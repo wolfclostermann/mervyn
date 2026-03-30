@@ -39,13 +39,18 @@ The user is an experienced Rust developer comfortable with async Rust, Tokio, Do
 │            │                                         │
 │   ┌────────▼───────────────────────┐                │
 │   │         Storage layer          │                │
-│   │   redb (structured)            │                │
+│   │   redb (structured + ingest)   │                │
 │   │   Markdown files (Obsidian)    │                │
+│   └────────────────────────────────┘                │
+│            ▲                                         │
+│   ┌────────┴───────────────────────┐                │
+│   │  Vault watcher (notify,       │                │
+│   │   debounced → sync to redb)   │                │
 │   └────────────────────────────────┘                │
 │                                                      │
 │   ┌──────────────────────────────────────────────┐  │
 │   │    Cron scheduler (tokio-cron-scheduler)     │  │
-│   │    Morning briefing, reminder checks         │  │
+│   │    Briefing, reminders, vault sync (cron)    │  │
 │   └──────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
          │                        │
@@ -138,6 +143,8 @@ mervyn/
 
 ## Dependencies (`Cargo.toml`)
 
+The committed manifest is the source of truth; it is reproduced here for the spec reader.
+
 ```toml
 [package]
 name = "mervyn"
@@ -145,46 +152,50 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Web framework (Slack event receiver)
 axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace"] }
 
-# HTTP client (Slack API + Claude API)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
-# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-postcard = { version = "1", features = ["alloc"] }  # redb value serialization
+postcard = { version = "1", features = ["alloc", "use-std"] }
 
-# Database
 redb = "2"
 
-# Scheduling
 tokio-cron-scheduler = "0.10"
 
-# File watching (vault)
 notify = "6"
 
-# Config
 config = "0.14"
 dotenvy = "0.15"
 
-# Error handling
 thiserror = "1"
 anyhow = "1"
 
-# Logging/tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+constant_time_eq = "0.4"
+bytes = "1"
+
+fnv = "1"
+anthropic-ai-sdk = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 ```
+
+**TLS / `reqwest`:** Mervyn enables **`rustls-tls`** on its direct `reqwest` dependency. **`anthropic-ai-sdk`** depends on `reqwest` with default features enabled, so Cargo’s feature union typically also links **`native-tls`** for the SDK’s client. Both stacks may appear in the dependency graph; this is a known trade-off until the SDK offers `default-features = false` on `reqwest` or a rustls-only feature flag.
 
 ---
 
@@ -194,9 +205,13 @@ Prefer maintained ecosystem crates over hand-rolled logic that duplicates specs 
 
 ### Anthropic / Claude HTTP client
 
-When wiring `src/claude/client.rs`, prefer an **official or well-maintained community client** (or OpenAPI-generated types) for request/response shapes, headers, API versioning, streaming, and tool use. Hand-written `serde` structs are fine for early spikes but must not be the long-term single source of truth for the Messages API.
+**Implemented:** `src/claude/client.rs` wraps **`anthropic-ai-sdk`** (`AnthropicClient` + `MessageClient::create_message`), using `CreateMessageParams`, `Message::new_text`, and API version `AnthropicClient::DEFAULT_API_VERSION` (currently `2023-06-01`). `ClaudeClient::new` returns `Result<_, MessageError>` because building the inner HTTP client can fail. Plain-text replies concatenate `ContentBlock::Text` segments from the response.
+
+For streaming, tools, or newer API fields, extend through the same SDK rather than duplicating request types by hand.
 
 ### Slack Events API
+
+Outbound **`chat.postMessage`** responses are deserialized into a small private struct (`ok` / `error`) instead of ad hoc `serde_json::Value` indexing (`src/slack/client.rs`).
 
 **Signature verification** must follow Slack’s rules: timestamp freshness, payload `v0:{timestamp}:{raw_body}`, HMAC-SHA256 with the signing secret, and **constant-time** comparison on the digest — using the **raw request body** before JSON parsing. Implement with the **`hmac`** and **`sha2`** crates and Slack’s docs, or use a **small, focused Slack signing helper** that encodes the same algorithm so behaviour stays aligned with [Verifying requests from Slack](https://api.slack.com/authentication/verifying-requests-from-slack). For heavier typing of envelopes and events, evaluate Slack-oriented crates; otherwise keep **`serde`** for minimal shapes.
 
@@ -232,7 +247,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
-    pub id: u64,                        // unix timestamp of creation (key in redb)
+    pub id: u64,                        // primary key in redb (vault sync uses stable FNV-1a ids; see vault/sync)
     pub title: String,
     pub description: Option<String>,
     pub start: DateTime<Utc>,
@@ -286,7 +301,9 @@ pub struct WorklogEntry {
 
 use redb::{Database, TableDefinition};
 
-// Tables: key = u64 (unix epoch millis), value = postcard-serialised struct bytes
+// Tables: value = postcard-serialised struct bytes.
+// u64 tables: domain ids (vault-derived rows use stable FNV-1a keys; others set id explicitly);
+// slack_ingest uses monotonic u64 row keys. META uses &str keys.
 pub const EVENTS_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("events");
 
@@ -296,107 +313,34 @@ pub const REMINDERS_TABLE: TableDefinition<u64, &[u8]> =
 pub const WORKLOG_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("worklog");
 
-// Key-value metadata table (last sync time, user prefs, etc.)
+// Key-value metadata (e.g. Slack event_id dedupe claims: `slack:ev:{event_id}`)
 pub const META_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("meta");
 
+// Append-only delivery log keyed by monotonic u64 (see storage/slack_ingest)
+pub const SLACK_INGEST_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("slack_ingest");
+
 pub fn open(path: &str) -> anyhow::Result<Database> {
     let db = Database::create(path)?;
-    // Initialise tables if they don't exist
     let write_txn = db.begin_write()?;
-    write_txn.open_table(EVENTS_TABLE)?;
-    write_txn.open_table(REMINDERS_TABLE)?;
-    write_txn.open_table(WORKLOG_TABLE)?;
-    write_txn.open_table(META_TABLE)?;
+    {
+        let _ = write_txn.open_table(EVENTS_TABLE)?;
+        let _ = write_txn.open_table(REMINDERS_TABLE)?;
+        let _ = write_txn.open_table(WORKLOG_TABLE)?;
+        let _ = write_txn.open_table(META_TABLE)?;
+        let _ = write_txn.open_table(SLACK_INGEST_TABLE)?;
+    }
     write_txn.commit()?;
     Ok(db)
 }
 ```
 
-Illustrative shape only — prefer a maintained Anthropic client or generated types for production (see **Crate preferences**).
+### Claude client (`src/claude/client.rs`) — as implemented
 
-```rust
-// src/claude/client.rs
+`ClaudeClient` holds an `anthropic_ai_sdk::client::AnthropicClient`, plus `model` and `max_tokens` from config. `complete(system, user_message)` builds `CreateMessageParams` (single user `Message` with text content, optional `system`), calls `create_message`, and joins text blocks. Errors from the SDK are converted to `anyhow::Error` at the call site where needed.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize)]
-pub struct ClaudeRequest {
-    pub model: String,
-    pub max_tokens: u32,
-    pub system: Option<String>,
-    pub messages: Vec<ClaudeMessage>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaudeMessage {
-    pub role: String,   // "user" or "assistant"
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ClaudeResponse {
-    pub content: Vec<ClaudeContent>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ClaudeContent {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub text: Option<String>,
-}
-
-pub struct ClaudeClient {
-    http: reqwest::Client,
-    api_key: String,
-    model: String,
-}
-
-impl ClaudeClient {
-    pub fn new(api_key: String, model: String) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            api_key,
-            model,
-        }
-    }
-
-    pub async fn complete(
-        &self,
-        system: Option<&str>,
-        user_message: &str,
-    ) -> anyhow::Result<String> {
-        let req = ClaudeRequest {
-            model: self.model.clone(),
-            max_tokens: 2048,
-            system: system.map(String::from),
-            messages: vec![ClaudeMessage {
-                role: "user".into(),
-                content: user_message.into(),
-            }],
-        };
-
-        let resp = self.http
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&req)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ClaudeResponse>()
-            .await?;
-
-        let text = resp.content
-            .into_iter()
-            .filter_map(|c| c.text)
-            .collect::<Vec<_>>()
-            .join("");
-
-        Ok(text)
-    }
-}
-```
+See **Dependencies** above for the `reqwest` / TLS interaction with `anthropic-ai-sdk`.
 
 **Context assembler** — Implemented in `src/context/assembler.rs`: `build_briefing_context`, `build_query_context`, and `briefing_prompt_sections` (three blobs for `MorningBriefingV1`). All take an explicit `now: DateTime<Utc>`.
 
@@ -417,7 +361,7 @@ Mervyn uses the Slack **Events API** (HTTP POST) rather than a persistent WebSoc
 
 ### Signature verification
 
-Every incoming Slack event must be verified using the signing secret. Implement this as an `axum` middleware layer before the event handler. Follow **Crate preferences (avoid reinventing wheels)** — use `hmac` + `sha2` (pure Rust) or an equivalent focused helper; do not roll a non-constant-time or body-re-parsed comparison.
+Every incoming Slack event must be verified using the signing secret **on the raw body** before JSON parsing. In the current code this runs at the start of the `slack_events` handler in `src/api/mod.rs` (not a separate Tower layer). Follow **Crate preferences** — use `hmac` + `sha2` + **`constant_time_eq`** on the decoded digest (as in `src/slack/events.rs`); do not compare digests with short-circuiting equality on secret material.
 
 ```rust
 // src/slack/events.rs — verify Slack request signature
@@ -472,15 +416,17 @@ Constants `PROMPT_API_VERSION` and `TASK_*` in `payloads.rs` identify the schema
 
 ## Scheduler Jobs
 
-Implemented with `tokio-cron-scheduler`. All times are Europe/London (handle DST).
+Implemented with `tokio-cron-scheduler`. Cron expressions and timezone come from **`config/default.toml`** (`[scheduler]` — `morning_briefing_cron`, `reminder_check_cron`, `vault_sync_cron`, `timezone`, e.g. `Europe/London` with DST). Defaults match the table below; override via TOML or `MERVYN__SCHEDULER__*` env vars.
 
-| Job | Schedule | Description |
-|-----|----------|-------------|
-| `morning_briefing` | `0 30 7 * * *` | Assemble context, call Claude, post to Slack |
-| `reminder_check` | `0 * * * * *` | Scan reminders table, fire any due ones to Slack |
+| Job | Default schedule | Description |
+|-----|------------------|-------------|
+| `morning_briefing` | `0 30 7 * * *` | Assemble context, call Claude, post to configured Slack channel |
+| `reminder_check` | `0 * * * * *` | Due pending reminders → Slack |
 | `vault_sync` | `0 */5 * * * *` | Re-read vault Markdown files into redb |
 
-The reminder_check job should use a redb range scan: iterate REMINDERS_TABLE where `due <= now` and `done == false`.
+**Vault watcher:** In addition to the cron job, `src/vault/watcher.rs` watches the vault tree with **`notify`**, debounces, and calls `sync_vault_to_db` so Obsidian saves land in redb quickly.
+
+The reminder check job uses storage helpers that query due pending reminders (not a blind full-table scan where avoidable).
 
 ---
 
@@ -527,7 +473,7 @@ Tags: openkj, mervyn
 Tags: karaoke
 ```
 
-The vault sync parser should be tolerant of messy human edits. For structure (headings, lists, front matter), follow **Crate preferences (avoid reinventing wheels)** — use a Markdown parser and front-matter crate where they apply; fall back to simple heuristics only where the human-edited format is intentionally loose.
+**Current code:** `src/vault/sync.rs` uses tolerant line- and section-oriented parsers (task list lines, `## YYYY-MM-DD` sections, tag lines). Stable row IDs use **FNV-1a 64-bit** via the **`fnv`** crate (`FnvHasher` over a prefix + normalised key string). For structure extraction, **Crate preferences** still recommend graduating to a Markdown parser and front-matter crate where that pays off; the existing parsers are intentional heuristics for this vault’s fixed conventions.
 
 ---
 
@@ -537,11 +483,13 @@ Load defaults from `config/default.toml` and merge **environment variables** (an
 
 ### `.env` (secrets, never committed)
 
+Required variables are loaded in `Secrets::from_env` (`src/state.rs`). See **`.env.example`** in the repo for the full list and optional `MERVYN__` overrides.
+
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
-SLACK_CHANNEL_ID=C...      # The channel Mervyn posts briefings to
+SLACK_CHANNEL_ID=C...      # Channel for morning briefing and reminder posts (bot must be a member)
 ```
 
 ### `config/default.toml` (non-secret, committed)
@@ -611,7 +559,7 @@ services:
 
 ## Implementation Order
 
-Build and validate each layer before moving to the next. Each step should be independently testable.
+Build and validate each layer before moving to the next. Each step should be independently testable. **As of the current tree, steps 1–11 are largely implemented** (storage, vault sync, Claude via SDK, context, prompts, scheduler, Slack client, Events API pipeline with ingest/dedupe, intents, Docker assets); use the checklist below for remaining hardening (see **Open TODOs**) and optional refactors from **Crate preferences**.
 
 1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types (DRY with a macro or generic helper per **Crate preferences**). Write unit tests using a temp file path for the database.
 
@@ -650,8 +598,8 @@ Items below are **not** fully implemented yet; track them for production hardeni
 ## Notes for the Implementer
 
 - Read **Crate preferences (avoid reinventing wheels)** before implementing Slack signing, Claude HTTP, vault parsing, recurrence, config layering, and storage CRUD patterns.
-- Use `Arc<redb::Database>` everywhere — the database handle is shared across the scheduler, the HTTP handler, and the vault sync job.
-- All async tasks communicate via the shared `Arc<Database>` and, if needed, a `tokio::sync::broadcast` channel for triggering immediate re-reads after vault writes.
+- Use `Arc<redb::Database>` everywhere — the database handle is shared across the scheduler, the HTTP handler, cron-driven vault sync, and the **vault watcher thread** (notify debounce → `sync_vault_to_db`).
+- Immediate vault updates are driven by **`notify`** in `vault/watcher.rs`, not by a Tokio broadcast channel (a broadcast channel remains an option if you add non-filesystem writers later).
 - Keep Claude-facing text out of Slack/intent handlers: build `system` / user JSON via `src/claude/prompts.rs` and `payloads.rs` only. Handlers pass structured inputs into those APIs; do not add ad hoc `format!` with user-controlled text.
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
