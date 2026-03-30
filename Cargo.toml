@@ -21,6 +21,7 @@ redb = "2"
 tokio-cron-scheduler = "0.10"
 
 notify = "6"
+notify-debouncer-mini = { version = "0.4", default-features = false }
 
 config = "0.14"
 dotenvy = "0.15"
