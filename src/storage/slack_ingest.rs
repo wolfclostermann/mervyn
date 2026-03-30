@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::codec;
 use super::db::SLACK_INGEST_TABLE;
 use super::error::Result;
+use super::meta;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlackIngestOutcome {
@@ -182,10 +183,64 @@ pub fn prune(
     })
 }
 
+const STALE_PENDING_MSG: &str = "stale Pending (sweeper)";
+
+/// Rows updated by [`sweep_stale_pending`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StalePendingSweepReport {
+    pub rewound: usize,
+}
+
+/// For each `Pending` row older than `stale_after_minutes`, release the Slack dedupe meta key (if any) and set outcome to [`SlackIngestOutcome::Failed`].
+pub fn sweep_stale_pending(
+    db: &Database,
+    now_ms: i64,
+    stale_after_minutes: u32,
+) -> Result<StalePendingSweepReport> {
+    if stale_after_minutes == 0 {
+        return Ok(StalePendingSweepReport::default());
+    }
+    let threshold_ms = i64::from(stale_after_minutes).saturating_mul(60_000);
+
+    let r = db.begin_read()?;
+    let t = r.open_table(SLACK_INGEST_TABLE)?;
+    let mut stale: Vec<(u64, SlackIngestEntry)> = Vec::new();
+    for row in t.iter()? {
+        let (k, v) = row?;
+        let id = k.value();
+        let Ok(entry) = codec::decode::<SlackIngestEntry>(v.value()) else {
+            continue;
+        };
+        if !matches!(entry.outcome, SlackIngestOutcome::Pending) {
+            continue;
+        }
+        if now_ms.saturating_sub(entry.received_at_ms) <= threshold_ms {
+            continue;
+        }
+        stale.push((id, entry));
+    }
+    drop(t);
+    drop(r);
+
+    if stale.is_empty() {
+        return Ok(StalePendingSweepReport::default());
+    }
+
+    let mut rewound = 0usize;
+    for (id, entry) in stale {
+        let _ = meta::release_slack_delivery(db, &entry.event_id);
+        set_outcome(db, id, SlackIngestOutcome::Failed(STALE_PENDING_MSG.into()))?;
+        rewound += 1;
+    }
+
+    Ok(StalePendingSweepReport { rewound })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::db;
+    use crate::storage::meta;
     use tempfile::NamedTempFile;
 
     fn sample_entry(received_at_ms: i64) -> SlackIngestEntry {
@@ -258,5 +313,59 @@ mod tests {
         assert_eq!(r.total_removed(), 0);
         let r = prune(&db, 9_999_999_999_999, Some(0), Some(0)).unwrap();
         assert_eq!(r.total_removed(), 0);
+    }
+
+    #[test]
+    fn sweep_stale_pending_releases_meta_and_sets_failed() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = db::open(tmp.path().to_str().unwrap()).unwrap();
+        assert!(meta::try_claim_slack_delivery(&db, "EvStale").unwrap());
+
+        let now_ms = 1_800_000_000_000_i64;
+        let old_ms = now_ms - 120 * 60_000;
+        put(
+            &db,
+            1,
+            &SlackIngestEntry {
+                event_id: "EvStale".into(),
+                received_at_ms: old_ms,
+                retry_num: None,
+                inner_type: "message".into(),
+                outcome: SlackIngestOutcome::Pending,
+            },
+        )
+        .unwrap();
+
+        let r = sweep_stale_pending(&db, now_ms, 30).unwrap();
+        assert_eq!(r.rewound, 1);
+        assert!(meta::try_claim_slack_delivery(&db, "EvStale").unwrap());
+
+        let read = db.begin_read().unwrap();
+        let t = read.open_table(SLACK_INGEST_TABLE).unwrap();
+        let e: SlackIngestEntry = codec::decode(t.get(1).unwrap().unwrap().value()).unwrap();
+        assert!(matches!(
+            e.outcome,
+            SlackIngestOutcome::Failed(ref s) if s == STALE_PENDING_MSG
+        ));
+    }
+
+    #[test]
+    fn sweep_respects_zero_disable() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = db::open(tmp.path().to_str().unwrap()).unwrap();
+        put(
+            &db,
+            1,
+            &SlackIngestEntry {
+                event_id: "Ev".into(),
+                received_at_ms: 0,
+                retry_num: None,
+                inner_type: "message".into(),
+                outcome: SlackIngestOutcome::Pending,
+            },
+        )
+        .unwrap();
+        let r = sweep_stale_pending(&db, 9_999_999_999_999, 0).unwrap();
+        assert_eq!(r.rewound, 0);
     }
 }

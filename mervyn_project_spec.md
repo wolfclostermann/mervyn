@@ -119,7 +119,7 @@ mervyn/
     │   ├── reminders.rs      # CRUD for Reminder records (+ recurrence advance helpers)
     │   ├── worklog.rs        # CRUD for WorklogEntry records
     │   ├── meta.rs           # META_TABLE: Slack event_id dedupe claims
-    │   └── slack_ingest.rs   # Append ingest log + outcome updates per delivery
+    │   └── slack_ingest.rs   # Ingest log, prune, sweep stale Pending + meta release
     │
     ├── vault/
     │   ├── mod.rs
@@ -383,7 +383,7 @@ Every **verified** `event_callback` is recorded before any business logic runs, 
 
 **Do not** skip processing solely because `X-Slack-Retry-Num` is set; deduplication is keyed by `event_id`, not the retry header.
 
-**Gap:** If the worker **panics** after ingest but before a terminal outcome, the row can remain `Pending` and the meta claim may strand. See **Open TODOs** below.
+**Hardening:** A [`SlackMetaClaimGuard`](src/slack/handler.rs) releases the meta claim on panic after a successful dedupe claim (unless disarmed on the success path). Rows still stuck `Pending` (e.g. panic before the guard is installed, or persistence failure after disarm) are cleared by the scheduled [`sweep_stale_pending`](src/storage/slack_ingest.rs) run (same cron as prune; see **`slack_ingest_stale_pending_minutes`**).
 
 ---
 
@@ -422,7 +422,7 @@ Implemented with `tokio-cron-scheduler`. Cron expressions and timezone come from
 | `morning_briefing` | `0 30 7 * * *` | Assemble context, call Claude, post to configured Slack channel |
 | `reminder_check` | `0 * * * * *` | Due pending reminders → Slack |
 | `vault_sync` | `0 */5 * * * *` | Re-read vault Markdown files into redb |
-| `slack_ingest_prune` | `0 0 4 * * *` | Age + row-cap pruning for `SLACK_INGEST_TABLE` (`[storage]` keys + `slack_ingest::prune`) |
+| `slack_ingest_prune` | `0 0 4 * * *` | Age + row-cap pruning (`slack_ingest::prune`) and stale-`Pending` sweep (`slack_ingest::sweep_stale_pending`) |
 
 **Vault watcher:** In addition to the cron job, `src/vault/watcher.rs` watches the vault tree with **`notify`**, debounces, and calls `sync_vault_to_db` so Obsidian saves land in redb quickly.
 
@@ -590,7 +590,7 @@ Build and validate each layer before moving to the next. Each step should be ind
 Items below are **not** fully implemented yet; track them for production hardening.
 
 - [x] **`slack_ingest` retention** — Implemented: `storage::slack_ingest::prune` (age in days, then optional max row count by monotonic id), scheduled job `slack_ingest_prune` in `scheduler/jobs.rs`. Knobs: `storage.slack_ingest_retention_days`, `storage.slack_ingest_keep_last` (use `0` to disable each rule), `scheduler.slack_ingest_prune_cron`; env `MERVYN__STORAGE__SLACK_INGEST_*`, `MERVYN__SCHEDULER__SLACK_INGEST_PRUNE_CRON`.
-- [ ] **Stuck `Pending` ingest rows** — After a panic between `append` and `set_outcome`, or a crash after `try_claim_slack_delivery`, rows can stay `Pending` and meta claims can block retries. Options: wrap the worker in `catch_unwind` + outcome `Failed` / claim release; a periodic sweeper that flags old `Pending` rows; metrics / alerts on `Pending` count.
+- [x] **Stuck `Pending` ingest rows** — Implemented: `SlackMetaClaimGuard` in `slack/handler.rs` releases dedupe meta on panic after claim (disarm on success/filter/error paths); `slack_ingest::sweep_stale_pending` on the prune cron marks long-`Pending` rows failed and releases meta (`storage.slack_ingest_stale_pending_minutes`, `0` = off). Metrics/alerts left to deployment.
 - [ ] **Operator visibility** — Read-only listing or export of recent ingest rows (by outcome, `event_id`, time range) for debugging without opening the raw redb file; optional small CLI or HTTP admin route (auth required).
 
 ---
@@ -604,4 +604,4 @@ Items below are **not** fully implemented yet; track them for production hardeni
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
 - Tracing: instrument every significant operation with `tracing::info!` / `tracing::debug!` spans. The Docker logs are your only observability.
-- Slack: ingest retention is implemented (scheduled prune); see **Open TODOs** for stuck-`Pending` / panic handling and operator tooling.
+- Slack: ingest retention and stale-`Pending` sweep are scheduled with prune; see **Open TODOs** for operator tooling only.

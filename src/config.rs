@@ -39,6 +39,13 @@ pub struct StorageSection {
     /// After age pruning, keep at most this many rows, dropping lowest ids first (`None` = no cap).
     #[serde(default)]
     pub slack_ingest_keep_last: Option<u64>,
+    /// Ingest rows still `Pending` after this many minutes are marked failed and Slack `event_id` meta claims released (scheduled with prune). `0` disables.
+    #[serde(default = "default_slack_ingest_stale_pending_minutes")]
+    pub slack_ingest_stale_pending_minutes: u32,
+}
+
+fn default_slack_ingest_stale_pending_minutes() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

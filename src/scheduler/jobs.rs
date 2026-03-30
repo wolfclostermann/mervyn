@@ -72,6 +72,17 @@ async fn run_slack_ingest_prune(state: &AppState) -> anyhow::Result<()> {
     } else {
         tracing::debug!("slack_ingest prune: nothing to remove");
     }
+
+    let sweep = slack_ingest::sweep_stale_pending(
+        state.db.as_ref(),
+        now_ms,
+        state.settings.storage.slack_ingest_stale_pending_minutes,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if sweep.rewound > 0 {
+        tracing::info!(rewound = sweep.rewound, "slack_ingest stale Pending swept");
+    }
+
     Ok(())
 }
 

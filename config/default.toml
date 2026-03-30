@@ -16,6 +16,8 @@ vault_path = "./data/vault"
 slack_ingest_retention_days = 90
 # Max rows to keep after age prune (oldest ids removed). Use 0 or MERVYN__STORAGE__SLACK_INGEST_KEEP_LAST=0 to disable the cap.
 slack_ingest_keep_last = 100000
+# Pending ingest rows older than this (minutes) are marked failed and meta claims released. 0 = disable sweeper.
+slack_ingest_stale_pending_minutes = 30
 
 [server]
 port = 3000

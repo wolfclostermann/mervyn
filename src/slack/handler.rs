@@ -3,13 +3,50 @@
 //! Pipeline: **ingest** (append every signed delivery) → **dedupe** ([`try_claim_slack_delivery`])
 //! → **filter** (bot / subtype / type / empty text) → **action** (classify + dispatch). Final state is
 //! written to [`crate::storage::slack_ingest`]. If the handler returns [`Err`], the dedupe claim is
-//! released so Slack can retry. A panic after claim can strand `Pending` rows and the meta claim.
+//! released so Slack can retry.
+//!
+//! After a successful dedupe **claim**, [`SlackMetaClaimGuard`] releases the meta key on drop (e.g.
+//! panic) unless [`SlackMetaClaimGuard::disarm`] runs on the success path where the claim must stay.
+//! Stale `Pending` rows are still handled by the scheduled sweeper in [`crate::storage::slack_ingest`].
+
+use std::sync::Arc;
+
+use redb::Database;
 
 use crate::intent::{self, IntentLabel};
 use crate::slack::events::SlackEvent;
 use crate::state::AppState;
 use crate::storage::meta;
 use crate::storage::slack_ingest::{self, SlackIngestOutcome};
+
+/// While held, a successful Slack `event_id` meta claim is released on [`Drop`] unless [`disarm`](Self::disarm).
+struct SlackMetaClaimGuard {
+    db: Arc<Database>,
+    event_id: String,
+    release_on_drop: bool,
+}
+
+impl SlackMetaClaimGuard {
+    fn new(db: Arc<Database>, event_id: String) -> Self {
+        Self {
+            db,
+            event_id,
+            release_on_drop: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for SlackMetaClaimGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop && !self.event_id.is_empty() {
+            let _ = meta::release_slack_delivery(&self.db, &self.event_id);
+        }
+    }
+}
 
 pub async fn process_event(
     state: AppState,
@@ -48,20 +85,27 @@ pub async fn process_event(
         return Ok(());
     }
 
+    let claim_guard = dedupe.then(|| {
+        SlackMetaClaimGuard::new(state.db.clone(), slack_event_id.clone())
+    });
+
     if event.bot_id.is_some() {
         release_if_claimed(&state, dedupe, &slack_event_id)?;
+        disarm_claim(claim_guard);
         slack_ingest::set_outcome(state.db.as_ref(), ingest_id, SlackIngestOutcome::FilteredBot)
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
     if event.subtype.is_some() {
         release_if_claimed(&state, dedupe, &slack_event_id)?;
+        disarm_claim(claim_guard);
         slack_ingest::set_outcome(state.db.as_ref(), ingest_id, SlackIngestOutcome::FilteredSubtype)
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
     if !matches!(event.kind.as_str(), "message" | "app_mention") {
         release_if_claimed(&state, dedupe, &slack_event_id)?;
+        disarm_claim(claim_guard);
         slack_ingest::set_outcome(
             state.db.as_ref(),
             ingest_id,
@@ -73,6 +117,7 @@ pub async fn process_event(
     let text = event.text.clone().unwrap_or_default();
     if text.trim().is_empty() {
         release_if_claimed(&state, dedupe, &slack_event_id)?;
+        disarm_claim(claim_guard);
         slack_ingest::set_outcome(
             state.db.as_ref(),
             ingest_id,
@@ -85,11 +130,15 @@ pub async fn process_event(
     let result = handle_user_message(&state, event, text).await;
     match &result {
         Ok(()) => {
+            // Disarm before `set_outcome` so a panic during persistence does not release the dedupe
+            // claim after a successful handler run.
+            disarm_claim(claim_guard);
             slack_ingest::set_outcome(state.db.as_ref(), ingest_id, SlackIngestOutcome::Processed)
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
         Err(e) => {
             release_if_claimed(&state, dedupe, &slack_event_id)?;
+            disarm_claim(claim_guard);
             slack_ingest::set_outcome(
                 state.db.as_ref(),
                 ingest_id,
@@ -99,6 +148,12 @@ pub async fn process_event(
         }
     }
     result
+}
+
+fn disarm_claim(guard: Option<SlackMetaClaimGuard>) {
+    if let Some(g) = guard {
+        g.disarm();
+    }
 }
 
 fn release_if_claimed(state: &AppState, dedupe: bool, slack_event_id: &str) -> anyhow::Result<()> {
