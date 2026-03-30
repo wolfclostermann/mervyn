@@ -2,6 +2,7 @@
 
 mod codec;
 pub mod db;
+mod table;
 pub mod error;
 pub mod events;
 pub mod meta;

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::codec;
 use super::db::REMINDERS_TABLE;
 use super::error::Result;
+use super::table;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reminder {
@@ -49,59 +50,24 @@ pub fn next_due_after_fire(reminder: &Reminder) -> Option<DateTime<Utc>> {
 }
 
 pub fn put(db: &Database, reminder: &Reminder) -> Result<()> {
-    let bytes = codec::encode(reminder)?;
-    let w = db.begin_write()?;
-    {
-        let mut t = w.open_table(REMINDERS_TABLE)?;
-        t.insert(reminder.id, bytes.as_slice())?;
-    }
-    w.commit()?;
-    Ok(())
+    table::put_u64(db, REMINDERS_TABLE, reminder.id, reminder)
 }
 
 pub fn get(db: &Database, id: u64) -> Result<Option<Reminder>> {
-    let r = db.begin_read()?;
-    let t = r.open_table(REMINDERS_TABLE)?;
-    let Some(guard) = t.get(id)? else {
-        return Ok(None);
-    };
-    Ok(Some(codec::decode(guard.value())?))
+    table::get_u64(db, REMINDERS_TABLE, id)
 }
 
 pub fn delete(db: &Database, id: u64) -> Result<bool> {
-    let w = db.begin_write()?;
-    let removed = {
-        let mut t = w.open_table(REMINDERS_TABLE)?;
-        let old = t.remove(id)?;
-        old.is_some()
-    };
-    w.commit()?;
-    Ok(removed)
+    table::delete_u64(db, REMINDERS_TABLE, id)
 }
 
 pub fn list_all(db: &Database) -> Result<Vec<Reminder>> {
-    let r = db.begin_read()?;
-    let t = r.open_table(REMINDERS_TABLE)?;
-    let mut out = Vec::new();
-    for row in t.iter()? {
-        let (_, v) = row?;
-        let reminder: Reminder = codec::decode(v.value())?;
-        out.push(reminder);
-    }
-    out.sort_by_key(|r| r.id);
-    Ok(out)
+    table::list_all_u64(db, REMINDERS_TABLE, |r: &Reminder| r.id)
 }
 
 /// Next numeric id (max key + 1).
 pub fn next_id(db: &Database) -> Result<u64> {
-    let r = db.begin_read()?;
-    let t = r.open_table(REMINDERS_TABLE)?;
-    let mut max = 0u64;
-    for row in t.iter()? {
-        let (k, _) = row?;
-        max = max.max(k.value());
-    }
-    Ok(max.saturating_add(1))
+    table::next_id_u64(db, REMINDERS_TABLE)
 }
 
 /// Pending reminders (`done == false`) with `due <= at`, ordered by `due`, at most `max` rows.

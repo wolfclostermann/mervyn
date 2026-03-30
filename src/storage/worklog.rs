@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::codec;
 use super::db::WORKLOG_TABLE;
 use super::error::Result;
+use super::table;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorklogEntry {
@@ -16,59 +17,24 @@ pub struct WorklogEntry {
 }
 
 pub fn put(db: &Database, entry: &WorklogEntry) -> Result<()> {
-    let bytes = codec::encode(entry)?;
-    let w = db.begin_write()?;
-    {
-        let mut t = w.open_table(WORKLOG_TABLE)?;
-        t.insert(entry.id, bytes.as_slice())?;
-    }
-    w.commit()?;
-    Ok(())
+    table::put_u64(db, WORKLOG_TABLE, entry.id, entry)
 }
 
 pub fn get(db: &Database, id: u64) -> Result<Option<WorklogEntry>> {
-    let r = db.begin_read()?;
-    let t = r.open_table(WORKLOG_TABLE)?;
-    let Some(guard) = t.get(id)? else {
-        return Ok(None);
-    };
-    Ok(Some(codec::decode(guard.value())?))
+    table::get_u64(db, WORKLOG_TABLE, id)
 }
 
 pub fn delete(db: &Database, id: u64) -> Result<bool> {
-    let w = db.begin_write()?;
-    let removed = {
-        let mut t = w.open_table(WORKLOG_TABLE)?;
-        let old = t.remove(id)?;
-        old.is_some()
-    };
-    w.commit()?;
-    Ok(removed)
+    table::delete_u64(db, WORKLOG_TABLE, id)
 }
 
 pub fn list_all(db: &Database) -> Result<Vec<WorklogEntry>> {
-    let r = db.begin_read()?;
-    let t = r.open_table(WORKLOG_TABLE)?;
-    let mut out = Vec::new();
-    for row in t.iter()? {
-        let (_, v) = row?;
-        let entry: WorklogEntry = codec::decode(v.value())?;
-        out.push(entry);
-    }
-    out.sort_by_key(|e| e.id);
-    Ok(out)
+    table::list_all_u64(db, WORKLOG_TABLE, |e: &WorklogEntry| e.id)
 }
 
 /// Next numeric id (max key + 1).
 pub fn next_id(db: &Database) -> Result<u64> {
-    let r = db.begin_read()?;
-    let t = r.open_table(WORKLOG_TABLE)?;
-    let mut max = 0u64;
-    for row in t.iter()? {
-        let (k, _) = row?;
-        max = max.max(k.value());
-    }
-    Ok(max.saturating_add(1))
+    table::next_id_u64(db, WORKLOG_TABLE)
 }
 
 /// Entries with `timestamp >= since`, newest first, at most `max` rows.

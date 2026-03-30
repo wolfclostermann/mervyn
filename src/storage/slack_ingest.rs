@@ -11,6 +11,7 @@ use super::codec;
 use super::db::SLACK_INGEST_TABLE;
 use super::error::Result;
 use super::meta;
+use super::table;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlackIngestOutcome {
@@ -34,17 +35,6 @@ pub struct SlackIngestEntry {
     pub outcome: SlackIngestOutcome,
 }
 
-fn next_id(db: &Database) -> Result<u64> {
-    let r = db.begin_read()?;
-    let t = r.open_table(SLACK_INGEST_TABLE)?;
-    let mut max = 0u64;
-    for row in t.iter()? {
-        let (k, _) = row?;
-        max = max.max(k.value());
-    }
-    Ok(max.saturating_add(1))
-}
-
 /// Record one delivery attempt. Always call [`set_outcome`] (or leave `Pending` only on panic).
 pub fn append(
     db: &Database,
@@ -52,7 +42,7 @@ pub fn append(
     retry_num: Option<u32>,
     inner_type: String,
 ) -> Result<u64> {
-    let id = next_id(db)?;
+    let id = table::next_id_u64(db, SLACK_INGEST_TABLE)?;
     let entry = SlackIngestEntry {
         event_id,
         received_at_ms: Utc::now().timestamp_millis(),
@@ -65,14 +55,7 @@ pub fn append(
 }
 
 pub(super) fn put(db: &Database, id: u64, entry: &SlackIngestEntry) -> Result<()> {
-    let bytes = codec::encode(entry)?;
-    let w = db.begin_write()?;
-    {
-        let mut t = w.open_table(SLACK_INGEST_TABLE)?;
-        t.insert(id, bytes.as_slice())?;
-    }
-    w.commit()?;
-    Ok(())
+    table::put_u64(db, SLACK_INGEST_TABLE, id, entry)
 }
 
 pub fn set_outcome(db: &Database, id: u64, outcome: SlackIngestOutcome) -> Result<()> {

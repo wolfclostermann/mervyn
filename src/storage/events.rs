@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::codec;
 use super::db::EVENTS_TABLE;
 use super::error::Result;
+use super::table;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -18,64 +19,27 @@ pub struct Event {
 
 /// Insert or replace an event (primary key is `event.id`).
 pub fn put(db: &Database, event: &Event) -> Result<()> {
-    let bytes = codec::encode(event)?;
-    let w = db.begin_write()?;
-    {
-        let mut t = w.open_table(EVENTS_TABLE)?;
-        t.insert(event.id, bytes.as_slice())?;
-    }
-    w.commit()?;
-    Ok(())
+    table::put_u64(db, EVENTS_TABLE, event.id, event)
 }
 
 pub fn get(db: &Database, id: u64) -> Result<Option<Event>> {
-    let r = db.begin_read()?;
-    let t = r.open_table(EVENTS_TABLE)?;
-    let Some(guard) = t.get(id)? else {
-        return Ok(None);
-    };
-    let raw = guard.value();
-    let event = codec::decode(raw)?;
-    Ok(Some(event))
+    table::get_u64(db, EVENTS_TABLE, id)
 }
 
 /// Returns whether a row existed and was removed.
 pub fn delete(db: &Database, id: u64) -> Result<bool> {
-    let w = db.begin_write()?;
-    let removed = {
-        let mut t = w.open_table(EVENTS_TABLE)?;
-        let old = t.remove(id)?;
-        old.is_some()
-    };
-    w.commit()?;
-    Ok(removed)
+    table::delete_u64(db, EVENTS_TABLE, id)
 }
 
 pub fn list_all(db: &Database) -> Result<Vec<Event>> {
-    let r = db.begin_read()?;
-    let t = r.open_table(EVENTS_TABLE)?;
-    let mut out = Vec::new();
-    for row in t.iter()? {
-        let (_, v) = row?;
-        let event: Event = codec::decode(v.value())?;
-        out.push(event);
-    }
-    out.sort_by_key(|e| e.id);
-    Ok(out)
+    table::list_all_u64(db, EVENTS_TABLE, |e: &Event| e.id)
 }
 
 /// Events whose `start` falls in `[from, until]`, ordered by `start`, at most `max` rows.
 /// Full table scan (no secondary index); `max` bounds work for briefings and Claude context.
 /// Next numeric id (max key + 1). For app-created rows; vault sync uses hashed ids.
 pub fn next_id(db: &Database) -> Result<u64> {
-    let r = db.begin_read()?;
-    let t = r.open_table(EVENTS_TABLE)?;
-    let mut max = 0u64;
-    for row in t.iter()? {
-        let (k, _) = row?;
-        max = max.max(k.value());
-    }
-    Ok(max.saturating_add(1))
+    table::next_id_u64(db, EVENTS_TABLE)
 }
 
 pub fn upcoming_within(
