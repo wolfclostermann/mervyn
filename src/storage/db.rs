@@ -1,0 +1,22 @@
+use redb::{Database, TableDefinition};
+
+pub const EVENTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
+
+pub const REMINDERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("reminders");
+
+pub const WORKLOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("worklog");
+
+pub const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+pub fn open(path: &str) -> anyhow::Result<Database> {
+    let db = Database::create(path)?;
+    let write_txn = db.begin_write()?;
+    {
+        let _ = write_txn.open_table(EVENTS_TABLE)?;
+        let _ = write_txn.open_table(REMINDERS_TABLE)?;
+        let _ = write_txn.open_table(WORKLOG_TABLE)?;
+        let _ = write_txn.open_table(META_TABLE)?;
+    }
+    write_txn.commit()?;
+    Ok(db)
+}

@@ -1,0 +1,16 @@
+[claude]
+model = "claude-sonnet-4-6"
+max_tokens = 2048
+
+[scheduler]
+morning_briefing_cron = "0 30 7 * * *"
+reminder_check_cron = "0 * * * * *"
+vault_sync_cron = "0 */5 * * * *"
+timezone = "Europe/London"
+
+[storage]
+db_path = "./data/mervyn.redb"
+vault_path = "./data/vault"
+
+[server]
+port = 3000
