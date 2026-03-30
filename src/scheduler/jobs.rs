@@ -6,6 +6,7 @@ use crate::claude::prompts;
 use crate::context::ContextAssembler;
 use crate::state::AppState;
 use crate::storage::reminders;
+use crate::storage::slack_ingest;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
@@ -53,6 +54,27 @@ async fn run_vault_sync(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_slack_ingest_prune(state: &AppState) -> anyhow::Result<()> {
+    let now_ms = Utc::now().timestamp_millis();
+    let report = slack_ingest::prune(
+        state.db.as_ref(),
+        now_ms,
+        state.settings.storage.slack_ingest_retention_days,
+        state.settings.storage.slack_ingest_keep_last,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if report.total_removed() > 0 {
+        tracing::info!(
+            removed_by_age = report.removed_by_age,
+            removed_by_cap = report.removed_by_cap,
+            "slack_ingest pruned"
+        );
+    } else {
+        tracing::debug!("slack_ingest prune: nothing to remove");
+    }
+    Ok(())
+}
+
 pub async fn spawn_scheduler(state: AppState) -> anyhow::Result<()> {
     let tz: chrono_tz::Tz = state
         .settings
@@ -97,6 +119,19 @@ pub async fn spawn_scheduler(state: AppState) -> anyhow::Result<()> {
             Box::pin(async move {
                 if let Err(e) = run_vault_sync(&st).await {
                     tracing::error!(error = %e, "vault_sync job");
+                }
+            })
+        })?)
+        .await?;
+
+    let st = state.clone();
+    let c = st.settings.scheduler.slack_ingest_prune_cron.clone();
+    sched
+        .add(Job::new_async_tz(c.as_str(), tz, move |_uuid, _lock| {
+            let st = st.clone();
+            Box::pin(async move {
+                if let Err(e) = run_slack_ingest_prune(&st).await {
+                    tracing::error!(error = %e, "slack_ingest_prune job");
                 }
             })
         })?)

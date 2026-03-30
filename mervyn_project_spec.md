@@ -415,13 +415,14 @@ Constants `PROMPT_API_VERSION` and `TASK_*` in `payloads.rs` identify the schema
 
 ## Scheduler Jobs
 
-Implemented with `tokio-cron-scheduler`. Cron expressions and timezone come from **`config/default.toml`** (`[scheduler]` — `morning_briefing_cron`, `reminder_check_cron`, `vault_sync_cron`, `timezone`, e.g. `Europe/London` with DST). Defaults match the table below; override via TOML or `MERVYN__SCHEDULER__*` env vars.
+Implemented with `tokio-cron-scheduler`. Cron expressions and timezone come from **`config/default.toml`** (`[scheduler]` — `morning_briefing_cron`, `reminder_check_cron`, `vault_sync_cron`, `slack_ingest_prune_cron`, `timezone`, e.g. `Europe/London` with DST). Defaults match the table below; override via TOML or `MERVYN__SCHEDULER__*` env vars.
 
 | Job | Default schedule | Description |
 |-----|------------------|-------------|
 | `morning_briefing` | `0 30 7 * * *` | Assemble context, call Claude, post to configured Slack channel |
 | `reminder_check` | `0 * * * * *` | Due pending reminders → Slack |
 | `vault_sync` | `0 */5 * * * *` | Re-read vault Markdown files into redb |
+| `slack_ingest_prune` | `0 0 4 * * *` | Age + row-cap pruning for `SLACK_INGEST_TABLE` (`[storage]` keys + `slack_ingest::prune`) |
 
 **Vault watcher:** In addition to the cron job, `src/vault/watcher.rs` watches the vault tree with **`notify`**, debounces, and calls `sync_vault_to_db` so Obsidian saves land in redb quickly.
 
@@ -588,7 +589,7 @@ Build and validate each layer before moving to the next. Each step should be ind
 
 Items below are **not** fully implemented yet; track them for production hardening.
 
-- [ ] **`slack_ingest` retention** — Unbounded growth of `SLACK_INGEST_TABLE`. Add a policy (e.g. delete rows older than *N* days, or keep last *M* rows), run from a cron job or the existing scheduler, and document env/config knobs.
+- [x] **`slack_ingest` retention** — Implemented: `storage::slack_ingest::prune` (age in days, then optional max row count by monotonic id), scheduled job `slack_ingest_prune` in `scheduler/jobs.rs`. Knobs: `storage.slack_ingest_retention_days`, `storage.slack_ingest_keep_last` (use `0` to disable each rule), `scheduler.slack_ingest_prune_cron`; env `MERVYN__STORAGE__SLACK_INGEST_*`, `MERVYN__SCHEDULER__SLACK_INGEST_PRUNE_CRON`.
 - [ ] **Stuck `Pending` ingest rows** — After a panic between `append` and `set_outcome`, or a crash after `try_claim_slack_delivery`, rows can stay `Pending` and meta claims can block retries. Options: wrap the worker in `catch_unwind` + outcome `Failed` / claim release; a periodic sweeper that flags old `Pending` rows; metrics / alerts on `Pending` count.
 - [ ] **Operator visibility** — Read-only listing or export of recent ingest rows (by outcome, `event_id`, time range) for debugging without opening the raw redb file; optional small CLI or HTTP admin route (auth required).
 
@@ -603,4 +604,4 @@ Items below are **not** fully implemented yet; track them for production hardeni
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
 - Tracing: instrument every significant operation with `tracing::info!` / `tracing::debug!` spans. The Docker logs are your only observability.
-- Slack: see **Open TODOs** for ingest retention, panic / stuck-`Pending` handling, and operator tooling.
+- Slack: ingest retention is implemented (scheduled prune); see **Open TODOs** for stuck-`Pending` / panic handling and operator tooling.

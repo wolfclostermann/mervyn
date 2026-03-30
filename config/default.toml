@@ -6,11 +6,16 @@ max_tokens = 2048
 morning_briefing_cron = "0 30 7 * * *"
 reminder_check_cron = "0 * * * * *"
 vault_sync_cron = "0 */5 * * * *"
+slack_ingest_prune_cron = "0 0 4 * * *"
 timezone = "Europe/London"
 
 [storage]
 db_path = "./data/mervyn.redb"
 vault_path = "./data/vault"
+# Slack delivery log: drop rows older than this many days. Use 0 or MERVYN__STORAGE__SLACK_INGEST_RETENTION_DAYS=0 to disable age pruning.
+slack_ingest_retention_days = 90
+# Max rows to keep after age prune (oldest ids removed). Use 0 or MERVYN__STORAGE__SLACK_INGEST_KEEP_LAST=0 to disable the cap.
+slack_ingest_keep_last = 100000
 
 [server]
 port = 3000
