@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::London;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Bumped when any payload shape changes incompatibly.
 pub const PROMPT_API_VERSION: u32 = 1;
@@ -75,6 +75,15 @@ impl IntentClassificationV1 {
             message: message.into(),
         }
     }
+}
+
+/// Expected model reply for intent routing (deserialize). `api_version` mirrors the request when present.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IntentClassificationReplyV1 {
+    #[serde(default)]
+    pub api_version: u32,
+    pub intent: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

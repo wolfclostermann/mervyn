@@ -18,9 +18,11 @@ You have access to Wolf's structured data supplied in later messages (also JSON)
 /// Append to [`system_prompt_json`] for intent-routing calls. User message must be JSON from [`intent_classification_user_json`].
 pub const SUPPLEMENT_INTENT_CLASSIFICATION: &str = r#"The user's message is one JSON object (UTF-8) with api_version, task "intent_classification", and message (their raw text).
 
-Classify message into exactly one label: add_reminder, add_event, log_work, add_note, ask.
+Classify message into exactly one intent: add_reminder, add_event, log_work, add_note, ask.
 
-Respond with only that label and nothing else."#;
+Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fences, no other text). Fields:
+- api_version: same integer as in the user's object
+- intent: one of add_reminder, add_event, log_work, add_note, ask"#;
 
 /// Append for morning briefing. User message = JSON from [`morning_briefing_user_json`].
 pub const SUPPLEMENT_MORNING_BRIEFING: &str = r#"The user's message is one JSON object with task "morning_briefing" and string fields events, reminders, worklog (preformatted text blobs).
