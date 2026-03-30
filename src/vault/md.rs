@@ -1,13 +1,45 @@
 //! Vault Markdown parsing via pulldown-cmark (task lists + ATX headings).
-//! Keeps the same field extraction rules as the historical line scanners.
+//! Leading YAML front matter (Obsidian-style `---` … `---`) is stripped and parsed with [`serde_yaml`];
+//! the Markdown body is what pulldown sees. Parsed front matter is reserved for future use.
 
+use std::borrow::Cow;
 use std::hash::Hasher;
 
 use chrono::{NaiveDate, Utc};
 use fnv::FnvHasher;
 use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
+use serde_yaml::Value as YamlValue;
 
 use crate::storage::{Event, Recurrence, Reminder, WorklogEntry};
+
+/// Obsidian/Jekyll-style YAML block at the top of a file. Tolerant: unclosed fence → whole `raw` is the body.
+/// Closing line may be `---` or `...`. BOM is skipped. Invalid YAML still yields a stripped body; `meta` is `None`.
+pub fn strip_yaml_front_matter(raw: &str) -> (Option<YamlValue>, Cow<'_, str>) {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let s = raw.trim_start();
+    if !s.starts_with("---") {
+        return (None, Cow::Borrowed(raw));
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.is_empty() || lines[0].trim() != "---" {
+        return (None, Cow::Borrowed(raw));
+    }
+    for i in 1..lines.len() {
+        let t = lines[i].trim();
+        if t == "---" || t == "..." {
+            let yaml_block = lines[1..i].join("\n");
+            let body = lines[i + 1..].join("\n");
+            let meta = serde_yaml::from_str(&yaml_block).ok();
+            return (meta, Cow::Owned(body));
+        }
+    }
+    (None, Cow::Borrowed(raw))
+}
+
+fn markdown_body(raw: &str) -> Cow<'_, str> {
+    let (_meta, body) = strip_yaml_front_matter(raw);
+    body
+}
 
 /// FNV-1a 64-bit — stable across Rust versions for vault-derived primary keys.
 pub(super) fn stable_vault_row_id(prefix: &[u8], key: &str) -> u64 {
@@ -83,7 +115,9 @@ fn is_h2_start(ev: &MdEvent<'_>) -> bool {
 
 /// GitHub-style task list items → [`Reminder`].
 pub fn parse_reminders(text: &str) -> Vec<Reminder> {
-    let events: Vec<MdEvent<'_>> = Parser::new_ext(text, Options::ENABLE_TASKLISTS).collect();
+    let body = markdown_body(text);
+    let events: Vec<MdEvent<'_>> =
+        Parser::new_ext(body.as_ref(), Options::ENABLE_TASKLISTS).collect();
     let mut i = 0;
     let mut out = Vec::new();
 
@@ -185,7 +219,8 @@ fn split_item_body_and_tags(body: &str) -> (String, Option<Vec<String>>) {
 
 /// `## YYYY-MM-DD — title` sections; body paragraphs + optional `Tags:` line.
 pub fn parse_events(text: &str) -> Vec<Event> {
-    let events: Vec<MdEvent<'_>> = Parser::new_ext(text, Options::empty()).collect();
+    let body = markdown_body(text);
+    let events: Vec<MdEvent<'_>> = Parser::new_ext(body.as_ref(), Options::empty()).collect();
     let mut i = 0;
     let mut out = Vec::new();
 
@@ -257,7 +292,8 @@ fn collect_list_item_text(events: &[MdEvent<'_>], i: &mut usize) -> String {
 
 /// `## YYYY-MM-DD` sections; list items as worklog bullets; optional `Tags:` paragraph.
 pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
-    let events: Vec<MdEvent<'_>> = Parser::new_ext(text, Options::empty()).collect();
+    let body = markdown_body(text);
+    let events: Vec<MdEvent<'_>> = Parser::new_ext(body.as_ref(), Options::empty()).collect();
     let mut i = 0;
     let mut out = Vec::new();
 
@@ -333,6 +369,17 @@ pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reminders_skip_yaml_front_matter() {
+        let md = "---\ntitle: Reminders\nfoo: bar\n---\n\n- [ ] Do thing — due 2026-06-01\n";
+        let list = parse_reminders(md);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].body, "Do thing");
+        let (meta, _) = strip_yaml_front_matter(md);
+        assert!(meta.is_some());
+        assert_eq!(meta.as_ref().unwrap()["title"], serde_yaml::Value::String("Reminders".into()));
+    }
 
     #[test]
     fn reminders_tasklist_matches_line_parser_case() {

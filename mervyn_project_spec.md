@@ -124,8 +124,9 @@ mervyn/
     │
     ├── vault/
     │   ├── mod.rs
-    │   ├── sync.rs           # Vault Markdown → redb upsert
-    │   └── watcher.rs        # notify debounced re-sync on vault file changes
+    │   ├── md.rs             # pulldown-cmark + YAML front matter → domain rows
+    │   ├── sync.rs           # Read vault files, call md::parse_*, upsert redb
+    │   └── watcher.rs        # notify-debouncer-mini → sync_vault_to_db
     │
     ├── scheduler/
     │   ├── mod.rs
@@ -170,6 +171,7 @@ redb = "2"
 tokio-cron-scheduler = "0.10"
 
 notify = "6"
+notify-debouncer-mini = { version = "0.4", default-features = false }
 
 config = "0.14"
 dotenvy = "0.15"
@@ -188,14 +190,17 @@ sha2 = "0.10"
 hex = "0.4"
 constant_time_eq = "0.4"
 bytes = "1"
-
 fnv = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
 ```
 
 **TLS / `reqwest`:** Mervyn uses **`reqwest`** with **`default-features = false`** and **`rustls-tls`** only, so the binary does not pull **`native-tls`**. Re-evaluate an official or community SDK only if it exposes a rustls-only feature set that preserves that property.
+
+**Vault YAML:** **`serde_yaml`** parses optional leading front matter in `vault/md.rs`. The upstream crate is marked deprecated on crates.io; if it stalls, migrate to a maintained YAML library and keep the same `strip_yaml_front_matter` contract.
 
 ---
 
@@ -221,7 +226,7 @@ Outbound **`chat.postMessage`** responses are deserialized into a small private 
 
 ### Obsidian / Markdown vault
 
-Vault sync and Markdown parsing should use a real **Markdown parser** (e.g. **`pulldown-cmark`** or **`comrak`**) and, for YAML front matter, a **`gray_matter`-style** crate. Stay tolerant of messy human edits in the ways this spec already allows, but implement structure extraction with proper parsers rather than fragile ad-hoc scanners where those crates apply.
+**Implemented:** `src/vault/md.rs` uses **`pulldown-cmark`** (GFM task lists + ATX headings) for `reminders.md`, `events.md`, and `worklog.md`. Optional Obsidian-style **YAML front matter** (`---` … `---` or `...`) is split and parsed with **`serde_yaml`** before Markdown; the parsed value is available for future file-level metadata and invalid YAML still strips the fence so the body parses. Stay tolerant of messy human edits; worklog **`Tags:`** merged into the last list item (CommonMark tight lists) is handled explicitly.
 
 ### Configuration
 
@@ -229,7 +234,7 @@ Layer settings with the **`config`** crate: committed `config/default.toml` plus
 
 ### Storage CRUD
 
-The `events`, `reminders`, and `worklog` modules share the same put/get/delete/list pattern over `redb`. Use a **macro or generic helper** over `TableDefinition` to avoid duplicated transaction/commit patterns and inconsistent error handling.
+The `events`, `reminders`, and `worklog` modules share the same put/get/delete/list pattern over `redb`. **Implemented:** `src/storage/table.rs` centralises postcard encode/decode + write/read/delete/`next_id` for `TableDefinition<u64, &[u8]>` (also used for `slack_ingest::put` / `append` id allocation). Domain modules keep filtered table scans.
 
 ### Already aligned (keep as-is)
 
@@ -420,9 +425,9 @@ User-derived text must **not** be interpolated into prompt templates with `forma
 
 Constants `PROMPT_API_VERSION` and `TASK_*` in `payloads.rs` identify the schema for future migrations.
 
-### Behaviour notes (unchanged intent)
+### Behaviour notes (intent classification)
 
-- Intent routing still resolves to exactly one of: `add_reminder`, `add_event`, `log_work`, `add_note`, `ask`; the supplement text tells the model to output only the label.
+- Intent routing still resolves to exactly one of: `add_reminder`, `add_event`, `log_work`, `add_note`, `ask`. The supplement asks the model for a **single JSON object** with `api_version` and `intent` (snake_case); `intent/mod.rs` parses JSON first, then markdown-fenced JSON, then a legacy plain-text label for compatibility.
 - Morning briefing still asks for summary, due/overdue reminders, and a prioritised todo list (max 7); the three context blobs are JSON fields on `MorningBriefingV1`.
 
 ---
@@ -487,7 +492,7 @@ Tags: openkj, mervyn
 Tags: karaoke
 ```
 
-**Current code:** `src/vault/sync.rs` uses tolerant line- and section-oriented parsers (task list lines, `## YYYY-MM-DD` sections, tag lines). Stable row IDs use **FNV-1a 64-bit** via the **`fnv`** crate (`FnvHasher` over a prefix + normalised key string). For structure extraction, **Crate preferences** still recommend graduating to a Markdown parser and front-matter crate where that pays off; the existing parsers are intentional heuristics for this vault’s fixed conventions.
+**Current code:** `src/vault/md.rs` drives structure extraction (**`pulldown-cmark`** + optional **`serde_yaml`** front matter); `src/vault/sync.rs` reads files and upserts into redb. Stable row IDs use **FNV-1a 64-bit** via the **`fnv`** crate in `md::stable_vault_row_id` (prefix + normalised key string). You may add an Obsidian YAML block at the top of any vault file without breaking list/heading parsing.
 
 ---
 
@@ -576,11 +581,11 @@ services:
 
 Build and validate each layer before moving to the next. Each step should be independently testable. **As of the current tree, steps 1–11 are largely implemented** (storage, vault sync, Claude Messages client, context, prompts, scheduler, Slack client, Events API pipeline with ingest/dedupe, intents, Docker assets); use the checklist below for remaining hardening (see **Open TODOs**) and optional refactors from **Crate preferences**.
 
-1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types (DRY with a macro or generic helper per **Crate preferences**). Write unit tests using a temp file path for the database.
+1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types (shared helpers in `storage/table.rs` per **Crate preferences**). Write unit tests using a temp file path for the database.
 
 2. **Storage read strategy (spike)** — Before vault sync and context assembly assume unbounded data, evaluate **paging / key-range scans / caps** in redb instead of loading whole tables with `list_all` → `Vec`. Decide patterns for: upcoming events window, pending reminders, recent worklog, reminder sweep, and any “dump for Claude” paths. Outcome should guide `context/assembler` and job implementations.
 
-3. **Vault parser** — `src/vault/sync.rs`. Parse the three Markdown files into typed structs (Markdown + front-matter crates per **Crate preferences**). Unit test with fixture files. Upsert into redb.
+3. **Vault parser** — `src/vault/md.rs` + `sync.rs`. Parse the three Markdown files (**`pulldown-cmark`**, optional YAML via **`serde_yaml`**) into typed structs; unit tests in `vault/md.rs` / `vault/sync.rs`. Upsert into redb.
 
 4. **Claude client** — `src/claude/client.rs`. Implement the HTTP client and `complete()` method per **Crate preferences** (prefer a maintained client or generated types for the Messages API). Test with a hardcoded prompt against the real API.
 
@@ -614,7 +619,7 @@ The checklist below tracks production hardening; **core items are implemented** 
 
 - Read **Crate preferences (avoid reinventing wheels)** before implementing Slack signing, Claude HTTP, vault parsing, recurrence, config layering, and storage CRUD patterns.
 - Use `Arc<redb::Database>` everywhere — the database handle is shared across the scheduler, the HTTP handler, cron-driven vault sync, and the **vault watcher thread** (notify debounce → `sync_vault_to_db`).
-- Immediate vault updates are driven by **`notify`** in `vault/watcher.rs`, not by a Tokio broadcast channel (a broadcast channel remains an option if you add non-filesystem writers later).
+- Immediate vault updates are driven by **`notify`** + **`notify-debouncer-mini`** in `vault/watcher.rs`, not by a Tokio broadcast channel (a broadcast channel remains an option if you add non-filesystem writers later).
 - Keep Claude-facing text out of Slack/intent handlers: build `system` / user JSON via `src/claude/prompts.rs` and `payloads.rs` only. Handlers pass structured inputs into those APIs; do not add ad hoc `format!` with user-controlled text.
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
