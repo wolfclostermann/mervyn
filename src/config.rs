@@ -36,6 +36,11 @@ pub struct ServerSection {
 pub fn load() -> anyhow::Result<AppConfig> {
     let settings = ::config::Config::builder()
         .add_source(::config::File::with_name("config/default"))
+        .add_source(
+            ::config::Environment::with_prefix("MERVYN")
+                .separator("__")
+                .try_parsing(true),
+        )
         .build()?;
     Ok(settings.try_deserialize()?)
 }

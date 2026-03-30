@@ -64,6 +64,41 @@ pub fn list_all(db: &Database) -> Result<Vec<Event>> {
     Ok(out)
 }
 
+/// Events whose `start` falls in `[from, until]`, ordered by `start`, at most `max` rows.
+/// Full table scan (no secondary index); `max` bounds work for briefings and Claude context.
+/// Next numeric id (max key + 1). For app-created rows; vault sync uses hashed ids.
+pub fn next_id(db: &Database) -> Result<u64> {
+    let r = db.begin_read()?;
+    let t = r.open_table(EVENTS_TABLE)?;
+    let mut max = 0u64;
+    for row in t.iter()? {
+        let (k, _) = row?;
+        max = max.max(k.value());
+    }
+    Ok(max.saturating_add(1))
+}
+
+pub fn upcoming_within(
+    db: &Database,
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+    max: usize,
+) -> Result<Vec<Event>> {
+    let r = db.begin_read()?;
+    let t = r.open_table(EVENTS_TABLE)?;
+    let mut out = Vec::new();
+    for row in t.iter()? {
+        let (_, v) = row?;
+        let event: Event = codec::decode(v.value())?;
+        if event.start >= from && event.start <= until {
+            out.push(event);
+        }
+    }
+    out.sort_by(|a, b| a.start.cmp(&b.start));
+    out.truncate(max);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +159,38 @@ mod tests {
         e.title = "Updated".into();
         put(&db, &e).unwrap();
         assert_eq!(get(&db, 1).unwrap().unwrap().title, "Updated");
+    }
+
+    #[test]
+    fn upcoming_within_filters_and_caps() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = db::open(tmp.path().to_str().unwrap()).unwrap();
+        let window_start = DateTime::parse_from_rfc3339("2026-04-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window_end = DateTime::parse_from_rfc3339("2026-04-10T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut inside = sample(1);
+        inside.start = DateTime::parse_from_rfc3339("2026-04-05T19:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut too_early = sample(2);
+        too_early.start = DateTime::parse_from_rfc3339("2026-03-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut too_late = sample(3);
+        too_late.start = DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        put(&db, &too_early).unwrap();
+        put(&db, &inside).unwrap();
+        put(&db, &too_late).unwrap();
+
+        let list = upcoming_within(&db, window_start, window_end, 10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, 1);
     }
 }

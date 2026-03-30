@@ -59,6 +59,35 @@ pub fn list_all(db: &Database) -> Result<Vec<WorklogEntry>> {
     Ok(out)
 }
 
+/// Next numeric id (max key + 1).
+pub fn next_id(db: &Database) -> Result<u64> {
+    let r = db.begin_read()?;
+    let t = r.open_table(WORKLOG_TABLE)?;
+    let mut max = 0u64;
+    for row in t.iter()? {
+        let (k, _) = row?;
+        max = max.max(k.value());
+    }
+    Ok(max.saturating_add(1))
+}
+
+/// Entries with `timestamp >= since`, newest first, at most `max` rows.
+pub fn recent_since(db: &Database, since: DateTime<Utc>, max: usize) -> Result<Vec<WorklogEntry>> {
+    let r = db.begin_read()?;
+    let t = r.open_table(WORKLOG_TABLE)?;
+    let mut out = Vec::new();
+    for row in t.iter()? {
+        let (_, v) = row?;
+        let entry: WorklogEntry = codec::decode(v.value())?;
+        if entry.timestamp >= since {
+            out.push(entry);
+        }
+    }
+    out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    out.truncate(max);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +134,30 @@ mod tests {
         assert!(delete(&db, 1).unwrap());
         assert!(!delete(&db, 1).unwrap());
         assert_eq!(get(&db, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn recent_since_orders_newest_first() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = db::open(tmp.path().to_str().unwrap()).unwrap();
+        let since = DateTime::parse_from_rfc3339("2026-03-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut old = sample(1);
+        old.timestamp = DateTime::parse_from_rfc3339("2026-03-28T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut new = sample(2);
+        new.timestamp = DateTime::parse_from_rfc3339("2026-03-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        put(&db, &old).unwrap();
+        put(&db, &new).unwrap();
+
+        let list = recent_since(&db, since, 10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, 2);
     }
 }

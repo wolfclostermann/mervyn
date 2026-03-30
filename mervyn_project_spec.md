@@ -82,8 +82,9 @@ mervyn/
 │       └── notes/
 └── src/
     ├── main.rs               # Tokio runtime, startup, service wiring
-    ├── config.rs             # Config loading (config crate: file + env layers)
+    ├── config.rs             # Config loading (config crate: file + env + MERVYN__ env overrides)
     ├── error.rs              # Unified error type (thiserror)
+    ├── state.rs              # AppState, Secrets (env)
     │
     ├── api/
     │   └── mod.rs            # axum router, Slack event handler HTTP endpoint
@@ -91,8 +92,8 @@ mervyn/
     ├── slack/
     │   ├── mod.rs
     │   ├── client.rs         # Outbound Slack Web API calls (reqwest)
-    │   ├── events.rs         # Incoming event deserialization (serde)
-    │   └── handler.rs        # Route incoming Slack messages to intent handlers
+    │   ├── events.rs         # Envelope serde, signature verify, X-Slack-Retry-Num parse
+    │   └── handler.rs        # Ingest → dedupe → filter → intent pipeline
     │
     ├── claude/
     │   ├── mod.rs
@@ -110,12 +111,15 @@ mervyn/
     │   ├── codec.rs          # Postcard encode/decode helpers
     │   ├── db.rs             # redb table definitions, open/init
     │   ├── events.rs         # CRUD for Event records
-    │   ├── reminders.rs      # CRUD for Reminder records
-    │   └── worklog.rs        # CRUD for WorklogEntry records
+    │   ├── reminders.rs      # CRUD for Reminder records (+ recurrence advance helpers)
+    │   ├── worklog.rs        # CRUD for WorklogEntry records
+    │   ├── meta.rs           # META_TABLE: Slack event_id dedupe claims
+    │   └── slack_ingest.rs   # Append ingest log + outcome updates per delivery
     │
     ├── vault/
     │   ├── mod.rs
-    │   └── sync.rs           # Read/write Markdown files; watch for changes (notify)
+    │   ├── sync.rs           # Vault Markdown → redb upsert
+    │   └── watcher.rs        # notify debounced re-sync on vault file changes
     │
     ├── scheduler/
     │   ├── mod.rs
@@ -394,35 +398,7 @@ impl ClaudeClient {
 }
 ```
 
-```rust
-// src/context/assembler.rs
-// Builds the context string passed to Claude for briefings and Q&A
-
-pub struct ContextAssembler {
-    db: Arc<redb::Database>,
-    vault_path: PathBuf,
-}
-
-impl ContextAssembler {
-    /// Build a full context dump for the morning briefing prompt.
-    /// Includes: upcoming events (7 days), pending reminders, recent worklog (3 days),
-    /// and the contents of vault/notes/ (if small enough).
-    pub async fn build_briefing_context(&self) -> anyhow::Result<String> {
-        // 1. Read upcoming events from redb (range scan by timestamp key)
-        // 2. Read pending reminders from redb
-        // 3. Read recent worklog entries from redb
-        // 4. Read vault Markdown files (worklog.md, reminders.md, notes/*.md)
-        // 5. Assemble into a structured string with clear section headings
-        todo!()
-    }
-
-    /// Lightweight context for answering a freeform question —
-    /// just reminders + recent worklog, skip notes.
-    pub async fn build_query_context(&self) -> anyhow::Result<String> {
-        todo!()
-    }
-}
-```
+**Context assembler** — Implemented in `src/context/assembler.rs`: `build_briefing_context`, `build_query_context`, and `briefing_prompt_sections` (three blobs for `MorningBriefingV1`). All take an explicit `now: DateTime<Utc>`.
 
 ---
 
@@ -450,6 +426,21 @@ Every incoming Slack event must be verified using the signing secret. Implement 
 // 2. Compute HMAC-SHA256 of "v0:{timestamp}:{raw_body}" using signing secret
 // 3. Compare with X-Slack-Signature header value (constant-time comparison)
 ```
+
+### Delivery ingest, deduplication, and handler pipeline
+
+Every **verified** `event_callback` is recorded before any business logic runs, so retries and filtered noise still leave an audit trail in redb.
+
+| Step | Responsibility | Code |
+|------|----------------|------|
+| 1. **Ingest** | Append one row per HTTP delivery to `slack_ingest` (`SLACK_INGEST_TABLE`): `event_id`, `received_at_ms`, `retry_num` from `X-Slack-Retry-Num` (if present), inner `event.type`, initial outcome `Pending`. | `storage/slack_ingest::append` |
+| 2. **Dedupe** | Atomically claim Slack’s top-level `event_id` in `META_TABLE` (`slack:ev:{event_id}`). If the claim fails, this delivery is a duplicate of an already-handled event: set ingest outcome to `DuplicateDelivery` and stop (no Claude / no Slack replies). | `storage/meta::try_claim_slack_delivery` |
+| 3. **Filter** | Drop bot messages, subtyped events, unsupported `type`s, empty text. Release the dedupe claim when skipping so a later legitimate retry can run. Set ingest outcome (`FilteredBot`, `FilteredSubtype`, etc.). | `slack/handler.rs` |
+| 4. **Action** | Classify intent → dispatch. On success: outcome `Processed`. On handler `Err`: **release** dedupe claim (so Slack can retry), outcome `Failed` (truncated error string). | `intent/*` |
+
+**Do not** skip processing solely because `X-Slack-Retry-Num` is set; deduplication is keyed by `event_id`, not the retry header.
+
+**Gap:** If the worker **panics** after ingest but before a terminal outcome, the row can remain `Pending` and the meta claim may strand. See **Open TODOs** below.
 
 ---
 
@@ -638,11 +629,21 @@ Build and validate each layer before moving to the next. Each step should be ind
 
 8. **Slack client** — `src/slack/client.rs`. Implement `post_message()`. Test by posting to the channel.
 
-9. **Slack event receiver** — `src/api/mod.rs` + `src/slack/`. Implement axum endpoint, signature verification (per **Crate preferences**), event deserialization, intent routing.
+9. **Slack event receiver** — `src/api/mod.rs` + `src/slack/`. Axum endpoint, signature verification, envelope parsing, **ingest → dedupe → filter → action** (see *Delivery ingest, deduplication, and handler pipeline*), intent routing.
 
 10. **Intent handlers** — `src/intent/`. Implement each handler. Wire everything together in `main.rs`.
 
 11. **Docker** — Build image, test locally, deploy to VPS. Set up TLS termination (Caddy or nginx in front of port 3000).
+
+---
+
+## Open TODOs (engineering follow-ups)
+
+Items below are **not** fully implemented yet; track them for production hardening.
+
+- [ ] **`slack_ingest` retention** — Unbounded growth of `SLACK_INGEST_TABLE`. Add a policy (e.g. delete rows older than *N* days, or keep last *M* rows), run from a cron job or the existing scheduler, and document env/config knobs.
+- [ ] **Stuck `Pending` ingest rows** — After a panic between `append` and `set_outcome`, or a crash after `try_claim_slack_delivery`, rows can stay `Pending` and meta claims can block retries. Options: wrap the worker in `catch_unwind` + outcome `Failed` / claim release; a periodic sweeper that flags old `Pending` rows; metrics / alerts on `Pending` count.
+- [ ] **Operator visibility** — Read-only listing or export of recent ingest rows (by outcome, `event_id`, time range) for debugging without opening the raw redb file; optional small CLI or HTTP admin route (auth required).
 
 ---
 
@@ -655,3 +656,4 @@ Build and validate each layer before moving to the next. Each step should be ind
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
 - Tracing: instrument every significant operation with `tracing::info!` / `tracing::debug!` spans. The Docker logs are your only observability.
+- Slack: see **Open TODOs** for ingest retention, panic / stuck-`Pending` handling, and operator tooling.

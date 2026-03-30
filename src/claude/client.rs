@@ -1,51 +1,55 @@
-use serde::{Deserialize, Serialize};
+//! HTTP client for the Anthropic Messages API.
 
-#[derive(Debug, Serialize)]
-pub struct ClaudeRequest {
-    pub model: String,
-    pub max_tokens: u32,
-    pub system: Option<String>,
-    pub messages: Vec<ClaudeMessage>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaudeMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ClaudeResponse {
-    pub content: Vec<ClaudeContent>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ClaudeContent {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub text: Option<String>,
-}
+use anthropic_ai_sdk::client::AnthropicClient;
+use anthropic_ai_sdk::types::message::{
+    ContentBlock, CreateMessageParams, Message, MessageClient, MessageError, Role,
+};
 
 pub struct ClaudeClient {
-    _http: reqwest::Client,
-    _api_key: String,
-    _model: String,
+    inner: AnthropicClient,
+    model: String,
+    max_tokens: u32,
 }
 
 impl ClaudeClient {
-    pub fn new(api_key: String, model: String) -> Self {
-        Self {
-            _http: reqwest::Client::new(),
-            _api_key: api_key,
-            _model: model,
-        }
+    pub fn new(api_key: String, model: String, max_tokens: u32) -> Result<Self, MessageError> {
+        let inner = AnthropicClient::new::<MessageError>(api_key, AnthropicClient::DEFAULT_API_VERSION)?;
+        Ok(Self {
+            inner,
+            model,
+            max_tokens,
+        })
     }
 
     pub async fn complete(
         &self,
-        _system: Option<&str>,
-        _user_message: &str,
+        system: Option<&str>,
+        user_message: &str,
     ) -> anyhow::Result<String> {
-        anyhow::bail!("Claude client not wired yet")
+        let params = CreateMessageParams {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            messages: vec![Message::new_text(Role::User, user_message)],
+            system: system.map(str::to_string),
+            ..Default::default()
+        };
+
+        let response = self
+            .inner
+            .create_message(Some(&params))
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        let text = response
+            .content
+            .into_iter()
+            .filter_map(|c| match c {
+                ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        Ok(text)
     }
 }
