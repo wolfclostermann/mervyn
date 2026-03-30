@@ -82,7 +82,7 @@ mervyn/
 │       └── notes/
 └── src/
     ├── main.rs               # Tokio runtime, startup, service wiring
-    ├── config.rs             # Config loading (config-rs or envy)
+    ├── config.rs             # Config loading (config crate: file + env layers)
     ├── error.rs              # Unified error type (thiserror)
     │
     ├── api/
@@ -96,7 +96,7 @@ mervyn/
     │
     ├── claude/
     │   ├── mod.rs
-    │   ├── client.rs         # Anthropic API HTTP client (reqwest + serde)
+    │   ├── client.rs         # Anthropic Messages API client (prefer maintained SDK/types; see Crate preferences)
     │   ├── payloads.rs       # Typed serde structs for prompt bodies (JSON to Claude)
     │   └── prompts.rs        # Static instructions + JSON builders (no raw format! of user text)
     │
@@ -184,6 +184,40 @@ chrono = { version = "0.4", features = ["serde"] }
 
 ---
 
+## Crate preferences (avoid reinventing wheels)
+
+Prefer maintained ecosystem crates over hand-rolled logic that duplicates specs and drifts when upstream APIs change.
+
+### Anthropic / Claude HTTP client
+
+When wiring `src/claude/client.rs`, prefer an **official or well-maintained community client** (or OpenAPI-generated types) for request/response shapes, headers, API versioning, streaming, and tool use. Hand-written `serde` structs are fine for early spikes but must not be the long-term single source of truth for the Messages API.
+
+### Slack Events API
+
+**Signature verification** must follow Slack’s rules: timestamp freshness, payload `v0:{timestamp}:{raw_body}`, HMAC-SHA256 with the signing secret, and **constant-time** comparison on the digest — using the **raw request body** before JSON parsing. Implement with the **`hmac`** and **`sha2`** crates and Slack’s docs, or use a **small, focused Slack signing helper** that encodes the same algorithm so behaviour stays aligned with [Verifying requests from Slack](https://api.slack.com/authentication/verifying-requests-from-slack). For heavier typing of envelopes and events, evaluate Slack-oriented crates; otherwise keep **`serde`** for minimal shapes.
+
+### Reminder recurrence
+
+`Recurrence::Custom(String)` must not evolve into a home-grown recurrence language. If storing or parsing **iCal-style RRULE** (or equivalent), use an established crate such as **`rrule`** instead of custom string parsers.
+
+### Obsidian / Markdown vault
+
+Vault sync and Markdown parsing should use a real **Markdown parser** (e.g. **`pulldown-cmark`** or **`comrak`**) and, for YAML front matter, a **`gray_matter`-style** crate. Stay tolerant of messy human edits in the ways this spec already allows, but implement structure extraction with proper parsers rather than fragile ad-hoc scanners where those crates apply.
+
+### Configuration
+
+Layer settings with the **`config`** crate: committed `config/default.toml` plus **environment variables** (and optional local overrides) on the same builder. Do not invent separate precedence or merge rules in application code.
+
+### Storage CRUD
+
+The `events`, `reminders`, and `worklog` modules share the same put/get/delete/list pattern over `redb`. Use a **macro or generic helper** over `TableDefinition` to avoid duplicated transaction/commit patterns and inconsistent error handling.
+
+### Already aligned (keep as-is)
+
+**`postcard`** for redb values, **`redb`** for embedded storage, **`tokio-cron-scheduler`** for scheduled jobs, **`notify`** for vault file watching, **`serde_json`** for Claude-bound JSON (prompt-injection safety), and **`config`** + **`dotenvy`** for settings are intentional choices and match this philosophy.
+
+---
+
 ## Core Types
 
 ```rust
@@ -223,7 +257,7 @@ pub enum Recurrence {
     Daily,
     Weekly,
     Monthly,
-    Custom(String),  // cron expression
+    Custom(String),  // e.g. RRULE or cron — parse with a real library (see Crate preferences)
 }
 ```
 
@@ -274,6 +308,8 @@ pub fn open(path: &str) -> anyhow::Result<Database> {
     Ok(db)
 }
 ```
+
+Illustrative shape only — prefer a maintained Anthropic client or generated types for production (see **Crate preferences**).
 
 ```rust
 // src/claude/client.rs
@@ -405,7 +441,7 @@ Mervyn uses the Slack **Events API** (HTTP POST) rather than a persistent WebSoc
 
 ### Signature verification
 
-Every incoming Slack event must be verified using the signing secret. Implement this as an `axum` middleware layer before the event handler:
+Every incoming Slack event must be verified using the signing secret. Implement this as an `axum` middleware layer before the event handler. Follow **Crate preferences (avoid reinventing wheels)** — use `hmac` + `sha2` (pure Rust) or an equivalent focused helper; do not roll a non-constant-time or body-re-parsed comparison.
 
 ```rust
 // src/slack/events.rs — verify Slack request signature
@@ -414,8 +450,6 @@ Every incoming Slack event must be verified using the signing secret. Implement 
 // 2. Compute HMAC-SHA256 of "v0:{timestamp}:{raw_body}" using signing secret
 // 3. Compare with X-Slack-Signature header value (constant-time comparison)
 ```
-
-Use the `hmac` and `sha2` crates (both pure Rust) for this.
 
 ---
 
@@ -502,11 +536,13 @@ Tags: openkj, mervyn
 Tags: karaoke
 ```
 
-The vault sync parser should be tolerant — prefer a simple line-by-line or regex parser over a strict format. Users will not always follow the format exactly.
+The vault sync parser should be tolerant of messy human edits. For structure (headings, lists, front matter), follow **Crate preferences (avoid reinventing wheels)** — use a Markdown parser and front-matter crate where they apply; fall back to simple heuristics only where the human-edited format is intentionally loose.
 
 ---
 
 ## Configuration
+
+Load defaults from `config/default.toml` and merge **environment variables** (and optional overrides) via the **`config`** crate as described in **Crate preferences (avoid reinventing wheels)**.
 
 ### `.env` (secrets, never committed)
 
@@ -586,13 +622,13 @@ services:
 
 Build and validate each layer before moving to the next. Each step should be independently testable.
 
-1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types. Write unit tests using a temp file path for the database.
+1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types (DRY with a macro or generic helper per **Crate preferences**). Write unit tests using a temp file path for the database.
 
 2. **Storage read strategy (spike)** — Before vault sync and context assembly assume unbounded data, evaluate **paging / key-range scans / caps** in redb instead of loading whole tables with `list_all` → `Vec`. Decide patterns for: upcoming events window, pending reminders, recent worklog, reminder sweep, and any “dump for Claude” paths. Outcome should guide `context/assembler` and job implementations.
 
-3. **Vault parser** — `src/vault/sync.rs`. Parse the three Markdown files into typed structs. Unit test with fixture files. Upsert into redb.
+3. **Vault parser** — `src/vault/sync.rs`. Parse the three Markdown files into typed structs (Markdown + front-matter crates per **Crate preferences**). Unit test with fixture files. Upsert into redb.
 
-4. **Claude client** — `src/claude/client.rs`. Implement the HTTP client and `complete()` method. Test with a hardcoded prompt against the real API.
+4. **Claude client** — `src/claude/client.rs`. Implement the HTTP client and `complete()` method per **Crate preferences** (prefer a maintained client or generated types for the Messages API). Test with a hardcoded prompt against the real API.
 
 5. **Context assembler** — `src/context/assembler.rs`. Implement `build_briefing_context()`. Test by printing the assembled string (use the read strategy from step 2).
 
@@ -602,7 +638,7 @@ Build and validate each layer before moving to the next. Each step should be ind
 
 8. **Slack client** — `src/slack/client.rs`. Implement `post_message()`. Test by posting to the channel.
 
-9. **Slack event receiver** — `src/api/mod.rs` + `src/slack/`. Implement axum endpoint, signature verification, event deserialization, intent routing.
+9. **Slack event receiver** — `src/api/mod.rs` + `src/slack/`. Implement axum endpoint, signature verification (per **Crate preferences**), event deserialization, intent routing.
 
 10. **Intent handlers** — `src/intent/`. Implement each handler. Wire everything together in `main.rs`.
 
@@ -612,6 +648,7 @@ Build and validate each layer before moving to the next. Each step should be ind
 
 ## Notes for the Implementer
 
+- Read **Crate preferences (avoid reinventing wheels)** before implementing Slack signing, Claude HTTP, vault parsing, recurrence, config layering, and storage CRUD patterns.
 - Use `Arc<redb::Database>` everywhere — the database handle is shared across the scheduler, the HTTP handler, and the vault sync job.
 - All async tasks communicate via the shared `Arc<Database>` and, if needed, a `tokio::sync::broadcast` channel for triggering immediate re-reads after vault writes.
 - Keep Claude-facing text out of Slack/intent handlers: build `system` / user JSON via `src/claude/prompts.rs` and `payloads.rs` only. Handlers pass structured inputs into those APIs; do not add ad hoc `format!` with user-controlled text.
