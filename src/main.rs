@@ -41,14 +41,11 @@ async fn main() -> anyhow::Result<()> {
         storage::db::open(&settings.storage.db_path).context("open redb")?,
     );
 
-    let claude = Arc::new(
-        ClaudeClient::new(
-            secrets.anthropic_api_key.clone(),
-            settings.claude.model.clone(),
-            settings.claude.max_tokens,
-        )
-        .context("anthropic client")?,
-    );
+    let claude = Arc::new(ClaudeClient::new(
+        secrets.anthropic_api_key.clone(),
+        settings.claude.model.clone(),
+        settings.claude.max_tokens,
+    ));
     let slack = Arc::new(SlackClient::new(secrets.slack_bot_token.clone()));
 
     let app_state = AppState {

@@ -6,7 +6,7 @@ See [mervyn_project_spec.md](mervyn_project_spec.md) for architecture, Slack ing
 
 **Runtime:** On startup, the binary opens `redb`, builds shared [`AppState`](src/state.rs) (config, secrets, Claude + Slack clients, DB, vault path), spawns the **cron scheduler** ([`scheduler/jobs.rs`](src/scheduler/jobs.rs)), and starts a **debounced vault file watcher** ([`vault/watcher.rs`](src/vault/watcher.rs)) so Markdown edits sync to the database without waiting for the periodic vault job.
 
-**Claude:** The Messages API is called through **`anthropic-ai-sdk`** ([`claude/client.rs`](src/claude/client.rs)). Prompt bodies still use the JSON API — typed structs in [`claude/payloads.rs`](src/claude/payloads.rs) and static copy in [`claude/prompts.rs`](src/claude/prompts.rs). See the spec *Prompt design (JSON API)*.
+**Claude:** The Messages API is called with **`reqwest`** ( **`rustls-tls`**, default features off) and small request/response types in [`claude/client.rs`](src/claude/client.rs). Prompt bodies still use the JSON API — typed structs in [`claude/payloads.rs`](src/claude/payloads.rs) and static copy in [`claude/prompts.rs`](src/claude/prompts.rs). See the spec *Prompt design (JSON API)*.
 
 ## Quick start (dev)
 

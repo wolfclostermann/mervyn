@@ -102,7 +102,7 @@ mervyn/
     │
     ├── claude/
     │   ├── mod.rs
-    │   ├── client.rs         # Anthropic Messages API client (prefer maintained SDK/types; see Crate preferences)
+    │   ├── client.rs         # Anthropic Messages API via reqwest + serde (rustls; see Crate preferences)
     │   ├── payloads.rs       # Typed serde structs for prompt bodies (JSON to Claude)
     │   └── prompts.rs        # Static instructions + JSON builders (no raw format! of user text)
     │
@@ -189,13 +189,12 @@ constant_time_eq = "0.4"
 bytes = "1"
 
 fnv = "1"
-anthropic-ai-sdk = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 ```
 
-**TLS / `reqwest`:** Mervyn enables **`rustls-tls`** on its direct `reqwest` dependency. **`anthropic-ai-sdk`** depends on `reqwest` with default features enabled, so Cargo’s feature union typically also links **`native-tls`** for the SDK’s client. Both stacks may appear in the dependency graph; this is a known trade-off until the SDK offers `default-features = false` on `reqwest` or a rustls-only feature flag.
+**TLS / `reqwest`:** Mervyn uses **`reqwest`** with **`default-features = false`** and **`rustls-tls`** only, so the binary does not pull **`native-tls`**. Re-evaluate an official or community SDK only if it exposes a rustls-only feature set that preserves that property.
 
 ---
 
@@ -205,9 +204,9 @@ Prefer maintained ecosystem crates over hand-rolled logic that duplicates specs 
 
 ### Anthropic / Claude HTTP client
 
-**Implemented:** `src/claude/client.rs` wraps **`anthropic-ai-sdk`** (`AnthropicClient` + `MessageClient::create_message`), using `CreateMessageParams`, `Message::new_text`, and API version `AnthropicClient::DEFAULT_API_VERSION` (currently `2023-06-01`). `ClaudeClient::new` returns `Result<_, MessageError>` because building the inner HTTP client can fail. Plain-text replies concatenate `ContentBlock::Text` segments from the response.
+**Implemented:** `src/claude/client.rs` POSTs to **`/v1/messages`** with **`reqwest`** (workspace **`rustls-tls`**), header **`anthropic-version: 2023-06-01`**, and serde request/response structs (string user `content`, optional `system`). Plain-text replies concatenate response blocks where **`type` is `text`**.
 
-For streaming, tools, or newer API fields, extend through the same SDK rather than duplicating request types by hand.
+For streaming, tools, or large API surface area, consider an SDK **only if** it can be configured for rustls-only `reqwest` (see **Dependencies**); otherwise extend the in-tree types carefully.
 
 ### Slack Events API
 
@@ -338,9 +337,9 @@ pub fn open(path: &str) -> anyhow::Result<Database> {
 
 ### Claude client (`src/claude/client.rs`) — as implemented
 
-`ClaudeClient` holds an `anthropic_ai_sdk::client::AnthropicClient`, plus `model` and `max_tokens` from config. `complete(system, user_message)` builds `CreateMessageParams` (single user `Message` with text content, optional `system`), calls `create_message`, and joins text blocks. Errors from the SDK are converted to `anyhow::Error` at the call site where needed.
+`ClaudeClient` holds a `reqwest::Client`, API key, `model`, and `max_tokens`. `complete(system, user_message)` sends one user message with string content and optional `system`, then joins `text` content blocks from the JSON response. HTTP and JSON failures surface as `anyhow::Error`.
 
-See **Dependencies** above for the `reqwest` / TLS interaction with `anthropic-ai-sdk`.
+See **Dependencies** above for the rustls-only `reqwest` setup.
 
 **Context assembler** — Implemented in `src/context/assembler.rs`: `build_briefing_context`, `build_query_context`, and `briefing_prompt_sections` (three blobs for `MorningBriefingV1`). All take an explicit `now: DateTime<Utc>`.
 
@@ -559,7 +558,7 @@ services:
 
 ## Implementation Order
 
-Build and validate each layer before moving to the next. Each step should be independently testable. **As of the current tree, steps 1–11 are largely implemented** (storage, vault sync, Claude via SDK, context, prompts, scheduler, Slack client, Events API pipeline with ingest/dedupe, intents, Docker assets); use the checklist below for remaining hardening (see **Open TODOs**) and optional refactors from **Crate preferences**.
+Build and validate each layer before moving to the next. Each step should be independently testable. **As of the current tree, steps 1–11 are largely implemented** (storage, vault sync, Claude Messages client, context, prompts, scheduler, Slack client, Events API pipeline with ingest/dedupe, intents, Docker assets); use the checklist below for remaining hardening (see **Open TODOs**) and optional refactors from **Crate preferences**.
 
 1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types (DRY with a macro or generic helper per **Crate preferences**). Write unit tests using a temp file path for the database.
 
