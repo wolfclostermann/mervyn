@@ -23,6 +23,8 @@ cargo run
 
 Default listen port comes from `config/default.toml` (`[server] port`, usually **3000**). Health check: `GET http://localhost:3000/health`
 
+Optional **operator** JSON: set `MERVYN_ADMIN_TOKEN` in `.env`, then `GET /admin/slack-ingest` with header `Authorization: Bearer <token>` and query params `limit`, `since_ms`, `until_ms`, `outcome`, `event_id` (see spec).
+
 ## Docker
 
 ```bash

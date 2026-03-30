@@ -236,6 +236,78 @@ pub fn sweep_stale_pending(
     Ok(StalePendingSweepReport { rewound })
 }
 
+/// Optional filters for [`list_recent`]. All conditions are ANDed. `outcome` matches the variant
+/// discriminant (`Pending`, `Processed`, `Failed`, `DuplicateDelivery`, …). `Failed` matches any
+/// [`SlackIngestOutcome::Failed`].
+#[derive(Debug, Clone, Default)]
+pub struct IngestListFilters<'a> {
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    pub outcome: Option<&'a str>,
+    pub event_id: Option<&'a str>,
+}
+
+fn outcome_matches_filter(o: &SlackIngestOutcome, filter: &str) -> bool {
+    match o {
+        SlackIngestOutcome::Failed(_) if filter == "Failed" => true,
+        SlackIngestOutcome::Pending if filter == "Pending" => true,
+        SlackIngestOutcome::DuplicateDelivery if filter == "DuplicateDelivery" => true,
+        SlackIngestOutcome::FilteredBot if filter == "FilteredBot" => true,
+        SlackIngestOutcome::FilteredSubtype if filter == "FilteredSubtype" => true,
+        SlackIngestOutcome::FilteredUnsupportedType if filter == "FilteredUnsupportedType" => true,
+        SlackIngestOutcome::FilteredEmptyText if filter == "FilteredEmptyText" => true,
+        SlackIngestOutcome::Processed if filter == "Processed" => true,
+        SlackIngestOutcome::Failed(_) => false,
+        _ => false,
+    }
+}
+
+/// Latest rows first (highest table id). Scans the full table in memory — intended for operator
+/// debugging, not hot paths. `limit` is clamped to **1..=500**.
+pub fn list_recent(
+    db: &Database,
+    filters: IngestListFilters<'_>,
+    limit: usize,
+) -> Result<Vec<(u64, SlackIngestEntry)>> {
+    let limit = limit.clamp(1, 500);
+    let r = db.begin_read()?;
+    let t = r.open_table(SLACK_INGEST_TABLE)?;
+    let mut rows: Vec<(u64, SlackIngestEntry)> = Vec::new();
+    for row in t.iter()? {
+        let (k, v) = row?;
+        let id = k.value();
+        let Ok(entry) = codec::decode::<SlackIngestEntry>(v.value()) else {
+            continue;
+        };
+        if let Some(s) = filters.since_ms {
+            if entry.received_at_ms < s {
+                continue;
+            }
+        }
+        if let Some(u) = filters.until_ms {
+            if entry.received_at_ms > u {
+                continue;
+            }
+        }
+        if let Some(eid) = filters.event_id {
+            if entry.event_id != eid {
+                continue;
+            }
+        }
+        if let Some(ov) = filters.outcome {
+            if !outcome_matches_filter(&entry.outcome, ov) {
+                continue;
+            }
+        }
+        rows.push((id, entry));
+    }
+    drop(t);
+    drop(r);
+    rows.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+    rows.truncate(limit);
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +439,72 @@ mod tests {
         .unwrap();
         let r = sweep_stale_pending(&db, 9_999_999_999_999, 0).unwrap();
         assert_eq!(r.rewound, 0);
+    }
+
+    #[test]
+    fn list_recent_filters_and_orders_newest_first() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = db::open(tmp.path().to_str().unwrap()).unwrap();
+        put(
+            &db,
+            1,
+            &SlackIngestEntry {
+                event_id: "A".into(),
+                received_at_ms: 100,
+                retry_num: None,
+                inner_type: "message".into(),
+                outcome: SlackIngestOutcome::Pending,
+            },
+        )
+        .unwrap();
+        put(
+            &db,
+            2,
+            &SlackIngestEntry {
+                event_id: "B".into(),
+                received_at_ms: 200,
+                retry_num: None,
+                inner_type: "message".into(),
+                outcome: SlackIngestOutcome::Processed,
+            },
+        )
+        .unwrap();
+        let rows = list_recent(
+            &db,
+            IngestListFilters {
+                outcome: Some("Processed"),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 2);
+        assert_eq!(rows[0].1.event_id, "B");
+
+        let rows = list_recent(
+            &db,
+            IngestListFilters {
+                event_id: Some("A"),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1);
+
+        let rows = list_recent(
+            &db,
+            IngestListFilters {
+                since_ms: Some(150),
+                until_ms: Some(250),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 2);
     }
 }

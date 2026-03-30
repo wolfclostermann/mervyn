@@ -14,6 +14,8 @@ pub struct Secrets {
     pub slack_bot_token: String,
     pub slack_signing_secret: String,
     pub slack_channel_id: String,
+    /// When set, enables `GET /admin/slack-ingest` with `Authorization: Bearer <token>`.
+    pub admin_token: Option<String>,
 }
 
 impl Secrets {
@@ -24,6 +26,10 @@ impl Secrets {
             slack_signing_secret: std::env::var("SLACK_SIGNING_SECRET")
                 .context("SLACK_SIGNING_SECRET")?,
             slack_channel_id: std::env::var("SLACK_CHANNEL_ID").context("SLACK_CHANNEL_ID")?,
+            admin_token: std::env::var("MERVYN_ADMIN_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

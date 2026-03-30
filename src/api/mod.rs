@@ -11,12 +11,18 @@ use crate::slack::events::{parse_retry_num, verify_slack_signature, SlackEnvelop
 use crate::slack::handler;
 use crate::state::AppState;
 
+mod admin;
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/slack/events", post(slack_events))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .route("/slack/events", post(slack_events));
+
+    if state.secrets.admin_token.is_some() {
+        app = app.route("/admin/slack-ingest", get(admin::list_slack_ingest));
+    }
+
+    app.layer(TraceLayer::new_for_http()).with_state(state)
 }
 
 async fn slack_events(

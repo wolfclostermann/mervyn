@@ -92,7 +92,8 @@ mervyn/
     ├── state.rs              # AppState, Secrets (env)
     │
     ├── api/
-    │   └── mod.rs            # axum router, Slack event handler HTTP endpoint
+    │   ├── mod.rs            # axum router, Slack events + optional admin routes
+    │   └── admin.rs          # Bearer-auth read-only slack_ingest listing (if MERVYN_ADMIN_TOKEN set)
     │
     ├── slack/
     │   ├── mod.rs
@@ -385,6 +386,19 @@ Every **verified** `event_callback` is recorded before any business logic runs, 
 
 **Hardening:** A [`SlackMetaClaimGuard`](src/slack/handler.rs) releases the meta claim on panic after a successful dedupe claim (unless disarmed on the success path). Rows still stuck `Pending` (e.g. panic before the guard is installed, or persistence failure after disarm) are cleared by the scheduled [`sweep_stale_pending`](src/storage/slack_ingest.rs) run (same cron as prune; see **`slack_ingest_stale_pending_minutes`**).
 
+### Operator: `slack_ingest` listing
+
+When **`MERVYN_ADMIN_TOKEN`** is set (non-empty), the router mounts **`GET /admin/slack-ingest`**. Clients send **`Authorization: Bearer <token>`** (compared with **`constant_time_eq`** on the suffix; reject wrong length without leaking timing on the secret). Query parameters (all optional except as noted):
+
+| Param | Meaning |
+|-------|---------|
+| `limit` | Max rows, default **100**, clamped **1..=500** |
+| `since_ms` / `until_ms` | Inclusive window on `received_at_ms` (Unix millis) |
+| `outcome` | Variant filter: `Pending`, `Processed`, `Failed` (any failure), `DuplicateDelivery`, `FilteredBot`, … |
+| `event_id` | Exact match on stored Slack top-level `event_id` |
+
+Response JSON: `{ "rows": [ { "id", "event_id", "received_at_ms", "retry_num", "inner_type", "outcome" } ] }` where `outcome` is a short string (`Failed: …` includes the message). Implementation scans the ingest table in memory (`storage::slack_ingest::list_recent`) — for debugging only, not a high-QPS API. If **`MERVYN_ADMIN_TOKEN`** is unset, the route is **not registered** (no probe surface).
+
 ---
 
 ## Prompt design (JSON API)
@@ -490,6 +504,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
 SLACK_CHANNEL_ID=C...      # Channel for morning briefing and reminder posts (bot must be a member)
+# Optional: MERVYN_ADMIN_TOKEN=...   # Enables GET /admin/slack-ingest (Bearer)
 ```
 
 ### `config/default.toml` (non-secret, committed)
@@ -591,7 +606,7 @@ Items below are **not** fully implemented yet; track them for production hardeni
 
 - [x] **`slack_ingest` retention** — Implemented: `storage::slack_ingest::prune` (age in days, then optional max row count by monotonic id), scheduled job `slack_ingest_prune` in `scheduler/jobs.rs`. Knobs: `storage.slack_ingest_retention_days`, `storage.slack_ingest_keep_last` (use `0` to disable each rule), `scheduler.slack_ingest_prune_cron`; env `MERVYN__STORAGE__SLACK_INGEST_*`, `MERVYN__SCHEDULER__SLACK_INGEST_PRUNE_CRON`.
 - [x] **Stuck `Pending` ingest rows** — Implemented: `SlackMetaClaimGuard` in `slack/handler.rs` releases dedupe meta on panic after claim (disarm on success/filter/error paths); `slack_ingest::sweep_stale_pending` on the prune cron marks long-`Pending` rows failed and releases meta (`storage.slack_ingest_stale_pending_minutes`, `0` = off). Metrics/alerts left to deployment.
-- [ ] **Operator visibility** — Read-only listing or export of recent ingest rows (by outcome, `event_id`, time range) for debugging without opening the raw redb file; optional small CLI or HTTP admin route (auth required).
+- [x] **Operator visibility** — Implemented: `GET /admin/slack-ingest` when `MERVYN_ADMIN_TOKEN` is set; Bearer auth; query filters `limit`, `since_ms`, `until_ms`, `outcome`, `event_id`; JSON body via `api/admin.rs` + `slack_ingest::list_recent`.
 
 ---
 
@@ -604,4 +619,4 @@ Items below are **not** fully implemented yet; track them for production hardeni
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
 - Tracing: instrument every significant operation with `tracing::info!` / `tracing::debug!` spans. The Docker logs are your only observability.
-- Slack: ingest retention and stale-`Pending` sweep are scheduled with prune; see **Open TODOs** for operator tooling only.
+- Slack: ingest retention, stale-`Pending` sweep, and optional admin ingest listing (`MERVYN_ADMIN_TOKEN`) — see spec *Operator: slack_ingest listing*.
