@@ -34,10 +34,11 @@ Under **OAuth & Permissions** → **Scopes** → **Bot Token Scopes**, add at le
 | Scope | Why |
 | ----- | --- |
 | `chat:write` | Post briefings, reminders, and replies (`chat.postMessage`) |
-| `channels:history` | Read channel message text for subscribed events |
+| `channels:history` | Read message text in **public** channels (for `message.channels` events) |
+| `groups:history` | Read message text in **private** channels the bot is in (for `message.groups` events) — **required** if Mervyn lives in a private channel |
 | `app_mentions:read` | Receive `app_mention` events |
 
-Adjust later if you move to private channels or DMs (e.g. `groups:history`, `im:history`) — see Slack’s scope docs for those surfaces.
+DMs would need `im:history` and `message.im` if you ever wire that; not required for channel use.
 
 ### 3. Event subscriptions
 
@@ -46,8 +47,11 @@ Adjust later if you move to private channels or DMs (e.g. `groups:history`, `im:
 3. Slack will send a URL verification challenge; Mervyn answers it when the route is wired correctly.
 4. Under **Subscribe to bot events**, add:
 
-   - `message.channels` — messages in public channels the bot is in  
+   - `message.channels` — ordinary messages in **public** channels the bot is in  
+   - `message.groups` — ordinary messages in **private** channels the bot is in (without this, only `@mentions` reach Mervyn in private channels)  
    - `app_mention` — when someone `@mentions` the bot  
+
+After changing scopes or events, open **OAuth & Permissions** and **Reinstall to Workspace** so the bot token picks up new permissions.
 
 ### 4. Install and copy secrets
 
@@ -57,7 +61,7 @@ Adjust later if you move to private channels or DMs (e.g. `groups:history`, `im:
 
 ### 5. Channel ID (`SLACK_CHANNEL_ID`)
 
-Scheduled briefings and reminders are posted to a single channel. Invite the bot to that channel, then set **`SLACK_CHANNEL_ID`** to that channel’s ID (starts with `C` for public channels). Typical ways to get it:
+Scheduled briefings and reminders are posted to a single channel. Invite the bot to that channel, then set **`SLACK_CHANNEL_ID`** to that channel’s ID (from **About** / channel details or the channel URL — public is often `C…`, private is often `G…`). Typical ways to get it:
 
 - In the Slack desktop app: open the channel → channel name → **About** / details, or copy a link to the channel and take the ID from the URL.
 - Or call [`conversations.list`](https://api.slack.com/methods/conversations.list) with your bot token and find the channel.
@@ -90,7 +94,7 @@ Interaction is the same whether you run with **`cargo run`** or **Docker Compose
 ### Slack
 
 1. **Invite the bot** into the public channel you care about (the one whose ID you set as `SLACK_CHANNEL_ID`, and any other channels you want it to read from).
-2. **Send a normal message** in that channel, or **@mention the bot**. Mervyn subscribes to `message.channels` and `app_mention`; it ignores its own bot messages and most message subtypes.
+2. **Send a normal message** in that channel, or **@mention the bot**. In **public** channels that requires `message.channels`; in **private** channels it requires **`message.groups`** plus `groups:history` (see above). Mervyn ignores its own bot messages and most message subtypes.
 3. **Natural language in, structured action out:** your text is sent to Claude for **intent classification**, then one handler runs and Mervyn **replies in Slack** (in the same channel; replies stay in the thread when Slack sends a thread timestamp). If classification fails, the message is treated as a plain **question** (`ask`).
 
 Roughly what each intent does (you do **not** type these labels yourself—describe what you want in ordinary sentences):
