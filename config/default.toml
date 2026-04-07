@@ -32,3 +32,12 @@ domain = ""
 enabled = true
 situation_file = "mervyn-situation.md"
 situation_max_chars = 12000
+
+# While Mervyn is running: `git pull --ff-only` in repo_path, then vault → redb sync (picks up symlinked worklog.md).
+# Default layout: sibling clone at ../mervyn-worklog (see mervyn-worklog README).
+[worklog_git]
+enabled = true
+repo_path = "../mervyn-worklog"
+remote = "origin"
+branch = "main"
+pull_cron = "0 */5 * * * *"

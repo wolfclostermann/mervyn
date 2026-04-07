@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub ngrok: NgrokSection,
     #[serde(default)]
     pub user_context: UserContextSection,
+    /// Optional scheduled `git pull` for a worklog (or vault) repo while Mervyn is running.
+    #[serde(default)]
+    pub worklog_git: WorklogGitSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +106,46 @@ impl Default for UserContextSection {
             enabled: default_user_context_enabled(),
             situation_file: default_situation_file(),
             situation_max_chars: default_situation_max_chars(),
+        }
+    }
+}
+
+fn default_git_remote() -> String {
+    "origin".to_string()
+}
+
+fn default_git_branch() -> String {
+    "main".to_string()
+}
+
+fn default_worklog_git_pull_cron() -> String {
+    "0 */5 * * * *".to_string()
+}
+
+/// Run `git pull --ff-only` on a schedule (same Tokio scheduler as vault sync). Off by default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorklogGitSection {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Repository working tree (path passed to `git -C`). Relative paths use the process cwd.
+    #[serde(default)]
+    pub repo_path: String,
+    #[serde(default = "default_git_remote")]
+    pub remote: String,
+    #[serde(default = "default_git_branch")]
+    pub branch: String,
+    #[serde(default = "default_worklog_git_pull_cron")]
+    pub pull_cron: String,
+}
+
+impl Default for WorklogGitSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo_path: String::new(),
+            remote: default_git_remote(),
+            branch: default_git_branch(),
+            pull_cron: default_worklog_git_pull_cron(),
         }
     }
 }

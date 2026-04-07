@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Append a line to a shared worklog.md (Mervyn vault format) and push from that repo.
+# Install: copy or symlink this file and append-worklog-line.py into the same directory,
+#          set git config core.hooksPath to that directory, and create ~/.config/mervyn-worklog/env
+# See README.md in this folder.
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mervyn-worklog"
+ENV_FILE="${CONFIG_DIR}/env"
+
+[[ -f "$ENV_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APPEND_PY="${MERVYN_WORKLOG_APPEND_SCRIPT:-$HOOK_DIR/append-worklog-line.py}"
+
+[[ -n "${MERVYN_WORKLOG_REPO:-}" ]] || exit 0
+[[ -n "${MERVYN_WORKLOG_REL_PATH:-}" ]] || exit 0
+[[ -n "${MERVYN_WORKLOG_PROJECT_PREFIXES:-}" ]] || exit 0
+
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+worklog_root="$(cd "$MERVYN_WORKLOG_REPO" && pwd)"
+top_abs="$(cd "$top" && pwd)"
+
+# Do not run when committing inside the worklog repo (avoids loops).
+[[ "$top_abs" != "$worklog_root" ]] || exit 0
+
+matched=
+for p in $MERVYN_WORKLOG_PROJECT_PREFIXES; do
+  pabs="$(cd "$p" 2>/dev/null && pwd)" || continue
+  case "$top_abs" in
+    "$pabs" | "$pabs"/*) matched=1; break ;;
+  esac
+done
+[[ -n "$matched" ]] || exit 0
+
+command -v python3 >/dev/null || exit 0
+[[ -f "$APPEND_PY" ]] || exit 0
+
+repo_name="$(basename "$top_abs")"
+hash="$(git rev-parse --short HEAD)"
+subj="$(git log -1 --pretty=%s)"
+# One markdown list item; Mervyn parses list bodies under ## YYYY-MM-DD.
+line="**${repo_name}** \`${hash}\` ${subj}"
+
+worklog_file="${MERVYN_WORKLOG_REPO}/${MERVYN_WORKLOG_REL_PATH}"
+python3 "$APPEND_PY" "$worklog_file" "$line"
+
+cd "$MERVYN_WORKLOG_REPO"
+git add -- "$MERVYN_WORKLOG_REL_PATH"
+if git diff --staged --quiet; then
+  exit 0
+fi
+
+git commit -m "worklog: ${repo_name} ${hash}"
+
+if [[ "${MERVYN_WORKLOG_SKIP_PUSH:-}" != "1" ]]; then
+  git push
+fi

@@ -1,6 +1,8 @@
-//! Cron jobs: morning briefing, reminder check, vault sync.
+//! Cron jobs: morning briefing, reminder check, vault sync, optional worklog `git pull`.
 
 use chrono::Utc;
+
+use anyhow::Context;
 
 use crate::claude::prompts;
 use crate::context::ContextAssembler;
@@ -9,6 +11,7 @@ use crate::storage::reminders;
 use crate::user_situation;
 use crate::storage::slack_ingest;
 use tokio_cron_scheduler::{Job, JobScheduler};
+use tokio::process::Command;
 
 async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
     let stats = crate::vault::sync::sync_vault_to_db(state.db.as_ref(), &state.vault_path)?;
@@ -55,6 +58,42 @@ async fn run_reminder_check(state: &AppState) -> anyhow::Result<()> {
 async fn run_vault_sync(state: &AppState) -> anyhow::Result<()> {
     let s = crate::vault::sync::sync_vault_to_db(state.db.as_ref(), &state.vault_path)?;
     tracing::debug!(?s, "scheduled vault sync");
+    Ok(())
+}
+
+async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
+    let cfg = &state.settings.worklog_git;
+    if !cfg.enabled {
+        return Ok(());
+    }
+    let repo = cfg.repo_path.trim();
+    if repo.is_empty() {
+        tracing::warn!("worklog_git.enabled is true but worklog_git.repo_path is empty");
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args([
+            "pull",
+            "--ff-only",
+            cfg.remote.trim(),
+            cfg.branch.trim(),
+        ])
+        .output()
+        .await
+        .with_context(|| format!("spawn git pull in {repo}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!("git pull in {repo} failed: {stderr} {stdout}");
+    }
+
+    tracing::info!(repo, remote = %cfg.remote, branch = %cfg.branch, "worklog git pull ok");
+
+    let s = crate::vault::sync::sync_vault_to_db(state.db.as_ref(), &state.vault_path)?;
+    tracing::debug!(?s, "vault synced after worklog git pull");
     Ok(())
 }
 
@@ -151,6 +190,27 @@ pub async fn spawn_scheduler(state: AppState) -> anyhow::Result<()> {
             })
         })?)
         .await?;
+
+    if state.settings.worklog_git.enabled {
+        if state.settings.worklog_git.repo_path.trim().is_empty() {
+            tracing::warn!(
+                "worklog_git.enabled is true but repo_path is empty; worklog git pull job not scheduled"
+            );
+        } else {
+            let st = state.clone();
+            let c = st.settings.worklog_git.pull_cron.clone();
+            sched
+                .add(Job::new_async_tz(c.as_str(), tz, move |_uuid, _lock| {
+                    let st = st.clone();
+                    Box::pin(async move {
+                        if let Err(e) = run_worklog_git_pull(&st).await {
+                            tracing::error!(error = %e, "worklog_git_pull job");
+                        }
+                    })
+                })?)
+                .await?;
+        }
+    }
 
     tokio::spawn(async move {
         if let Err(e) = sched.start().await {
