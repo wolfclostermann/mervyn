@@ -60,7 +60,14 @@ Exploratory notes for connecting Mervyn to corporate Microsoft 365, WhatsApp, an
 
 ---
 
+## VPS / private worklog (Docker)
+
+**TODO (deployment):** With **mervyn-worklog** private, configure Git authentication on the VPS so `git pull` in Docker succeeds — PAT over HTTPS, deploy key, or equivalent. See **[docs/vps-worklog-git.md](docs/vps-worklog-git.md)**.
+
+---
+
 ## Related documents
 
 - [mervyn_project_spec.md](mervyn_project_spec.md) — architecture, Slack, vault, Claude, deployment
 - [README.md](README.md) — quick start and current integrations
+- [docs/vps-worklog-git.md](docs/vps-worklog-git.md) — VPS Git auth for private worklog in Docker
