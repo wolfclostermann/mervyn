@@ -17,6 +17,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+
 use crate::claude::client::ClaudeClient;
 use crate::slack::client::SlackClient;
 use crate::state::{AppState, Secrets};
@@ -69,13 +72,62 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("start ngrok tunnel")?;
 
+    let startup_msg = "Hello! Mervyn is up and running.";
+    match app_state
+        .slack
+        .post_message(&app_state.secrets.slack_channel_id, startup_msg, None)
+        .await
+    {
+        Ok(()) => tracing::info!("slack startup greeting sent"),
+        Err(e) => tracing::warn!(error = %e, "slack startup greeting failed"),
+    }
+
     tracing::info!(port = settings.server.port, "mervyn starting");
 
+    let state_for_shutdown = app_state.clone();
     let app = api::router(app_state);
     let addr = format!("0.0.0.0:{}", settings.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    let shutdown_msg = "Goodbye! Mervyn is shutting down.";
+    match state_for_shutdown
+        .slack
+        .post_message(&state_for_shutdown.secrets.slack_channel_id, shutdown_msg, None)
+        .await
+    {
+        Ok(()) => tracing::info!("slack shutdown message sent"),
+        Err(e) => tracing::warn!(error = %e, "slack shutdown message failed"),
+    }
+
     Ok(())
+}
+
+/// Waits for Ctrl+C or (on Unix) SIGTERM so the HTTP server can drain and exit cleanly.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        signal(SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        _ = sigterm => {},
+    }
 }
