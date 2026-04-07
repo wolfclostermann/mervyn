@@ -14,6 +14,8 @@ const NOTES_CHAR_BUDGET: usize = 24_000;
 const QUERY_EVENT_HORIZON_DAYS: i64 = 40;
 /// Cap for `events.md` mirror in query context (keeps token use bounded).
 const QUERY_EVENTS_MD_MAX_CHARS: usize = 12_000;
+/// Cap for `worklog.md` mirror in query context (git-synced file may be ahead of redb briefly).
+const QUERY_WORKLOG_MD_MAX_CHARS: usize = 16_000;
 
 /// Slack-queued briefing lines stay visible to the morning job for this long.
 const BRIEFING_QUEUE_MAX_AGE: Duration = Duration::hours(48);
@@ -174,9 +176,25 @@ impl ContextAssembler {
         let reminder_horizon = now + Duration::days(7);
         let pending = reminders::pending_due_within(self.db.as_ref(), reminder_horizon, 40)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let worklog_since = now - Duration::days(2);
-        let work = worklog::recent_since(self.db.as_ref(), worklog_since, 25)
+        let worklog_since = now - Duration::days(7);
+        let work = worklog::recent_since(self.db.as_ref(), worklog_since, 50)
             .map_err(|e| anyhow::anyhow!(e))?;
+
+        let worklog_md_raw = read_file_or_empty(self.vault_path.join("worklog.md")).await?;
+        let wl_len = worklog_md_raw.chars().count();
+        let worklog_md: String = worklog_md_raw
+            .chars()
+            .take(QUERY_WORKLOG_MD_MAX_CHARS)
+            .collect();
+        let worklog_md_block = if worklog_md.trim().is_empty() {
+            "(empty or missing)\n".to_string()
+        } else {
+            let mut s = worklog_md;
+            if wl_len > QUERY_WORKLOG_MD_MAX_CHARS {
+                s.push_str("\n… (worklog.md truncated)\n");
+            }
+            s
+        };
 
         let situation_block = situation
             .map(str::trim)
@@ -191,12 +209,14 @@ impl ContextAssembler {
              ## Upcoming events (database, next {} days)\n{}\n\n\
              ## Vault events.md\n{}\n\n\
              ## Pending reminders\n{}\n\n\
-             ## Recent worklog\n{}",
+             ## Recent worklog (database, last 7 days)\n{}\n\n\
+             ## Vault worklog.md (file on disk; may include git-backed lines not yet in DB)\n{}",
             QUERY_EVENT_HORIZON_DAYS,
             format_events(&evs),
             events_md_block,
             format_reminders(&pending),
-            format_worklog(&work)
+            format_worklog(&work),
+            worklog_md_block
         ))
     }
 
@@ -399,5 +419,25 @@ mod tests {
             .with_timezone(&Utc);
         let ctx = asm.build_query_context(now, None).await.unwrap();
         assert!(ctx.contains("Team sync"));
+    }
+
+    #[tokio::test]
+    async fn query_context_includes_vault_worklog_md() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(db::open(tmp.path().to_str().unwrap()).unwrap());
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("worklog.md"),
+            "## 2026-04-07\n- **mervyn** `abc1234` shipped feature\n",
+        )
+        .unwrap();
+
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
+        let now = DateTime::parse_from_rfc3339("2026-04-07T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ctx = asm.build_query_context(now, None).await.unwrap();
+        assert!(ctx.contains("Vault worklog.md"));
+        assert!(ctx.contains("shipped feature"));
     }
 }

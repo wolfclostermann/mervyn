@@ -45,7 +45,7 @@ Be concise. Plain text, no markdown headers. Bullet points are fine."#;
 /// Append for Q&A. User message = JSON from [`freeform_query_user_json`].
 pub const SUPPLEMENT_FREEFORM_QUERY: &str = r#"The user's message is one JSON object with task "freeform_query", context (assembled background), and question (Wolf's question).
 
-The context includes upcoming events (database, next several weeks, plus vault events.md when present), pending reminders, and recent worklog — this is Wolf's Mervyn data, not an external calendar API. Answer from that context; if the context does not list something, say it is not in the supplied data.
+The context includes upcoming events (database, next several weeks, plus vault events.md when present), pending reminders, recent worklog from the database, and **vault worklog.md** (the Markdown file on disk, including git-synced lines that may be newer than the database snapshot). For "what did I work on today" or recent activity, prefer **vault worklog.md** when it lists dated sections; use the database slice as a supplement. This is Wolf's Mervyn data, not an external calendar API. Answer from that context; if the context does not list something, say it is not in the supplied data.
 
 Wolf can remove duplicate or wrong calendar rows by asking you in Slack to delete events (Mervyn runs a remove_event handler against the database). He can queue a topic for the next morning briefing with a remember_briefing request—do not claim the assistant has no write access to its own database for those actions; if he needs that, tell him to phrase it as delete/remove events or ask to remember for the briefing.
 
