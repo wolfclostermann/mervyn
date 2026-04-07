@@ -19,7 +19,11 @@ async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
 
     let now = Utc::now();
     let situation = user_situation::load_for_prompts(state.settings.as_ref());
-    let asm = ContextAssembler::new(state.db.clone(), state.vault_path.clone());
+    let asm = ContextAssembler::new(
+        state.db.clone(),
+        state.vault_path.clone(),
+        state.settings.worklog_md_git_mirror_path(),
+    );
     let (ev, rem, wl) = asm
         .briefing_prompt_sections(now, situation.as_deref())
         .await?;
@@ -61,7 +65,8 @@ async fn run_vault_sync(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
+/// `git pull` worklog repo + vault sync. Used on a cron when enabled and once at process startup.
+pub async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
     let cfg = &state.settings.worklog_git;
     if !cfg.enabled {
         return Ok(());

@@ -25,8 +25,9 @@ Clone it somewhere stable, e.g. `~/Code/Play/mervyn-worklog`.
 
 Pick one:
 
-- **Symlink** into your Mervyn vault:  
-  `ln -sf ~/Code/Play/mervyn-worklog/worklog.md /path/to/mervyn/data/vault/worklog.md`
+- **Symlink** into your Mervyn vault. Prefer an **absolute** target so tools (e.g. Cursor) that resolve links from the workspace root still find the file; relative `../../../mervyn-worklog/worklog.md` is correct for the shell but can break in editors.  
+  `ln -sf /Users/you/Code/Play/mervyn-worklog/worklog.md /path/to/mervyn/data/vault/worklog.md`  
+  If you use a relative link from **`mervyn/data/vault`**, it must be **three** `..` segments, then **`mervyn-worklog/worklog.md`** (not two `..`).
 - Or keep **only** `worklog.md` in the worklog repo and put the rest of the vault (reminders, events, notes) beside it on disk as you already do.
 
 Mervyn only needs `vault_path/worklog.md` to exist and match the [worklog format](../../mervyn_project_spec.md) (`## YYYY-MM-DD` + bullets).

@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 fn default_slack_ingest_prune_cron() -> String {
@@ -147,6 +149,21 @@ impl Default for WorklogGitSection {
             branch: default_git_branch(),
             pull_cron: default_worklog_git_pull_cron(),
         }
+    }
+}
+
+impl AppConfig {
+    /// When `[worklog_git]` is on, path to `worklog.md` inside that clone — used if vault `worklog.md`
+    /// is missing or empty (e.g. broken symlink into an unmounted path in Docker).
+    pub fn worklog_md_git_mirror_path(&self) -> Option<PathBuf> {
+        if !self.worklog_git.enabled {
+            return None;
+        }
+        let r = self.worklog_git.repo_path.trim();
+        if r.is_empty() {
+            return None;
+        }
+        Some(Path::new(r).join("worklog.md"))
     }
 }
 

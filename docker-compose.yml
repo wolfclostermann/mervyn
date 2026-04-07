@@ -6,7 +6,11 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/app/data
+      # Sibling git worklog repo (host path). Uncomment so vault symlinks / pull target exist in-container.
+      - ../mervyn-worklog:/worklog
     env_file:
       - .env
     environment:
       - RUST_LOG=mervyn=debug,tower_http=info
+      # Must match the /worklog volume when using Docker; vault symlinks often break without this.
+      - MERVYN__WORKLOG_GIT__REPO_PATH=/worklog

@@ -35,6 +35,9 @@ situation_max_chars = 12000
 
 # While Mervyn is running: `git pull --ff-only` in repo_path, then vault → redb sync (picks up symlinked worklog.md).
 # Default layout: sibling clone at ../mervyn-worklog (see mervyn-worklog README).
+# Docker: mount that repo (e.g. to /worklog) and set MERVYN__WORKLOG_GIT__REPO_PATH=/worklog — vault symlinks
+# to the host clone do not resolve inside the container otherwise. When set, Ask/briefing also read
+# repo_path/worklog.md if vault worklog.md is missing or empty.
 [worklog_git]
 enabled = true
 repo_path = "../mervyn-worklog"

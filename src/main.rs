@@ -72,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("start ngrok tunnel")?;
 
+    if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {
+        tracing::error!(error = %e, "worklog git pull on startup");
+    }
+
     let startup_msg = "Hello! Mervyn is up and running.";
     match app_state
         .slack
