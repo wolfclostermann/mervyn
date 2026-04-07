@@ -10,6 +10,10 @@ pub struct AppConfig {
     pub scheduler: SchedulerSection,
     pub storage: StorageSection,
     pub server: ServerSection,
+    #[serde(default)]
+    pub ngrok: NgrokSection,
+    #[serde(default)]
+    pub user_context: UserContextSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +55,56 @@ fn default_slack_ingest_stale_pending_minutes() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerSection {
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NgrokSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+impl Default for NgrokSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: None,
+        }
+    }
+}
+
+fn default_user_context_enabled() -> bool {
+    true
+}
+
+fn default_situation_file() -> String {
+    "mervyn-situation.md".to_string()
+}
+
+fn default_situation_max_chars() -> usize {
+    12_000
+}
+
+/// Markdown file (under `storage.vault_path`) merged into Claude session JSON for every call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserContextSection {
+    #[serde(default = "default_user_context_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_situation_file")]
+    pub situation_file: String,
+    #[serde(default = "default_situation_max_chars")]
+    pub situation_max_chars: usize,
+}
+
+impl Default for UserContextSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_user_context_enabled(),
+            situation_file: default_situation_file(),
+            situation_max_chars: default_situation_max_chars(),
+        }
+    }
 }
 
 pub fn load() -> anyhow::Result<AppConfig> {

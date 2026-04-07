@@ -13,6 +13,8 @@ pub const PROMPT_API_VERSION: u32 = 1;
 pub const TASK_INTENT_CLASSIFICATION: &str = "intent_classification";
 pub const TASK_MORNING_BRIEFING: &str = "morning_briefing";
 pub const TASK_FREEFORM_QUERY: &str = "freeform_query";
+pub const TASK_EVENT_TITLE_EXTRACTION: &str = "event_title_extraction";
+pub const TASK_REMOVE_EVENT: &str = "remove_event";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +23,9 @@ pub struct SystemContextV1 {
     pub assistant_name: &'static str,
     pub user: UserProfileV1,
     pub clock: ClockV1,
+    /// Wolf-maintained Markdown (vault file): projects, priorities, life context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub situation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,7 +45,7 @@ pub struct ClockV1 {
 }
 
 impl SystemContextV1 {
-    pub fn for_wolf(now: DateTime<Utc>) -> Self {
+    pub fn for_wolf(now: DateTime<Utc>, situation: Option<String>) -> Self {
         let london = now.with_timezone(&London);
         Self {
             api_version: PROMPT_API_VERSION,
@@ -55,6 +60,7 @@ impl SystemContextV1 {
                 time: london.format("%H:%M").to_string(),
                 timezone: "Europe/London",
             },
+            situation,
         }
     }
 }
@@ -75,6 +81,67 @@ impl IntentClassificationV1 {
             message: message.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EventTitleExtractionV1 {
+    pub api_version: u32,
+    pub task: &'static str,
+    pub message: String,
+}
+
+impl EventTitleExtractionV1 {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            api_version: PROMPT_API_VERSION,
+            task: TASK_EVENT_TITLE_EXTRACTION,
+            message: message.into(),
+        }
+    }
+}
+
+/// Model reply for [`TASK_EVENT_TITLE_EXTRACTION`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EventTitleReplyV1 {
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RemoveEventCandidateV1 {
+    pub id: u64,
+    pub title: String,
+    pub start_rfc3339: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RemoveEventRequestV1 {
+    pub api_version: u32,
+    pub task: &'static str,
+    pub message: String,
+    pub candidates: Vec<RemoveEventCandidateV1>,
+}
+
+impl RemoveEventRequestV1 {
+    pub fn new(message: impl Into<String>, candidates: Vec<RemoveEventCandidateV1>) -> Self {
+        Self {
+            api_version: PROMPT_API_VERSION,
+            task: TASK_REMOVE_EVENT,
+            message: message.into(),
+            candidates,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RemoveEventReplyV1 {
+    #[serde(default)]
+    pub event_ids_to_delete: Vec<u64>,
 }
 
 /// Expected model reply for intent routing (deserialize). `api_version` mirrors the request when present.

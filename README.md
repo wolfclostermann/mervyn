@@ -81,6 +81,8 @@ Default listen port comes from `config/default.toml` (`[server] port`, usually *
 
 Optional **operator** JSON: set `MERVYN_ADMIN_TOKEN` in `.env`, then `GET /admin/slack-ingest` with header `Authorization: Bearer <token>` and query params `limit`, `since_ms`, `until_ms`, `outcome`, `event_id` (see spec).
 
+Optional **built-in ngrok tunnel** (local dev): set `NGROK_AUTHTOKEN` and `MERVYN__NGROK__ENABLED=true` in `.env`, then run `cargo run`. Mervyn logs a public URL and the exact Slack Events URL to paste into Slack app settings. You can also set `MERVYN__NGROK__DOMAIN=<reserved-domain>` if you use a reserved ngrok domain.
+
 ## Usage
 
 Interaction is the same whether you run with **`cargo run`** or **Docker Compose**: Slack and the vault are the main surfaces; HTTP is for health, Slack delivery, and optional admin.

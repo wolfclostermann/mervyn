@@ -14,6 +14,7 @@ use std::sync::Arc;
 use redb::Database;
 
 use crate::intent::{self, IntentLabel};
+use crate::user_situation;
 use crate::slack::events::SlackEvent;
 use crate::state::AppState;
 use crate::storage::meta;
@@ -179,14 +180,15 @@ async fn handle_user_message(
         .unwrap_or(state.secrets.slack_channel_id.as_str());
     let thread_parent = event.thread_ts.as_deref().or(event.ts.as_deref());
 
-    let label = match intent::classify_intent(&state.claude, &cleaned).await {
+    let situation = user_situation::load_for_prompts(state.settings.as_ref());
+    let label = match intent::classify_intent(&state.claude, &cleaned, situation.clone()).await {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!(error = %e, "intent classification failed; defaulting to ask");
             IntentLabel::Ask
         }
     };
-    intent::dispatch(state, label, &cleaned, channel, thread_parent).await
+    intent::dispatch(state, label, &cleaned, channel, thread_parent, situation).await
 }
 
 fn strip_leading_bot_mention(text: &str) -> String {

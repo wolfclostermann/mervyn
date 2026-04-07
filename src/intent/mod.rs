@@ -2,7 +2,12 @@ pub mod add_event;
 pub mod add_note;
 pub mod add_reminder;
 pub mod ask;
+pub mod event_title;
 pub mod log_work;
+pub mod remember_briefing;
+pub mod remove_event;
+pub mod slack_clean;
+pub mod text_datetime;
 
 use chrono::Utc;
 
@@ -16,6 +21,8 @@ pub enum IntentLabel {
     AddEvent,
     LogWork,
     AddNote,
+    RemoveEvent,
+    RememberBriefing,
     Ask,
 }
 
@@ -28,6 +35,8 @@ fn intent_from_token(token: &str) -> Option<IntentLabel> {
         "add_event" => Some(IntentLabel::AddEvent),
         "log_work" => Some(IntentLabel::LogWork),
         "add_note" => Some(IntentLabel::AddNote),
+        "remove_event" => Some(IntentLabel::RemoveEvent),
+        "remember_briefing" => Some(IntentLabel::RememberBriefing),
         "ask" => Some(IntentLabel::Ask),
         _ => None,
     }
@@ -40,7 +49,7 @@ pub fn parse_intent_label(raw: &str) -> Option<IntentLabel> {
     intent_from_token(token)
 }
 
-fn normalize_claude_json_block(raw: &str) -> String {
+pub(crate) fn normalize_claude_json_block(raw: &str) -> String {
     let s = raw.trim();
     let Some(after_open) = s.strip_prefix("```") else {
         return s.to_string();
@@ -74,9 +83,10 @@ pub fn parse_intent_reply(raw: &str) -> Option<IntentLabel> {
 pub async fn classify_intent(
     claude: &crate::claude::client::ClaudeClient,
     message: &str,
+    situation: Option<String>,
 ) -> anyhow::Result<IntentLabel> {
     let now = Utc::now();
-    let sys = prompts::system_prompt_json(now)?;
+    let sys = prompts::system_prompt_json(now, situation)?;
     let system = format!("{sys}\n\n{}", prompts::SUPPLEMENT_INTENT_CLASSIFICATION);
     let user_json = prompts::intent_classification_user_json(message)?;
     let label_text = claude.complete(Some(&system), &user_json).await?;
@@ -89,12 +99,15 @@ pub async fn dispatch(
     user_text: &str,
     channel: &str,
     thread_parent_ts: Option<&str>,
+    situation: Option<String>,
 ) -> anyhow::Result<()> {
     let reply = match label {
         IntentLabel::AddReminder => add_reminder::run(state, user_text).await?,
-        IntentLabel::AddEvent => add_event::run(state, user_text).await?,
+        IntentLabel::AddEvent => add_event::run(state, user_text, situation).await?,
         IntentLabel::LogWork => log_work::run(state, user_text).await?,
         IntentLabel::AddNote => add_note::run(state, user_text).await?,
+        IntentLabel::RemoveEvent => remove_event::run(state, user_text).await?,
+        IntentLabel::RememberBriefing => remember_briefing::run(state, user_text).await?,
         IntentLabel::Ask => ask::run(state, user_text).await?,
     };
     state
@@ -124,5 +137,13 @@ mod tests {
     fn parse_intent_reply_plain_label_fallback() {
         assert_eq!(parse_intent_reply("add_reminder"), Some(IntentLabel::AddReminder));
         assert_eq!(parse_intent_reply("`ask`"), Some(IntentLabel::Ask));
+    }
+
+    #[test]
+    fn parse_intent_reply_remove_and_briefing() {
+        let j = r#"{"api_version":1,"intent":"remove_event"}"#;
+        assert_eq!(parse_intent_reply(j), Some(IntentLabel::RemoveEvent));
+        let j2 = r#"{"api_version":1,"intent":"remember_briefing"}"#;
+        assert_eq!(parse_intent_reply(j2), Some(IntentLabel::RememberBriefing));
     }
 }

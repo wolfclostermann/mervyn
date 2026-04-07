@@ -2,6 +2,7 @@
 name = "mervyn"
 version = "0.1.0"
 edition = "2021"
+default-run = "mervyn"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -43,6 +44,9 @@ bytes = "1"
 fnv = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 serde_yaml = "0.9"
+ngrok = "0.18.0"
+# Explicit provider so binaries that only use ngrok (e.g. `check_ngrok`) and the main binary agree on one Rustls backend.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

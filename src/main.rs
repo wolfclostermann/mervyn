@@ -4,10 +4,12 @@ mod config;
 mod context;
 mod error;
 mod intent;
+mod ngrok_tunnel;
 mod scheduler;
 mod slack;
 mod state;
 mod storage;
+mod user_situation;
 mod vault;
 
 use std::path::Path;
@@ -62,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
         .context("start scheduler")?;
 
     vault::watcher::spawn_vault_watcher(app_state.db.clone(), app_state.vault_path.clone());
+
+    let _ngrok_forwarder = ngrok_tunnel::start(&settings.ngrok, settings.server.port)
+        .await
+        .context("start ngrok tunnel")?;
 
     tracing::info!(port = settings.server.port, "mervyn starting");
 

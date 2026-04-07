@@ -6,6 +6,7 @@ use crate::claude::prompts;
 use crate::context::ContextAssembler;
 use crate::state::AppState;
 use crate::storage::reminders;
+use crate::user_situation;
 use crate::storage::slack_ingest;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
@@ -14,9 +15,12 @@ async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
     tracing::info!(?stats, "vault synced before morning briefing");
 
     let now = Utc::now();
+    let situation = user_situation::load_for_prompts(state.settings.as_ref());
     let asm = ContextAssembler::new(state.db.clone(), state.vault_path.clone());
-    let (ev, rem, wl) = asm.briefing_prompt_sections(now).await?;
-    let sys = prompts::system_prompt_json(now)?;
+    let (ev, rem, wl) = asm
+        .briefing_prompt_sections(now, situation.as_deref())
+        .await?;
+    let sys = prompts::system_prompt_json(now, situation)?;
     let system = format!("{sys}\n\n{}", prompts::SUPPLEMENT_MORNING_BRIEFING);
     let user = prompts::morning_briefing_user_json(&ev, &rem, &wl)?;
     let text = state.claude.complete(Some(&system), &user).await?;

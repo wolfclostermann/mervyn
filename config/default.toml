@@ -21,3 +21,14 @@ slack_ingest_stale_pending_minutes = 30
 
 [server]
 port = 3000
+
+[ngrok]
+enabled = false
+# Optional reserved domain (for paid ngrok plans).
+domain = ""
+
+# Markdown under `storage.vault_path` → merged into every Claude system JSON + briefing / ask context.
+[user_context]
+enabled = true
+situation_file = "mervyn-situation.md"
+situation_max_chars = 12000

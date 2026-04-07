@@ -4,10 +4,19 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use redb::Database;
 
+use crate::intent::remember_briefing::WORKLOG_TAG;
 use crate::storage::{events, reminders, worklog};
 
 /// Max characters from `vault/notes/*.md` injected into briefing context.
 const NOTES_CHAR_BUDGET: usize = 24_000;
+
+/// Events horizon for freeform Q&A (`ask`) — covers “next month” style questions.
+const QUERY_EVENT_HORIZON_DAYS: i64 = 40;
+/// Cap for `events.md` mirror in query context (keeps token use bounded).
+const QUERY_EVENTS_MD_MAX_CHARS: usize = 12_000;
+
+/// Slack-queued briefing lines stay visible to the morning job for this long.
+const BRIEFING_QUEUE_MAX_AGE: Duration = Duration::hours(48);
 
 pub struct ContextAssembler {
     db: Arc<Database>,
@@ -33,22 +42,68 @@ impl ContextAssembler {
         Self { db, vault_path }
     }
 
-    async fn load_briefing_data(&self, now: DateTime<Utc>) -> anyhow::Result<BriefingData> {
+    async fn load_briefing_data(
+        &self,
+        now: DateTime<Utc>,
+        situation: Option<&str>,
+    ) -> anyhow::Result<BriefingData> {
         let until_events = now + Duration::days(7);
         let events = events::upcoming_within(self.db.as_ref(), now, until_events, 50)
             .map_err(|e| anyhow::anyhow!(e))?;
         let reminder_horizon = now + Duration::days(7);
         let pending = reminders::pending_due_within(self.db.as_ref(), reminder_horizon, 80)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let worklog_since = now - Duration::days(3);
-        let work = worklog::recent_since(self.db.as_ref(), worklog_since, 40)
+        let work_horizon = now - Duration::days(7);
+        let work_all = worklog::recent_since(self.db.as_ref(), work_horizon, 100)
             .map_err(|e| anyhow::anyhow!(e))?;
+        let three_days = now - Duration::days(3);
+        let brief_cutoff = now - BRIEFING_QUEUE_MAX_AGE;
+
+        let mut briefing_queue = Vec::new();
+        let mut other = Vec::new();
+        for e in work_all {
+            let tagged = e
+                .tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(WORKLOG_TAG));
+            if tagged && e.timestamp >= brief_cutoff {
+                briefing_queue.push(e);
+            } else if !tagged && e.timestamp >= three_days {
+                other.push(e);
+            }
+        }
+
+        let situation_block = situation
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("### Wolf's standing context (vault situation file)\n{s}\n\n"))
+            .unwrap_or_default();
+
+        let worklog_text = {
+            let mut parts = Vec::new();
+            if !briefing_queue.is_empty() {
+                parts.push(format!(
+                    "### Queued for this morning briefing (from Slack, last 48h)\n{}",
+                    format_worklog(&briefing_queue)
+                ));
+            }
+            parts.push(format!(
+                "### Other recent worklog (database, last 3 days)\n{}",
+                format_worklog(&other)
+            ));
+            let inner = parts.join("\n\n");
+            if situation_block.is_empty() {
+                inner
+            } else {
+                format!("{situation_block}{inner}")
+            }
+        };
 
         let vault = self.read_vault_mirror().await?;
         Ok(BriefingData {
             events_text: format_events(&events),
             reminders_text: format_reminders(&pending),
-            worklog_text: format_worklog(&work),
+            worklog_text,
             vault,
         })
     }
@@ -57,8 +112,9 @@ impl ContextAssembler {
     pub async fn briefing_prompt_sections(
         &self,
         now: DateTime<Utc>,
+        situation: Option<&str>,
     ) -> anyhow::Result<(String, String, String)> {
-        let d = self.load_briefing_data(now).await?;
+        let d = self.load_briefing_data(now, situation).await?;
         let events_blob = format!(
             "### Database (upcoming)\n{}\n### Vault events.md\n{}",
             d.events_text, d.vault.events_md
@@ -77,7 +133,7 @@ impl ContextAssembler {
     /// Full context for the morning briefing: capped DB slices plus vault Markdown mirrors.
     #[allow(dead_code)] // Handy for debugging; cron uses [`Self::briefing_prompt_sections`].
     pub async fn build_briefing_context(&self, now: DateTime<Utc>) -> anyhow::Result<String> {
-        let d = self.load_briefing_data(now).await?;
+        let d = self.load_briefing_data(now, None).await?;
         let vault = format!(
             "## Vault events.md\n{}\n\n## Vault reminders.md\n{}\n\n## Vault worklog.md\n{}\n\n{}",
             d.vault.events_md, d.vault.reminders_md, d.vault.worklog_md, d.vault.notes_section
@@ -92,8 +148,29 @@ impl ContextAssembler {
         ))
     }
 
-    /// Smaller context for freeform Q&A: reminders + recent worklog only (no vault notes).
-    pub async fn build_query_context(&self, now: DateTime<Utc>) -> anyhow::Result<String> {
+    /// Context for freeform Q&A: upcoming events (DB + `events.md`), reminders, recent worklog (no `notes/`).
+    pub async fn build_query_context(
+        &self,
+        now: DateTime<Utc>,
+        situation: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let event_until = now + Duration::days(QUERY_EVENT_HORIZON_DAYS);
+        let evs = events::upcoming_within(self.db.as_ref(), now, event_until, 120)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let events_md_raw = read_file_or_empty(self.vault_path.join("events.md")).await?;
+        let md_len = events_md_raw.chars().count();
+        let events_md: String = events_md_raw.chars().take(QUERY_EVENTS_MD_MAX_CHARS).collect();
+        let events_md_block = if events_md.trim().is_empty() {
+            "(empty or missing)\n".to_string()
+        } else {
+            let mut s = events_md;
+            if md_len > QUERY_EVENTS_MD_MAX_CHARS {
+                s.push_str("\n… (events.md truncated)\n");
+            }
+            s
+        };
+
         let reminder_horizon = now + Duration::days(7);
         let pending = reminders::pending_due_within(self.db.as_ref(), reminder_horizon, 40)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -101,8 +178,23 @@ impl ContextAssembler {
         let work = worklog::recent_since(self.db.as_ref(), worklog_since, 25)
             .map_err(|e| anyhow::anyhow!(e))?;
 
+        let situation_block = situation
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                format!("## Wolf's standing context (vault situation file)\n{s}\n\n")
+            })
+            .unwrap_or_default();
+
         Ok(format!(
-            "## Pending reminders\n{}\n\n## Recent worklog\n{}",
+            "{situation_block}\
+             ## Upcoming events (database, next {} days)\n{}\n\n\
+             ## Vault events.md\n{}\n\n\
+             ## Pending reminders\n{}\n\n\
+             ## Recent worklog\n{}",
+            QUERY_EVENT_HORIZON_DAYS,
+            format_events(&evs),
+            events_md_block,
             format_reminders(&pending),
             format_worklog(&work)
         ))
@@ -267,15 +359,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_context_skips_vault() {
+    async fn query_context_skips_notes_tree() {
         let tmp = NamedTempFile::new().unwrap();
         let db = Arc::new(db::open(tmp.path().to_str().unwrap()).unwrap());
         let vault = tempfile::tempdir().unwrap();
-        std::fs::write(vault.path().join("events.md"), "SECRET").unwrap();
+        std::fs::create_dir_all(vault.path().join("notes")).unwrap();
+        std::fs::write(vault.path().join("notes/leak.md"), "SECRET").unwrap();
 
         let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = Utc::now();
-        let ctx = asm.build_query_context(now).await.unwrap();
+        let ctx = asm.build_query_context(now, None).await.unwrap();
         assert!(!ctx.contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn query_context_includes_db_events_within_horizon() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(db::open(tmp.path().to_str().unwrap()).unwrap());
+        let vault = tempfile::tempdir().unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-04-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ev::put(
+            db.as_ref(),
+            &crate::storage::Event {
+                id: 1,
+                title: "Team sync".into(),
+                description: None,
+                start,
+                end: None,
+                tags: vec![],
+            },
+        )
+        .unwrap();
+
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
+        let now = DateTime::parse_from_rfc3339("2026-04-05T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ctx = asm.build_query_context(now, None).await.unwrap();
+        assert!(ctx.contains("Team sync"));
     }
 }
