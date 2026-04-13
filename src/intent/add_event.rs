@@ -1,4 +1,5 @@
 use chrono::Utc;
+use chrono_tz::Tz;
 
 use crate::intent::event_title::resolve_event_title;
 use crate::intent::text_datetime::event_timing_from_text;
@@ -12,7 +13,19 @@ pub async fn run(
 ) -> anyhow::Result<String> {
     let id = events::next_id(state.db.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
     let now = Utc::now();
-    let (start, end) = event_timing_from_text(text.trim(), now);
+    let tz: Tz = state
+        .settings
+        .scheduler
+        .timezone
+        .parse()
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                tz = %state.settings.scheduler.timezone,
+                "invalid scheduler.timezone; using UTC for event time parsing"
+            );
+            chrono_tz::UTC
+        });
+    let (start, end) = event_timing_from_text(text.trim(), now, tz);
     let title = resolve_event_title(
         &state.claude,
         text.trim(),
