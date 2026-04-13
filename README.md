@@ -104,7 +104,8 @@ Roughly what each intent does (you do **not** type these labels yourself—descr
 | **Reminder** | Stores a reminder in `redb`. If the message contains an ISO date `YYYY-MM-DD`, that day is used (default time 09:00 UTC); otherwise due time defaults to about **tomorrow** at 09:00 UTC. Due reminders are **posted to `SLACK_CHANNEL_ID`** on a schedule (see below). |
 | **Event** | Saves a calendar-style **event** in `redb` with a default start around **24 hours** ahead; refine times and detail in Obsidian (`events.md`) if needed. |
 | **Work log** | Appends a **worklog** entry with the current UTC timestamp. |
-| **Note** | Does **not** write files: replies with guidance to put durable notes under **`data/vault/notes/`** in your Obsidian layout. |
+| **Note** | Parses one or more **todo** lines and stores them in **`redb`** (open until marked done). They appear in **morning briefing** context and **ask** context. For long-form writing you can still use **`data/vault/notes/`** in Obsidian. |
+| **Complete todo** | Loads **open** todos, uses Claude to match your wording (or numeric id) to rows, then sets **`done`** in **`redb`**. |
 | **Ask** | Builds **context** from `redb` plus vault Markdown and asks Claude for an answer, then returns that text in Slack. |
 
 ### Obsidian vault (`data/vault`)

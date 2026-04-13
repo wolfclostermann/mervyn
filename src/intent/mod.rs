@@ -2,12 +2,14 @@ pub mod add_event;
 pub mod add_note;
 pub mod add_reminder;
 pub mod ask;
+pub mod complete_todo;
 pub mod event_title;
 pub mod log_work;
 pub mod remember_briefing;
 pub mod remove_event;
 pub mod slack_clean;
 pub mod text_datetime;
+pub mod todo_items;
 
 use chrono::Utc;
 
@@ -22,6 +24,7 @@ pub enum IntentLabel {
     LogWork,
     AddNote,
     RemoveEvent,
+    CompleteTodo,
     RememberBriefing,
     Ask,
 }
@@ -36,6 +39,7 @@ fn intent_from_token(token: &str) -> Option<IntentLabel> {
         "log_work" => Some(IntentLabel::LogWork),
         "add_note" => Some(IntentLabel::AddNote),
         "remove_event" => Some(IntentLabel::RemoveEvent),
+        "complete_todo" => Some(IntentLabel::CompleteTodo),
         "remember_briefing" => Some(IntentLabel::RememberBriefing),
         "ask" => Some(IntentLabel::Ask),
         _ => None,
@@ -105,8 +109,9 @@ pub async fn dispatch(
         IntentLabel::AddReminder => add_reminder::run(state, user_text).await?,
         IntentLabel::AddEvent => add_event::run(state, user_text, situation).await?,
         IntentLabel::LogWork => log_work::run(state, user_text).await?,
-        IntentLabel::AddNote => add_note::run(state, user_text).await?,
+        IntentLabel::AddNote => add_note::run(state, user_text, situation).await?,
         IntentLabel::RemoveEvent => remove_event::run(state, user_text).await?,
+        IntentLabel::CompleteTodo => complete_todo::run(state, user_text).await?,
         IntentLabel::RememberBriefing => remember_briefing::run(state, user_text).await?,
         IntentLabel::Ask => ask::run(state, user_text).await?,
     };
@@ -145,5 +150,11 @@ mod tests {
         assert_eq!(parse_intent_reply(j), Some(IntentLabel::RemoveEvent));
         let j2 = r#"{"api_version":1,"intent":"remember_briefing"}"#;
         assert_eq!(parse_intent_reply(j2), Some(IntentLabel::RememberBriefing));
+    }
+
+    #[test]
+    fn parse_intent_reply_complete_todo() {
+        let j = r#"{"api_version":1,"intent":"complete_todo"}"#;
+        assert_eq!(parse_intent_reply(j), Some(IntentLabel::CompleteTodo));
     }
 }

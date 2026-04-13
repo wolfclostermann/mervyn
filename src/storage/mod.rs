@@ -8,10 +8,12 @@ pub mod events;
 pub mod meta;
 pub mod reminders;
 pub mod slack_ingest;
+pub mod todos;
 pub mod worklog;
 
 pub use error::{Result, StorageError};
 pub use events::Event;
 pub use reminders::{Recurrence, Reminder};
 pub use slack_ingest::{SlackIngestEntry, SlackIngestOutcome};
+pub use todos::TodoItem;
 pub use worklog::WorklogEntry;

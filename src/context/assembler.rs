@@ -6,7 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 use redb::Database;
 
 use crate::intent::remember_briefing::WORKLOG_TAG;
-use crate::storage::{events, reminders, worklog};
+use crate::storage::{events, reminders, todos, worklog};
 
 /// Max characters from `vault/notes/*.md` injected into briefing context.
 const NOTES_CHAR_BUDGET: usize = 24_000;
@@ -124,6 +124,8 @@ impl ContextAssembler {
             .map(|s| format!("### Wolf's standing context (vault situation file)\n{s}\n\n"))
             .unwrap_or_default();
 
+        let open_todos = todos::list_open(self.db.as_ref(), 80).map_err(|e| anyhow::anyhow!(e))?;
+
         let worklog_text = {
             let mut parts = Vec::new();
             if !briefing_queue.is_empty() {
@@ -132,6 +134,10 @@ impl ContextAssembler {
                     format_worklog(&briefing_queue)
                 ));
             }
+            parts.push(format!(
+                "### Open todos (database)\n{}",
+                format_todos(&open_todos, false)
+            ));
             parts.push(format!(
                 "### Other recent worklog (database, last 3 days)\n{}",
                 format_worklog(&other)
@@ -222,6 +228,7 @@ impl ContextAssembler {
         let worklog_since = now - Duration::days(7);
         let work = worklog::recent_since(self.db.as_ref(), worklog_since, 50)
             .map_err(|e| anyhow::anyhow!(e))?;
+        let open_todos = todos::list_open(self.db.as_ref(), 80).map_err(|e| anyhow::anyhow!(e))?;
 
         let worklog_md_raw = self.read_worklog_md_with_fallback().await?;
         let wl_len = worklog_md_raw.chars().count();
@@ -252,12 +259,14 @@ impl ContextAssembler {
              ## Upcoming events (database, next {} days)\n{}\n\n\
              ## Vault events.md\n{}\n\n\
              ## Pending reminders\n{}\n\n\
+             ## Open todos (database; numeric ids for reference)\n{}\n\n\
              ## Recent worklog (database, last 7 days)\n{}\n\n\
              ## Vault worklog.md (file on disk; may include git-backed lines not yet in DB)\n{}",
             QUERY_EVENT_HORIZON_DAYS,
             format_events(&evs),
             events_md_block,
             format_reminders(&pending),
+            format_todos(&open_todos, true),
             format_worklog(&work),
             worklog_md_block
         ))
@@ -358,6 +367,21 @@ fn format_reminders(list: &[crate::storage::Reminder]) -> String {
             r.due.format("%Y-%m-%d %H:%M"),
             if r.done { " [done]" } else { "" }
         ));
+    }
+    s
+}
+
+fn format_todos(items: &[crate::storage::TodoItem], include_ids: bool) -> String {
+    if items.is_empty() {
+        return "(none)\n".into();
+    }
+    let mut s = String::new();
+    for t in items {
+        if include_ids {
+            s.push_str(&format!("- [{}] {}\n", t.id, t.body));
+        } else {
+            s.push_str(&format!("- {}\n", t.body));
+        }
     }
     s
 }

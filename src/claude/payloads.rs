@@ -15,6 +15,8 @@ pub const TASK_MORNING_BRIEFING: &str = "morning_briefing";
 pub const TASK_FREEFORM_QUERY: &str = "freeform_query";
 pub const TASK_EVENT_TITLE_EXTRACTION: &str = "event_title_extraction";
 pub const TASK_REMOVE_EVENT: &str = "remove_event";
+pub const TASK_COMPLETE_TODO: &str = "complete_todo";
+pub const TASK_TODO_ITEMS_EXTRACTION: &str = "todo_items_extraction";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +144,68 @@ impl RemoveEventRequestV1 {
 pub struct RemoveEventReplyV1 {
     #[serde(default)]
     pub event_ids_to_delete: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TodoDoneCandidateV1 {
+    pub id: u64,
+    pub body: String,
+    pub created_rfc3339: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompleteTodoRequestV1 {
+    pub api_version: u32,
+    pub task: &'static str,
+    pub message: String,
+    pub candidates: Vec<TodoDoneCandidateV1>,
+}
+
+impl CompleteTodoRequestV1 {
+    pub fn new(message: impl Into<String>, candidates: Vec<TodoDoneCandidateV1>) -> Self {
+        Self {
+            api_version: PROMPT_API_VERSION,
+            task: TASK_COMPLETE_TODO,
+            message: message.into(),
+            candidates,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompleteTodoReplyV1 {
+    #[serde(default)]
+    pub todo_ids_to_complete: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TodoItemsExtractionV1 {
+    pub api_version: u32,
+    pub task: &'static str,
+    pub message: String,
+}
+
+impl TodoItemsExtractionV1 {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            api_version: PROMPT_API_VERSION,
+            task: TASK_TODO_ITEMS_EXTRACTION,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TodoItemsReplyV1 {
+    #[serde(default)]
+    pub api_version: u32,
+    #[serde(default)]
+    pub items: Vec<String>,
 }
 
 /// Expected model reply for intent routing (deserialize). `api_version` mirrors the request when present.

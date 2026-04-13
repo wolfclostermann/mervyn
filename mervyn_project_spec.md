@@ -427,7 +427,7 @@ Constants `PROMPT_API_VERSION` and `TASK_*` in `payloads.rs` identify the schema
 
 ### Behaviour notes (intent classification)
 
-- Intent routing still resolves to exactly one of: `add_reminder`, `add_event`, `log_work`, `add_note`, `ask`. The supplement asks the model for a **single JSON object** with `api_version` and `intent` (snake_case); `intent/mod.rs` parses JSON first, then markdown-fenced JSON, then a legacy plain-text label for compatibility.
+- Intent routing still resolves to exactly one of: `add_reminder`, `add_event`, `log_work`, `add_note`, `remove_event`, `complete_todo`, `remember_briefing`, `ask`. The supplement asks the model for a **single JSON object** with `api_version` and `intent` (snake_case); `intent/mod.rs` parses JSON first, then markdown-fenced JSON, then a legacy plain-text label for compatibility.
 - Morning briefing still asks for summary, due/overdue reminders, and a prioritised todo list (max 7); the three context blobs are JSON fields on `MorningBriefingV1`.
 
 ---
