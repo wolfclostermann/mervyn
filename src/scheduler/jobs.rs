@@ -56,6 +56,8 @@ async fn run_reminder_check(state: &AppState) -> anyhow::Result<()> {
         }
         reminders::put(state.db.as_ref(), &r).map_err(|e| anyhow::anyhow!(e))?;
     }
+
+    super::appointment_reminders::run(state).await?;
     Ok(())
 }
 

@@ -4,6 +4,7 @@ mod codec;
 pub mod db;
 mod table;
 pub mod error;
+pub mod event_notices;
 pub mod events;
 pub mod meta;
 pub mod reminders;

@@ -8,6 +8,7 @@ use crate::claude::payloads::{RemoveEventCandidateV1, RemoveEventReplyV1};
 use crate::claude::prompts;
 use crate::intent::normalize_claude_json_block;
 use crate::state::AppState;
+use crate::storage::event_notices;
 use crate::storage::events;
 use crate::user_situation;
 
@@ -76,6 +77,9 @@ pub async fn run(state: &AppState, text: &str) -> anyhow::Result<String> {
         if let Some(ev) = list.iter().find(|e| e.id == id) {
             let title = ev.title.clone();
             if events::delete(state.db.as_ref(), id).map_err(|e| anyhow::anyhow!(e))? {
+                if let Err(e) = event_notices::delete(state.db.as_ref(), id) {
+                    tracing::warn!(id, error = %e, "remove_event: event_notices delete failed");
+                }
                 removed_titles.push(title);
             }
         }

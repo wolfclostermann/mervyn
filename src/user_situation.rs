@@ -51,6 +51,9 @@ mod tests {
                 vault_sync_cron: "0 */5 * * * *".into(),
                 slack_ingest_prune_cron: "0 0 4 * * *".into(),
                 timezone: "Europe/London".into(),
+                appointment_reminders_enabled: true,
+                appointment_reminder_advance_minutes: 30,
+                appointment_start_grace_minutes: 30,
             },
             storage: StorageSection {
                 db_path: "/tmp/x.redb".into(),

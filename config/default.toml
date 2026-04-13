@@ -8,6 +8,11 @@ reminder_check_cron = "0 * * * * *"
 vault_sync_cron = "0 */5 * * * *"
 slack_ingest_prune_cron = "0 0 4 * * *"
 timezone = "Europe/London"
+# Calendar events in redb: Slack ping N minutes before start, then at start (same cron as reminder_check).
+appointment_reminders_enabled = true
+appointment_reminder_advance_minutes = 30
+# If Mervyn was offline past start, still notify within this many minutes after start.
+appointment_start_grace_minutes = 30
 
 [storage]
 db_path = "./data/mervyn.redb"

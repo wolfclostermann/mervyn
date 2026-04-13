@@ -27,6 +27,18 @@ pub struct ClaudeSection {
     pub max_tokens: u32,
 }
 
+fn default_appointment_reminders_enabled() -> bool {
+    true
+}
+
+fn default_appointment_reminder_advance_minutes() -> u32 {
+    30
+}
+
+fn default_appointment_start_grace_minutes() -> u32 {
+    30
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerSection {
     pub morning_briefing_cron: String,
@@ -36,6 +48,14 @@ pub struct SchedulerSection {
     #[serde(default = "default_slack_ingest_prune_cron")]
     pub slack_ingest_prune_cron: String,
     pub timezone: String,
+    /// Post Slack for calendar events this many minutes before `start`, and at `start`.
+    #[serde(default = "default_appointment_reminders_enabled")]
+    pub appointment_reminders_enabled: bool,
+    #[serde(default = "default_appointment_reminder_advance_minutes")]
+    pub appointment_reminder_advance_minutes: u32,
+    /// If the process is down past `start`, still post “starting now” within this window; otherwise mark done quietly.
+    #[serde(default = "default_appointment_start_grace_minutes")]
+    pub appointment_start_grace_minutes: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
