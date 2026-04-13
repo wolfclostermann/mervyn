@@ -157,19 +157,18 @@ fn hours_around_til(text: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Default reminder due: ISO or English month/day at 09:00 UTC, else tomorrow 09:00 UTC.
-pub fn due_datetime_from_reminder_text(text: &str, now: DateTime<Utc>) -> DateTime<Utc> {
-    let today = now.date_naive();
-    if let Some(d) = naive_date_from_text(text, today) {
-        if let Some(naive) = d.and_hms_opt(9, 0, 0) {
-            return naive.and_utc();
-        }
-    }
-    (now + Duration::days(1))
-        .date_naive()
-        .and_hms_opt(9, 0, 0)
-        .expect("valid time")
-        .and_utc()
+/// Reminder due: same date/time rules as [`try_parse_event_timing`] when that matches; otherwise
+/// tomorrow 09:00 UTC (legacy “no date in text” default).
+pub fn due_datetime_from_reminder_text(text: &str, now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
+    try_parse_event_timing(text, now, tz)
+        .map(|(start, _)| start)
+        .unwrap_or_else(|| {
+            (now + Duration::days(1))
+                .date_naive()
+                .and_hms_opt(9, 0, 0)
+                .expect("valid time")
+                .and_utc()
+        })
 }
 
 fn has_whole_word(text: &str, word: &str) -> bool {
@@ -305,12 +304,14 @@ fn to_24h_clock(
     }
 }
 
-/// Event start/end: ISO / month-day / **today** / **tomorrow** / `H:MM` (see `tz`); else start = now + 24h.
-///
-/// Clock times without `am`/`pm` use `tz` local wall date `date`; ambiguous 1–11 pick AM if still
-/// in the future today, else PM. Default time when no clock is **09:00 UTC** for ISO/month-only
-/// phrases, **09:00 local** for today/tomorrow/tonight or time-only-same-day.
-pub fn event_timing_from_text(text: &str, now: DateTime<Utc>, tz: Tz) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+/// Parsed start/end when the text carries a schedulable date and/or clock (same rules as events).
+/// `None` only when there is no ISO/month/today/tomorrow anchor and no `H:MM` clock — so callers
+/// can apply their own default (event: now+24h; reminder: tomorrow 09:00 UTC).
+pub(crate) fn try_parse_event_timing(
+    text: &str,
+    now: DateTime<Utc>,
+    tz: Tz,
+) -> Option<(DateTime<Utc>, Option<DateTime<Utc>>)> {
     let local_now = now.with_timezone(&tz);
     let today_utc = now.date_naive();
 
@@ -348,41 +349,42 @@ pub fn event_timing_from_text(text: &str, now: DateTime<Utc>, tz: Tz) -> (DateTi
             anchor = Some(local_now.date_naive());
             nine_is_local = true;
         } else {
-            return (now + Duration::hours(24), None);
+            return None;
         }
     }
 
     let date = anchor.expect("set above");
 
     if let Some((h1, h2)) = hours_around_til(text) {
-        let Some(start_utc) = naive_local_to_utc(date, h1, 0, tz) else {
-            return (now + Duration::hours(24), None);
-        };
-        let Some(end_utc) = naive_local_to_utc(date, h2, 0, tz) else {
-            return (now + Duration::hours(24), None);
-        };
-        return (start_utc, Some(end_utc));
+        let start_utc = naive_local_to_utc(date, h1, 0, tz)?;
+        let end_utc = naive_local_to_utc(date, h2, 0, tz)?;
+        return Some((start_utc, Some(end_utc)));
     }
 
     if let Some((h, min, ampm)) = clock {
         if let Some((h24, m)) = to_24h_clock(h, min, ampm, date, local_now, tz) {
             if let Some(start_utc) = naive_local_to_utc(date, h24, m, tz) {
-                return (start_utc, None);
+                return Some((start_utc, None));
             }
         }
     }
 
     if nine_is_local {
-        let Some(start_utc) = naive_local_to_utc(date, 9, 0, tz) else {
-            return (now + Duration::hours(24), None);
-        };
-        return (start_utc, None);
+        let start_utc = naive_local_to_utc(date, 9, 0, tz)?;
+        return Some((start_utc, None));
     }
 
-    let Some(start_naive) = date.and_hms_opt(9, 0, 0) else {
-        return (now + Duration::hours(24), None);
-    };
-    (start_naive.and_utc(), None)
+    let start_naive = date.and_hms_opt(9, 0, 0)?;
+    Some((start_naive.and_utc(), None))
+}
+
+/// Event start/end: ISO / month-day / **today** / **tomorrow** / `H:MM` (see `tz`); else start = now + 24h.
+///
+/// Clock times without `am`/`pm` use `tz` local wall date `date`; ambiguous 1–11 pick AM if still
+/// in the future today, else PM. Default time when no clock is **09:00 UTC** for ISO/month-only
+/// phrases, **09:00 local** for today/tomorrow/tonight or time-only-same-day.
+pub fn event_timing_from_text(text: &str, now: DateTime<Utc>, tz: Tz) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+    try_parse_event_timing(text, now, tz).unwrap_or((now + Duration::hours(24), None))
 }
 
 #[cfg(test)]
@@ -449,5 +451,33 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(start, want);
+    }
+
+    /// Same clock path as events: 5:30 PM local when “now” is afternoon (London, BST).
+    #[test]
+    fn reminder_at_five_thirty_matches_event_clock() {
+        let now = DateTime::parse_from_rfc3339("2026-04-14T15:18:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let text = "I have to leave to pick Sparrow up at 5:30";
+        let due = due_datetime_from_reminder_text(text, now, chrono_tz::Europe::London);
+        let want = DateTime::parse_from_rfc3339("2026-04-14T16:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(due, want);
+    }
+
+    #[test]
+    fn reminder_no_date_or_clock_defaults_tomorrow_nine_utc() {
+        let now = DateTime::parse_from_rfc3339("2026-04-14T15:18:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let due = due_datetime_from_reminder_text("remind me to call Victor", now, chrono_tz::UTC);
+        let want = NaiveDate::from_ymd_opt(2026, 4, 15)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(due, want);
     }
 }
