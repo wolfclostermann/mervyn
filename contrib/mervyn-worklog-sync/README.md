@@ -67,7 +67,7 @@ cp config/env.example ~/.config/mervyn-worklog/env
 # edit paths
 ```
 
-Use **`export`** for every variable you set so `python3` sees optional flags (see `env.example`).
+Use **`export`** for every variable you set so `python3` sees optional flags (see `env.example`). Set **`MERVYN_WORKLOG_PROJECT_PREFIXES`** to **`$HOME/Code`** (or similar) if you want every repo under `~/Code` to append to the worklog; narrower prefixes skip other trees.
 
 ---
 
@@ -102,6 +102,23 @@ If Mervyn is stopped, pulls do not run (by design). For a machine where Mervyn i
 | Hook | Appends `- **reponame** \`hash\` subject` under today’s `## YYYY-MM-DD` in `worklog.md`. |
 | Hook | `git commit` + `git push` in the worklog repo. |
 | Mervyn `[worklog_git]` job | `git pull` on `pull_cron`, then vault sync → `redb` (and the usual vault watcher still applies). |
+
+---
+
+## Backfill (missed hook runs)
+
+If commits were made without the global hook (new machine, wrong `MERVYN_WORKLOG_PROJECT_PREFIXES`, etc.), run **`backfill_worklog_from_git.py`** from this folder. It reads the same **`~/.config/mervyn-worklog/env`**, walks git repos under your prefixes (skipping **`.terraform/`**, **`node_modules/`**, the worklog repo itself), and appends hook-style lines for commits whose hash is not already in **`worklog.md`**.
+
+- **Date heading:** each commit goes under **`## YYYY-MM-DD`** using git’s author date (`%as`, author-local calendar day).
+- **Time suffix:** backfilled lines include **`_HH:MM_`** from the author timestamp (wall clock from git’s `%ai`).
+- **`--since`:** default **`auto`** uses the **earliest `## YYYY-MM-DD`** already present in **`worklog.md`** so you do not import all of **`~/Code`** history. Use **`--since none`** for a full import, or **`--since 2025-01-01`** for a custom cutoff.
+
+```bash
+python3 contrib/mervyn-worklog-sync/backfill_worklog_from_git.py --dry-run
+python3 contrib/mervyn-worklog-sync/backfill_worklog_from_git.py
+```
+
+Then **`git commit`** / **`git push`** the worklog repo as usual.
 
 ---
 
