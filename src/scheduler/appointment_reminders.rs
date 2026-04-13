@@ -88,11 +88,20 @@ pub async fn run(state: &AppState) -> anyhow::Result<()> {
 
         if send_advance {
             let when = format_event_time(state, event.start)?;
-            let mins = (event.start - now).num_minutes().clamp(0, 10_000) as u32;
-            let mut msg = format!(
-                "Appointment in about {} min: “{}” — {}",
-                mins, event.title, when
-            );
+            let until = event.start.signed_duration_since(now);
+            let secs = until.num_seconds().max(0);
+            let mut msg = if secs < 60 {
+                format!(
+                    "Appointment in less than a minute: “{}” — {}",
+                    event.title, when
+                )
+            } else {
+                let mins = until.num_minutes().max(0).min(10_000) as u32;
+                format!(
+                    "Appointment in about {} min: “{}” — {}",
+                    mins, event.title, when
+                )
+            };
             if let Some(desc) = event.description.as_deref() {
                 let d = desc.trim();
                 if !d.is_empty() {
