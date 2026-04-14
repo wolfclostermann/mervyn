@@ -612,6 +612,7 @@ The checklist below tracks production hardening; **core items are implemented** 
 - [x] **`slack_ingest` retention** — Implemented: `storage::slack_ingest::prune` (age in days, then optional max row count by monotonic id), scheduled job `slack_ingest_prune` in `scheduler/jobs.rs`. Knobs: `storage.slack_ingest_retention_days`, `storage.slack_ingest_keep_last` (use `0` to disable each rule), `scheduler.slack_ingest_prune_cron`; env `MERVYN__STORAGE__SLACK_INGEST_*`, `MERVYN__SCHEDULER__SLACK_INGEST_PRUNE_CRON`.
 - [x] **Stuck `Pending` ingest rows** — Implemented: `SlackMetaClaimGuard` in `slack/handler.rs` releases dedupe meta on panic after claim (disarm on success/filter/error paths); `slack_ingest::sweep_stale_pending` on the prune cron marks long-`Pending` rows failed and releases meta (`storage.slack_ingest_stale_pending_minutes`, `0` = off). Metrics/alerts left to deployment.
 - [x] **Operator visibility** — Implemented: `GET /admin/slack-ingest` when `MERVYN_ADMIN_TOKEN` is set; Bearer auth; query filters `limit`, `since_ms`, `until_ms`, `outcome`, `event_id`; JSON body via `api/admin.rs` + `slack_ingest::list_recent`.
+- [ ] **Slack huddle AI notes → worklog** — Spike whether Slack’s Web API can read AI huddle note content (canvases in huddle threads; may need `canvases:*` plus channel/DM history scopes). If readable: scheduled job, dedupe canvas/file/thread ids in `META_TABLE`, append `WorklogEntry` (e.g. tag `slack-huddle`), extend `SlackClient`. If not: third-party huddle transcript/recording API or human-in-the-loop (paste/DM).
 
 ---
 

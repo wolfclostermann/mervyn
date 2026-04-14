@@ -1,0 +1,26 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Do not commit secrets.
+
+tenancy_ocid     = "ocid1.tenancy.oc1..aaaaaaaa..."
+user_ocid        = "ocid1.user.oc1..aaaaaaaa..."
+api_fingerprint  = "aa:bb:cc:..."
+private_key_path = "/Users/you/.oci/oci_api_key.pem"
+region           = "uk-london-1"
+compartment_ocid = "ocid1.compartment.oc1..aaaaaaaa..."
+
+ssh_public_key = "ssh-ed25519 AAAA... you@host"
+
+# Optional: lock SSH to your IP
+# ssh_allowed_cidrs = ["203.0.113.10/32"]
+
+# Optional: expose Mervyn directly on 3000 (Slack still needs HTTPS — use a tunnel or proxy)
+# expose_app_port = true
+
+# Optional: if A1 is out of capacity in the first AD
+# availability_domain_index = 1
+
+# Optional: smaller free-tier footprint
+# instance_ocpus         = 1
+# instance_memory_gbs    = 6
+
+# Optional: skip cloud-init Docker install and install manually
+# bootstrap_docker = false

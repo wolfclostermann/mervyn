@@ -5,3 +5,16 @@
 
 __pycache__/
 *.py[cod]
+
+# Terraform (secrets / state)
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+*.tfvars
+!terraform/terraform.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
