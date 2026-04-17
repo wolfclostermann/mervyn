@@ -1,5 +1,6 @@
 //! Cron jobs: morning briefing, reminder check, vault sync, optional worklog `git pull`.
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
 
 use anyhow::Context;
@@ -68,6 +69,11 @@ async fn run_vault_sync(state: &AppState) -> anyhow::Result<()> {
 }
 
 /// `git pull` worklog repo + vault sync. Used on a cron when enabled and once at process startup.
+///
+/// When **`MERVYN_WORKLOG_GITHUB_PAT`** is set (e.g. from `.env` / Compose), sends GitHub HTTPS
+/// **Basic** auth (`x-access-token:<secret>`) via `http.https://github.com/.extraheader`, so
+/// private clones work in Docker without an interactive credential prompt. Value can be a
+/// classic/fine-grained PAT or a `gh auth token` OAuth token (`gho_…`).
 pub async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
     let cfg = &state.settings.worklog_git;
     if !cfg.enabled {
@@ -79,14 +85,29 @@ pub async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args([
-            "pull",
-            "--ff-only",
-            cfg.remote.trim(),
-            cfg.branch.trim(),
-        ])
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg("credential.helper=");
+    if let Ok(pat) = std::env::var("MERVYN_WORKLOG_GITHUB_PAT") {
+        let pat = pat.trim();
+        if !pat.is_empty() {
+            // GitHub Git-over-HTTPS expects `x-access-token` + PAT/OAuth token as Basic, not Bearer.
+            let basic = B64.encode(format!("x-access-token:{pat}"));
+            let header = format!("AUTHORIZATION: basic {basic}");
+            cmd.arg("-c")
+                .arg(format!("http.https://github.com/.extraheader={header}"));
+        }
+    }
+    cmd.args([
+        "pull",
+        "--ff-only",
+        cfg.remote.trim(),
+        cfg.branch.trim(),
+    ]);
+
+    let output = cmd
         .output()
         .await
         .with_context(|| format!("spawn git pull in {repo}"))?;

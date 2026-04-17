@@ -82,9 +82,9 @@ Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fenc
 - event_ids_to_delete: array of numeric ids; only ids from candidates; empty array if none should be deleted"#;
 
 /// Append for marking open todos done. User message = JSON from [`complete_todo_user_json`].
-pub const SUPPLEMENT_COMPLETE_TODO: &str = r#"The user's message is one JSON object with task "complete_todo", message (what Wolf asked), and candidates (open todos from the database: id, body, created_rfc3339).
+pub const SUPPLEMENT_COMPLETE_TODO: &str = r#"The user's message is one JSON object with task "complete_todo", message (what Wolf asked), and candidates (open todos: id, list_number, body, created_rfc3339).
 
-Choose which todo id(s) to mark **done** based on Wolf's request. Match by task wording, by numeric id if he states it, or by obvious synonym. If he means several, return multiple ids. If nothing matches or the request is ambiguous with no clear target, return an empty array.
+Each candidate's `id` is the internal database key. `list_number` is its 1-based position in Wolf's **ordered open-todo checklist** (the same order as "1. … 2. …" lists in chat). When Wolf gives bare numbers like "7, 11 done" or "mark todo 3 complete", treat those as **list_number**, not as `id`, unless he clearly refers to the bracketed database id from context. Match by task wording when he names the errand. Return the chosen rows' **`id`** values in `todo_ids_to_complete`. If nothing matches or the request is ambiguous with no clear target, return an empty array.
 
 Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fences, no other text). Fields:
 - api_version: same integer as in the user's object

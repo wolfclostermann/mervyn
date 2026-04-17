@@ -149,7 +149,10 @@ pub struct RemoveEventReplyV1 {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TodoDoneCandidateV1 {
+    /// Stable `redb` primary key — not the same as checklist position.
     pub id: u64,
+    /// 1-based index in the ordered open-todo list (matches numbered lists in Slack replies).
+    pub list_number: u32,
     pub body: String,
     pub created_rfc3339: String,
 }
