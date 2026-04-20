@@ -19,7 +19,8 @@
 #   MERVYN_COMPARTMENT_OCID   Compartment for VCN + VM (default: detect * (root) compartment)
 #   MERVYN_SSH_PUBLIC_KEY     Full public key string (else use MERVYN_SSH_PUBLIC_KEY_FILE)
 #   MERVYN_SSH_PUBLIC_KEY_FILE  Path to .pub (default: ~/.ssh/id_ed25519.pub or id_rsa.pub)
-#   MERVYN_AD_INDEX           Availability domain index 0..n-1 (default: 0)
+#   MERVYN_AD_INDEX           First availability domain to try, 0..n-1 (default: 0);
+#                             on "Out of host capacity" the script tries other ADs in order.
 #   MERVYN_OCPUS              A1.Flex OCPUs (default: 1)
 #   MERVYN_MEMORY_GBS         A1.Flex memory in GB (default: 6)
 #   MERVYN_UBUNTU_VERSION     e.g. 22.04 (default: 22.04)
@@ -32,6 +33,11 @@
 # Example:
 #   export MERVYN_SSH_ALLOWED_CIDRS="$(curl -sS https://checkip.amazonaws.com)/32"
 #   ./scripts/oci-bootstrap.sh
+#
+# Re-runs: networking is reused when resources with the expected display names already exist
+# in the compartment. Instance launch is skipped if a RUNNING/PROVISIONING/STARTING instance
+# named ${MERVYN_PROJECT_NAME:-mervyn}-arm already exists. Otherwise launch tries each
+# availability domain in rotation until success or a non-capacity error.
 
 set -euo pipefail
 
@@ -187,17 +193,6 @@ fi
 
 echo "==> Using profile=$OCI_PROFILE region=$REGION compartment=$COMPARTMENT_OCID"
 
-AD_NAME=$(oci "${oci_args[@]}" iam availability-domain list \
-  --compartment-id "$TENANCY_OCID" \
-  --query "data[$AD_INDEX].name" \
-  --raw-output)
-
-if [[ -z "$AD_NAME" || "$AD_NAME" == "null" ]]; then
-  echo "error: no availability domain at index $AD_INDEX (try MERVYN_AD_INDEX=1)" >&2
-  exit 1
-fi
-echo "==> Availability domain: $AD_NAME"
-
 echo "==> Resolving Ubuntu ${UBUNTU_VER} aarch64 image for VM.Standard.A1.Flex..."
 IMAGES_JSON=$(oci "${oci_args[@]}" compute image list \
   --compartment-id "$COMPARTMENT_OCID" \
@@ -229,29 +224,116 @@ if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "null" ]]; then
   exit 1
 fi
 
-echo "==> Creating VCN ${PROJECT}-vcn..."
-VCN_JSON=$(oci "${oci_args[@]}" network vcn create \
-  --cidr-block 10.0.0.0/16 \
+# --- Networking (idempotent: reuse by display-name when already AVAILABLE) ---
+VCN_DN="${PROJECT}-vcn"
+IGW_DN="${PROJECT}-igw"
+SL_DN="${PROJECT}-public-sl"
+SUBNET_DN="${PROJECT}-public"
+
+jq_vcn_match() {
+  jq -r --arg dn "$VCN_DN" '
+    .data[]?
+    | select(
+        (."display-name" // .displayName // "") == $dn
+        and (."lifecycle-state" // .lifecycleState // "") == "AVAILABLE"
+      )
+    | .id // empty' | head -1
+}
+
+VCN_ID=$(oci "${oci_args[@]}" network vcn list \
   --compartment-id "$COMPARTMENT_OCID" \
-  --display-name "${PROJECT}-vcn" \
-  --dns-label "$dns_label_vcn" \
-  --wait-for-state AVAILABLE \
-  --output json)
+  --all \
+  --output json | jq_vcn_match)
+
+if [[ -n "$VCN_ID" ]]; then
+  echo "==> Reusing existing VCN $VCN_DN"
+  VCN_JSON=$(oci "${oci_args[@]}" network vcn get --vcn-id "$VCN_ID" --output json)
+else
+  echo "==> Creating VCN $VCN_DN..."
+  set +e
+  VCN_JSON=$(oci "${oci_args[@]}" network vcn create \
+    --cidr-block 10.0.0.0/16 \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --display-name "$VCN_DN" \
+    --dns-label "$dns_label_vcn" \
+    --wait-for-state AVAILABLE \
+    --output json 2>&1)
+  vcn_rc=$?
+  set -e
+  if [[ $vcn_rc -ne 0 ]]; then
+    if echo "$VCN_JSON" | grep -qi 'already exists\|Duplicate\|Conflict\|not unique'; then
+      VCN_ID=$(oci "${oci_args[@]}" network vcn list \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --all \
+        --output json | jq_vcn_match)
+      if [[ -n "$VCN_ID" ]]; then
+        echo "==> VCN create reported conflict; reusing $VCN_DN"
+        VCN_JSON=$(oci "${oci_args[@]}" network vcn get --vcn-id "$VCN_ID" --output json)
+      else
+        echo "$VCN_JSON" >&2
+        exit "$vcn_rc"
+      fi
+    else
+      echo "$VCN_JSON" >&2
+      exit "$vcn_rc"
+    fi
+  fi
+fi
 
 VCN_ID=$(echo "$VCN_JSON" | jq -r '.data.id')
 RT_ID=$(echo "$VCN_JSON" | jq -r '.data["default-route-table-id"] // .data.defaultRouteTableId')
 
-echo "==> Creating internet gateway..."
-IGW_JSON=$(oci "${oci_args[@]}" network internet-gateway create \
+IGW_ID=$(oci "${oci_args[@]}" network internet-gateway list \
   --compartment-id "$COMPARTMENT_OCID" \
   --vcn-id "$VCN_ID" \
-  --display-name "${PROJECT}-igw" \
-  --is-enabled true \
-  --wait-for-state AVAILABLE \
-  --output json)
-IGW_ID=$(echo "$IGW_JSON" | jq -r '.data.id')
+  --all \
+  --output json | jq -r --arg dn "$IGW_DN" '
+    .data[]?
+    | select(
+        (."display-name" // .displayName // "") == $dn
+        and (."lifecycle-state" // .lifecycleState // "") == "AVAILABLE"
+      )
+    | .id // empty' | head -1)
 
-echo "==> Updating default route table to use internet gateway..."
+if [[ -n "$IGW_ID" ]]; then
+  echo "==> Reusing existing internet gateway $IGW_DN"
+else
+  echo "==> Creating internet gateway $IGW_DN..."
+  set +e
+  IGW_JSON=$(oci "${oci_args[@]}" network internet-gateway create \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --vcn-id "$VCN_ID" \
+    --display-name "$IGW_DN" \
+    --is-enabled true \
+    --wait-for-state AVAILABLE \
+    --output json 2>&1)
+  igw_rc=$?
+  set -e
+  if [[ $igw_rc -ne 0 ]]; then
+    if echo "$IGW_JSON" | grep -qi 'already exists\|Duplicate\|Conflict\|not unique'; then
+      IGW_ID=$(oci "${oci_args[@]}" network internet-gateway list \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --vcn-id "$VCN_ID" \
+        --all \
+        --output json | jq -r --arg dn "$IGW_DN" '
+          .data[]?
+          | select((."display-name" // .displayName // "") == $dn)
+          | .id // empty' | head -1)
+      if [[ -z "$IGW_ID" ]]; then
+        echo "$IGW_JSON" >&2
+        exit "$igw_rc"
+      fi
+      echo "==> Internet gateway create reported conflict; reusing $IGW_DN"
+    else
+      echo "$IGW_JSON" >&2
+      exit "$igw_rc"
+    fi
+  else
+    IGW_ID=$(echo "$IGW_JSON" | jq -r '.data.id')
+  fi
+fi
+
+echo "==> Ensuring default route table sends 0.0.0.0/0 to internet gateway..."
 oci "${oci_args[@]}" network route-table update \
   --rt-id "$RT_ID" \
   --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"$IGW_ID\"}]" \
@@ -259,30 +341,121 @@ oci "${oci_args[@]}" network route-table update \
   --wait-for-state AVAILABLE \
   >/dev/null
 
-echo "==> Creating security list ${PROJECT}-public-sl..."
-SL_JSON=$(oci "${oci_args[@]}" network security-list create \
+SL_ID=$(oci "${oci_args[@]}" network security-list list \
   --compartment-id "$COMPARTMENT_OCID" \
   --vcn-id "$VCN_ID" \
-  --display-name "${PROJECT}-public-sl" \
-  --ingress-security-rules "$INGRESS_RULES_JSON" \
-  --egress-security-rules "$EGRESS_RULES_JSON" \
-  --wait-for-state AVAILABLE \
-  --output json)
-SL_ID=$(echo "$SL_JSON" | jq -r '.data.id')
+  --all \
+  --output json | jq -r --arg dn "$SL_DN" '
+    .data[]?
+    | select(
+        (."display-name" // .displayName // "") == $dn
+        and (."lifecycle-state" // .lifecycleState // "") == "AVAILABLE"
+      )
+    | .id // empty' | head -1)
 
-echo "==> Creating public subnet..."
-SUBNET_JSON=$(oci "${oci_args[@]}" network subnet create \
-  --cidr-block 10.0.0.0/24 \
+if [[ -n "$SL_ID" ]]; then
+  echo "==> Updating existing security list $SL_DN (ingress/egress rules)"
+  oci "${oci_args[@]}" network security-list update \
+    --security-list-id "$SL_ID" \
+    --ingress-security-rules "$INGRESS_RULES_JSON" \
+    --egress-security-rules "$EGRESS_RULES_JSON" \
+    --force \
+    --wait-for-state AVAILABLE \
+    >/dev/null
+else
+  echo "==> Creating security list $SL_DN..."
+  set +e
+  SL_JSON=$(oci "${oci_args[@]}" network security-list create \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --vcn-id "$VCN_ID" \
+    --display-name "$SL_DN" \
+    --ingress-security-rules "$INGRESS_RULES_JSON" \
+    --egress-security-rules "$EGRESS_RULES_JSON" \
+    --wait-for-state AVAILABLE \
+    --output json 2>&1)
+  sl_rc=$?
+  set -e
+  if [[ $sl_rc -ne 0 ]]; then
+    if echo "$SL_JSON" | grep -qi 'already exists\|Duplicate\|Conflict\|not unique'; then
+      SL_ID=$(oci "${oci_args[@]}" network security-list list \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --vcn-id "$VCN_ID" \
+        --all \
+        --output json | jq -r --arg dn "$SL_DN" '
+          .data[]? | select((."display-name" // .displayName // "") == $dn) | .id // empty' | head -1)
+      if [[ -n "$SL_ID" ]]; then
+        echo "==> Security list create reported conflict; updating $SL_DN"
+        oci "${oci_args[@]}" network security-list update \
+          --security-list-id "$SL_ID" \
+          --ingress-security-rules "$INGRESS_RULES_JSON" \
+          --egress-security-rules "$EGRESS_RULES_JSON" \
+          --force \
+          --wait-for-state AVAILABLE \
+          >/dev/null
+      else
+        echo "$SL_JSON" >&2
+        exit "$sl_rc"
+      fi
+    else
+      echo "$SL_JSON" >&2
+      exit "$sl_rc"
+    fi
+  else
+    SL_ID=$(echo "$SL_JSON" | jq -r '.data.id')
+  fi
+fi
+
+SUBNET_ID=$(oci "${oci_args[@]}" network subnet list \
   --compartment-id "$COMPARTMENT_OCID" \
   --vcn-id "$VCN_ID" \
-  --display-name "${PROJECT}-public" \
-  --dns-label "$dns_label_subnet" \
-  --prohibit-public-ip-on-vnic false \
-  --route-table-id "$RT_ID" \
-  --security-list-ids "[\"$SL_ID\"]" \
-  --wait-for-state AVAILABLE \
-  --output json)
-SUBNET_ID=$(echo "$SUBNET_JSON" | jq -r '.data.id')
+  --all \
+  --output json | jq -r --arg dn "$SUBNET_DN" '
+    .data[]?
+    | select(
+        (."display-name" // .displayName // "") == $dn
+        and (."lifecycle-state" // .lifecycleState // "") == "AVAILABLE"
+      )
+    | .id // empty' | head -1)
+
+if [[ -n "$SUBNET_ID" ]]; then
+  echo "==> Reusing existing subnet $SUBNET_DN"
+else
+  echo "==> Creating public subnet $SUBNET_DN..."
+  set +e
+  SUBNET_JSON=$(oci "${oci_args[@]}" network subnet create \
+    --cidr-block 10.0.0.0/24 \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --vcn-id "$VCN_ID" \
+    --display-name "$SUBNET_DN" \
+    --dns-label "$dns_label_subnet" \
+    --prohibit-public-ip-on-vnic false \
+    --route-table-id "$RT_ID" \
+    --security-list-ids "[\"$SL_ID\"]" \
+    --wait-for-state AVAILABLE \
+    --output json 2>&1)
+  sn_rc=$?
+  set -e
+  if [[ $sn_rc -ne 0 ]]; then
+    if echo "$SUBNET_JSON" | grep -qi 'already exists\|Duplicate\|Conflict\|not unique'; then
+      SUBNET_ID=$(oci "${oci_args[@]}" network subnet list \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --vcn-id "$VCN_ID" \
+        --all \
+        --output json | jq -r --arg dn "$SUBNET_DN" '
+          .data[]? | select((."display-name" // .displayName // "") == $dn) | .id // empty' | head -1)
+      if [[ -z "$SUBNET_ID" ]]; then
+        echo "$SUBNET_JSON" >&2
+        exit "$sn_rc"
+      fi
+      echo "==> Subnet create reported conflict; reusing $SUBNET_DN"
+    else
+      echo "$SUBNET_JSON" >&2
+      exit "$sn_rc"
+    fi
+  else
+    SUBNET_ID=$(echo "$SUBNET_JSON" | jq -r '.data.id')
+  fi
+fi
 
 METADATA_JSON=$(jq -n --arg ssh "$SSH_PUB" '{ssh_authorized_keys: $ssh}')
 if [[ "$BOOTSTRAP_DOCKER" == "true" || "$BOOTSTRAP_DOCKER" == "1" ]]; then
@@ -305,21 +478,123 @@ printf '%s' "$METADATA_JSON" >"$META_FILE"
 SHAPE_CONFIG_JSON=$(jq -n --argjson o "$OCPUS" --argjson m "$MEM_GB" '{ocpus: $o, memoryInGBs: $m}')
 printf '%s' "$SHAPE_CONFIG_JSON" >"$SHAPE_FILE"
 
-echo "==> Launching instance ${PROJECT}-arm (shape VM.Standard.A1.Flex)..."
-INST_JSON=$(oci "${oci_args[@]}" compute instance launch \
-  --availability-domain "$AD_NAME" \
-  --compartment-id "$COMPARTMENT_OCID" \
-  --shape "VM.Standard.A1.Flex" \
-  --shape-config "file://$SHAPE_FILE" \
-  --display-name "${PROJECT}-arm" \
-  --subnet-id "$SUBNET_ID" \
-  --assign-public-ip true \
-  --image-id "$IMAGE_ID" \
-  --metadata "file://$META_FILE" \
-  --wait-for-state RUNNING \
-  --output json)
+# True when launch failed in a way that may succeed in another AD (capacity, unknown AD, etc.).
+launch_error_try_next_ad() {
+  local text=$1
+  echo "$text" | grep -qi 'Out of host capacity' && return 0
+  echo "$text" | grep -qi 'InsufficientHostCapacity' && return 0
+  echo "$text" | grep -qi 'no host capacity' && return 0
+  # Some regions list AD names that compute no longer accepts, or fewer ADs than IAM returns.
+  echo "$text" | grep -qi 'not found' && return 0
+  echo "$text" | grep -qi 'NotFound' && return 0
+  echo "$text" | grep -qi 'UnknownAvailabilityDomain' && return 0
+  echo "$text" | grep -qi 'Invalid availability domain' && return 0
+  return 1
+}
 
-IID=$(echo "$INST_JSON" | jq -r '.data.id')
+INST_DN="${PROJECT}-arm"
+AD_JSON=$(oci "${oci_args[@]}" iam availability-domain list \
+  --compartment-id "$TENANCY_OCID" \
+  --output json)
+n_ads=$(echo "$AD_JSON" | jq '.data | length')
+if [[ "$n_ads" -lt 1 ]]; then
+  echo "error: no availability domains in region $REGION" >&2
+  exit 1
+fi
+if [[ "$AD_INDEX" -ge "$n_ads" || "$AD_INDEX" -lt 0 ]]; then
+  echo "warn: MERVYN_AD_INDEX=$AD_INDEX out of range 0..$((n_ads - 1)); using 0" >&2
+  AD_INDEX=0
+fi
+
+AD_ORDERED=()
+for ((offset = 0; offset < n_ads; offset++)); do
+  i=$(((AD_INDEX + offset) % n_ads))
+  nm=$(echo "$AD_JSON" | jq -r ".data[$i].name // empty")
+  [[ -z "$nm" || "$nm" == "null" ]] && continue
+  dup=0
+  for existing in "${AD_ORDERED[@]}"; do
+    [[ "$existing" == "$nm" ]] && {
+      dup=1
+      break
+    }
+  done
+  [[ "$dup" -eq 1 ]] && continue
+  AD_ORDERED+=("$nm")
+done
+if [[ ${#AD_ORDERED[@]} -eq 0 ]]; then
+  echo "error: could not resolve any availability domain names from IAM API" >&2
+  exit 1
+fi
+
+EXIST_IID=$(oci "${oci_args[@]}" compute instance list \
+  --compartment-id "$COMPARTMENT_OCID" \
+  --all \
+  --output json | jq -r --arg dn "$INST_DN" '
+    .data[]?
+    | select(
+        (."display-name" // .displayName // "") == $dn
+        and (
+          (."lifecycle-state" // .lifecycleState // "") == "RUNNING"
+          or (."lifecycle-state" // .lifecycleState // "") == "PROVISIONING"
+          or (."lifecycle-state" // .lifecycleState // "") == "STARTING"
+        )
+      )
+    | .id // empty' | head -1)
+
+if [[ -n "$EXIST_IID" ]]; then
+  echo "==> Reusing existing instance $INST_DN ($EXIST_IID)"
+  IID=$EXIST_IID
+  ls_state=$(oci "${oci_args[@]}" compute instance get --instance-id "$IID" --output json \
+    | jq -r '.data["lifecycle-state"] // .data.lifecycleState // empty')
+  if [[ "$ls_state" != "RUNNING" ]]; then
+    echo "    waiting for RUNNING (currently $ls_state)..."
+    oci "${oci_args[@]}" compute instance get \
+      --instance-id "$IID" \
+      --wait-for-state RUNNING \
+      >/dev/null
+  fi
+else
+  INST_JSON=""
+  last_launch_err=""
+  launched=0
+  for AD_NAME in "${AD_ORDERED[@]}"; do
+    echo "==> Launching instance $INST_DN in $AD_NAME (shape VM.Standard.A1.Flex)..."
+    set +e
+    out=$(oci "${oci_args[@]}" compute instance launch \
+      --availability-domain "$AD_NAME" \
+      --compartment-id "$COMPARTMENT_OCID" \
+      --shape "VM.Standard.A1.Flex" \
+      --shape-config "file://$SHAPE_FILE" \
+      --display-name "$INST_DN" \
+      --subnet-id "$SUBNET_ID" \
+      --assign-public-ip true \
+      --image-id "$IMAGE_ID" \
+      --metadata "file://$META_FILE" \
+      --wait-for-state RUNNING \
+      --output json 2>&1)
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      INST_JSON=$out
+      launched=1
+      break
+    fi
+    last_launch_err=$out
+    if launch_error_try_next_ad "$out"; then
+      echo "warn: $AD_NAME: skipped (capacity or AD not usable); trying next availability domain..." >&2
+      continue
+    fi
+    echo "$out" >&2
+    exit "$rc"
+  done
+  if [[ "$launched" -ne 1 ]]; then
+    echo "error: instance launch failed in all ${#AD_ORDERED[@]} availability domain(s) tried" >&2
+    echo "$last_launch_err" >&2
+    exit 1
+  fi
+  IID=$(echo "$INST_JSON" | jq -r '.data.id')
+fi
+
 echo "    instance OCID: $IID"
 
 echo "==> Waiting for public IP on primary VNIC..."
