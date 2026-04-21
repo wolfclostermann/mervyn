@@ -1,17 +1,17 @@
 output "instance_public_ip" {
   description = "Public IPv4 for SSH and (after TLS) Slack Events URL."
-  value       = module.oci_stack.instance_public_ip
+  value       = oci_core_instance.mervyn.public_ip
 }
 
 output "instance_ocid" {
-  value = module.oci_stack.instance_ocid
+  value = oci_core_instance.mervyn.id
 }
 
 output "vcn_id" {
-  value = module.oci_stack.vcn_id
+  value = oci_core_vcn.this.id
 }
 
 output "ssh_command" {
   description = "Default user is ubuntu on Canonical images."
-  value       = module.oci_stack.ssh_command
+  value       = "ssh ubuntu@${oci_core_instance.mervyn.public_ip}"
 }

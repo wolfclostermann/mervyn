@@ -2,8 +2,6 @@ services:
   mervyn:
     build: .
     restart: unless-stopped
-    ports:
-      - "3000:3000"
     volumes:
       - ./data:/app/data
       # Sibling git worklog repo (host path). Uncomment so vault symlinks / pull target exist in-container.

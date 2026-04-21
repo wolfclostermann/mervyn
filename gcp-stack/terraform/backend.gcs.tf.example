@@ -1,0 +1,10 @@
+# GCS backend. Copied to backend.tf by run.sh (non-local). Backend bucket + credentials
+# come from terraform-framework shared-config (see run.sh).
+#
+#   terraform init -reconfigure \
+#     -backend-config="prefix=stacks/mervyn-gcp/<env>" \
+#     -backend-config=<terraform-framework>/shared-config/shared/backend.config.hcl
+
+terraform {
+  backend "gcs" {}
+}

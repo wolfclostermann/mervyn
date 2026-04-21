@@ -43,7 +43,7 @@ DMs would need `im:history` and `message.im` if you ever wire that; not required
 ### 3. Event subscriptions
 
 1. Under **Event Subscriptions**, turn **Enable Events** on.
-2. Set **Request URL** to `https://<your-public-host>/slack/events` (must be HTTPS and reachable from Slack’s servers). For local development, use a tunnel ([ngrok](https://ngrok.com/), [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/), etc.) so that URL points at your machine’s Mervyn port (e.g. `https://abc.ngrok.io/slack/events`).
+2. Set **Request URL** to `https://<your-public-host>/slack/events` (must be HTTPS and reachable from Slack’s servers). Mervyn includes an **[ngrok](https://ngrok.com/) HTTP tunnel** ([`src/ngrok_tunnel.rs`](src/ngrok_tunnel.rs)): enable it with **`NGROK_AUTHTOKEN`** and **`MERVYN__NGROK__ENABLED=true`** in `.env` (or `[ngrok]` in [`config/default.toml`](config/default.toml)). On startup the process connects to ngrok, forwards to the local server port, and **logs the public URL** and the exact Slack path to use—no separate ngrok agent binary is required. Optional **`MERVYN__NGROK__DOMAIN`** sets a reserved domain on paid ngrok plans. If you prefer not to use it, terminate HTTPS with your own reverse proxy or another tunnel ([Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/), etc.).
 3. Slack will send a URL verification challenge; Mervyn answers it when the route is wired correctly.
 4. Under **Subscribe to bot events**, add:
 
@@ -85,7 +85,7 @@ Default listen port comes from `config/default.toml` (`[server] port`, usually *
 
 Optional **operator** JSON: set `MERVYN_ADMIN_TOKEN` in `.env`, then `GET /admin/slack-ingest` with header `Authorization: Bearer <token>` and query params `limit`, `since_ms`, `until_ms`, `outcome`, `event_id` (see spec).
 
-Optional **built-in ngrok tunnel** (local dev): set `NGROK_AUTHTOKEN` and `MERVYN__NGROK__ENABLED=true` in `.env`, then run `cargo run`. Mervyn logs a public URL and the exact Slack Events URL to paste into Slack app settings. You can also set `MERVYN__NGROK__DOMAIN=<reserved-domain>` if you use a reserved ngrok domain.
+**Slack HTTPS URL:** enable the **built-in ngrok tunnel** with `NGROK_AUTHTOKEN` and `MERVYN__NGROK__ENABLED=true` in `.env`, then run `cargo run`. Logs include the public base URL and `/slack/events` path for [Event subscriptions](#3-event-subscriptions). Optional `MERVYN__NGROK__DOMAIN` for a reserved ngrok hostname.
 
 ## Usage
 
@@ -146,7 +146,7 @@ Compose loads secrets and optional `MERVYN__*` overrides from a **`.env` file ne
 
 **Already in the image** — [`config/default.toml`](config/default.toml) is copied into the image at build time (`Dockerfile`), so you do not need to mount `config/` for a default run. Override behaviour with `MERVYN__…` environment variables in `.env` if you need different ports, paths, or schedules.
 
-**Slack** — Your Events API Request URL must reach the HTTP server that ends at this container (for example `https://<tunnel-or-host>/slack/events` with port **3000** published as in compose, or a reverse proxy in front).
+**Slack** — Prefer the **built-in ngrok tunnel**: set `NGROK_AUTHTOKEN` and `MERVYN__NGROK__ENABLED=true` in the same `.env` Compose loads; Mervyn inside the container opens the tunnel to its HTTP port, so Slack uses ngrok’s HTTPS URL and you **do not** need a separate tunnel binary or inbound firewall rules to the app port on a cloud host. Check logs for the Request URL. **Host port:** the default [`docker-compose.yml`](docker-compose.yml) does **not** publish port **3000**; for `curl` / browser on your machine use [`docker-compose.local.yml`](docker-compose.local.yml): `docker compose -f docker-compose.yml -f docker-compose.local.yml up --build`. If `[ngrok]` stays off, use that override or another reverse proxy so Slack can reach the server.
 
 ```bash
 docker compose up --build

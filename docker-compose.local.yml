@@ -1,0 +1,6 @@
+# Optional: map the app port to the host for local curl / browser (127.0.0.1 only).
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+services:
+  mervyn:
+    ports:
+      - "127.0.0.1:3000:3000"

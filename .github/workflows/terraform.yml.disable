@@ -1,0 +1,140 @@
+# Rename this file to terraform.yml (remove the .disable suffix) to enable GitHub Actions.
+#
+# GCP stack root: ./gcp-stack/terraform (see gcp-stack/run.sh).
+# Checkout gfs-sre/terraform-framework for shared-config (backend HCL). Modules and org/billing
+# come from Git + terraform-core remote state (see gcp-stack/terraform/data.tf, main.tf).
+#
+# Repository variables: WORKLOAD_IDENTITY_PROVIDER, WORKLOAD_IDENTITY_SERVICE_ACCOUNT
+# Plan/apply authenticate via Workload Identity → service account (no SSH public key; VM access is IAP + OS Login).
+# WIF must allow this repository. Teardown: use ./gcp-stack/run.sh <env> destroy (not run in CI).
+
+name: Terraform
+
+on:
+  push:
+    branches: [main, development]
+    paths:
+      - "gcp-stack/terraform/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches: [main, development]
+    paths:
+      - "gcp-stack/terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+
+env:
+  TF_VERSION: "1.14"
+  STACK: mervyn-gcp
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    defaults:
+      run:
+        working-directory: gcp-stack/terraform
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Checkout terraform-framework (shared-config)
+        uses: actions/checkout@v4
+        with:
+          repository: gfs-sre/terraform-framework
+          ref: main
+          path: terraform-framework
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.WORKLOAD_IDENTITY_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cp backend.gcs.tf.example backend.tf
+          terraform init -reconfigure \
+            -backend-config="prefix=stacks/${{ env.STACK }}/${{ matrix.environment }}" \
+            -backend-config=${{ github.workspace }}/terraform-framework/shared-config/shared/backend.config.hcl
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: |
+          terraform plan -no-color \
+            -var-file=envs/${{ matrix.environment }}.tfvars \
+            -out=tfplan-${{ matrix.environment }}
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: gcp-stack/terraform/tfplan-${{ matrix.environment }}
+
+  apply:
+    name: Apply
+    needs: plan
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    defaults:
+      run:
+        working-directory: gcp-stack/terraform
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Checkout terraform-framework (shared-config)
+        uses: actions/checkout@v4
+        with:
+          repository: gfs-sre/terraform-framework
+          ref: main
+          path: terraform-framework
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.WORKLOAD_IDENTITY_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: gcp-stack/terraform
+
+      - name: Terraform Init
+        run: |
+          cp backend.gcs.tf.example backend.tf
+          terraform init -reconfigure \
+            -backend-config="prefix=stacks/${{ env.STACK }}/${{ matrix.environment }}" \
+            -backend-config=${{ github.workspace }}/terraform-framework/shared-config/shared/backend.config.hcl
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan-${{ matrix.environment }}

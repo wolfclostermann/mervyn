@@ -12,8 +12,11 @@ __pycache__/
 *.tfstate.*
 .terraform.tfstate.lock.info
 crash.log
+gcp-stack/terraform/backend.tf
 *.tfvars
 !terraform/terraform.tfvars.example
+!terraform/stacks/aws/terraform.tfvars.example
+!gcp-stack/terraform/envs/*.tfvars
 override.tf
 override.tf.json
 *_override.tf

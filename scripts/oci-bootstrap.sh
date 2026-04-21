@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap Mervyn on Oracle Cloud (Ampere A1) using the OCI CLI — similar in spirit to
-# a one-shot gcloud run: network + Ubuntu ARM + Docker cloud-init, using your configured profile.
+# Bootstrap Mervyn on Oracle Cloud (default: Ampere VM.Standard.A1.Flex) using the OCI CLI —
+# similar in spirit to a one-shot gcloud run: network + Ubuntu + Docker cloud-init.
 #
 # Prerequisites (install once):
 #   - Oracle Cloud Infrastructure CLI: https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm
@@ -21,8 +21,10 @@
 #   MERVYN_SSH_PUBLIC_KEY_FILE  Path to .pub (default: ~/.ssh/id_ed25519.pub or id_rsa.pub)
 #   MERVYN_AD_INDEX           First availability domain to try, 0..n-1 (default: 0);
 #                             on "Out of host capacity" the script tries other ADs in order.
-#   MERVYN_OCPUS              A1.Flex OCPUs (default: 1)
-#   MERVYN_MEMORY_GBS         A1.Flex memory in GB (default: 6)
+#   MERVYN_COMPUTE_SHAPE        e.g. VM.Standard.A1.Flex (default Ampere) or VM.Standard.E2.1.Micro
+#   MERVYN_INSTANCE_DISPLAY_NAME  Compute display name for idempotency (default: ${PROJECT}-arm)
+#   MERVYN_OCPUS              Flex shapes only: OCPUs (default: 1)
+#   MERVYN_MEMORY_GBS         Flex shapes only: memory in GB (default: 6)
 #   MERVYN_UBUNTU_VERSION     e.g. 22.04 (default: 22.04)
 #   MERVYN_SSH_ALLOWED_CIDRS  Comma-separated CIDRs for SSH (default: 0.0.0.0/0)
 #   MERVYN_HTTP_CIDRS         Comma-separated CIDRs for 80/443 (default: 0.0.0.0/0)
@@ -36,7 +38,8 @@
 #
 # Re-runs: networking is reused when resources with the expected display names already exist
 # in the compartment. Instance launch is skipped if a RUNNING/PROVISIONING/STARTING instance
-# named ${MERVYN_PROJECT_NAME:-mervyn}-arm already exists. Otherwise launch tries each
+# named MERVYN_INSTANCE_DISPLAY_NAME (default ${MERVYN_PROJECT_NAME:-mervyn}-arm) already exists.
+# Otherwise launch tries each
 # availability domain in rotation until success or a non-capacity error.
 
 set -euo pipefail
@@ -49,6 +52,8 @@ OCI_CONFIG="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
 OCI_PROFILE="${OCI_CLI_PROFILE:-DEFAULT}"
 
 PROJECT="${MERVYN_PROJECT_NAME:-mervyn}"
+COMPUTE_SHAPE="${MERVYN_COMPUTE_SHAPE:-VM.Standard.A1.Flex}"
+INST_DN="${MERVYN_INSTANCE_DISPLAY_NAME:-${PROJECT}-arm}"
 AD_INDEX="${MERVYN_AD_INDEX:-0}"
 OCPUS="${MERVYN_OCPUS:-1}"
 MEM_GB="${MERVYN_MEMORY_GBS:-6}"
@@ -193,12 +198,19 @@ fi
 
 echo "==> Using profile=$OCI_PROFILE region=$REGION compartment=$COMPARTMENT_OCID"
 
-echo "==> Resolving Ubuntu ${UBUNTU_VER} aarch64 image for VM.Standard.A1.Flex..."
+shape_requires_flex_config() {
+  case "$1" in
+  *Flex) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+echo "==> Resolving Ubuntu ${UBUNTU_VER} image compatible with $COMPUTE_SHAPE..."
 IMAGES_JSON=$(oci "${oci_args[@]}" compute image list \
   --compartment-id "$COMPARTMENT_OCID" \
   --operating-system "Canonical Ubuntu" \
   --operating-system-version "$UBUNTU_VER" \
-  --shape "VM.Standard.A1.Flex" \
+  --shape "$COMPUTE_SHAPE" \
   --sort-by TIMECREATED \
   --sort-order DESC \
   --all \
@@ -220,7 +232,7 @@ if [[ -n "$DISPLAY_PICKED" ]]; then
 fi
 
 if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "null" ]]; then
-  echo "error: no compatible Ubuntu image found (region/A1 capacity/shape filter)" >&2
+  echo "error: no compatible Ubuntu image found for $COMPUTE_SHAPE (region or shape filter)" >&2
   exit 1
 fi
 
@@ -468,15 +480,18 @@ if [[ "$BOOTSTRAP_DOCKER" == "true" || "$BOOTSTRAP_DOCKER" == "1" ]]; then
 fi
 
 META_FILE=$(mktemp)
-SHAPE_FILE=$(mktemp)
+SHAPE_FILE=""
+if shape_requires_flex_config "$COMPUTE_SHAPE"; then
+  SHAPE_FILE=$(mktemp)
+  SHAPE_CONFIG_JSON=$(jq -n --argjson o "$OCPUS" --argjson m "$MEM_GB" '{ocpus: $o, memoryInGBs: $m}')
+  printf '%s' "$SHAPE_CONFIG_JSON" >"$SHAPE_FILE"
+fi
 cleanup_tmp() {
-  rm -f "$META_FILE" "$SHAPE_FILE"
+  rm -f "$META_FILE"
+  [[ -n "$SHAPE_FILE" ]] && rm -f "$SHAPE_FILE"
 }
 trap cleanup_tmp EXIT
 printf '%s' "$METADATA_JSON" >"$META_FILE"
-
-SHAPE_CONFIG_JSON=$(jq -n --argjson o "$OCPUS" --argjson m "$MEM_GB" '{ocpus: $o, memoryInGBs: $m}')
-printf '%s' "$SHAPE_CONFIG_JSON" >"$SHAPE_FILE"
 
 # True when launch failed in a way that may succeed in another AD (capacity, unknown AD, etc.).
 launch_error_try_next_ad() {
@@ -492,7 +507,6 @@ launch_error_try_next_ad() {
   return 1
 }
 
-INST_DN="${PROJECT}-arm"
 AD_JSON=$(oci "${oci_args[@]}" iam availability-domain list \
   --compartment-id "$TENANCY_OCID" \
   --output json)
@@ -506,14 +520,14 @@ if [[ "$AD_INDEX" -ge "$n_ads" || "$AD_INDEX" -lt 0 ]]; then
   AD_INDEX=0
 fi
 
-AD_ORDERED=()
+declare -a AD_ORDERED=()
 for ((offset = 0; offset < n_ads; offset++)); do
   i=$(((AD_INDEX + offset) % n_ads))
   nm=$(echo "$AD_JSON" | jq -r ".data[$i].name // empty")
   [[ -z "$nm" || "$nm" == "null" ]] && continue
   dup=0
-  for existing in "${AD_ORDERED[@]}"; do
-    [[ "$existing" == "$nm" ]] && {
+  for ((e = 0; e < ${#AD_ORDERED[@]}; e++)); do
+    [[ "${AD_ORDERED[$e]}" == "$nm" ]] && {
       dup=1
       break
     }
@@ -521,7 +535,7 @@ for ((offset = 0; offset < n_ads; offset++)); do
   [[ "$dup" -eq 1 ]] && continue
   AD_ORDERED+=("$nm")
 done
-if [[ ${#AD_ORDERED[@]} -eq 0 ]]; then
+if ((${#AD_ORDERED[@]} == 0)); then
   echo "error: could not resolve any availability domain names from IAM API" >&2
   exit 1
 fi
@@ -557,21 +571,36 @@ else
   INST_JSON=""
   last_launch_err=""
   launched=0
-  for AD_NAME in "${AD_ORDERED[@]}"; do
-    echo "==> Launching instance $INST_DN in $AD_NAME (shape VM.Standard.A1.Flex)..."
+  for ((ad_i = 0; ad_i < ${#AD_ORDERED[@]}; ad_i++)); do
+    AD_NAME="${AD_ORDERED[$ad_i]}"
+    echo "==> Launching instance $INST_DN in $AD_NAME (shape $COMPUTE_SHAPE)..."
     set +e
-    out=$(oci "${oci_args[@]}" compute instance launch \
-      --availability-domain "$AD_NAME" \
-      --compartment-id "$COMPARTMENT_OCID" \
-      --shape "VM.Standard.A1.Flex" \
-      --shape-config "file://$SHAPE_FILE" \
-      --display-name "$INST_DN" \
-      --subnet-id "$SUBNET_ID" \
-      --assign-public-ip true \
-      --image-id "$IMAGE_ID" \
-      --metadata "file://$META_FILE" \
-      --wait-for-state RUNNING \
-      --output json 2>&1)
+    if shape_requires_flex_config "$COMPUTE_SHAPE"; then
+      out=$(oci "${oci_args[@]}" compute instance launch \
+        --availability-domain "$AD_NAME" \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --shape "$COMPUTE_SHAPE" \
+        --shape-config "file://$SHAPE_FILE" \
+        --display-name "$INST_DN" \
+        --subnet-id "$SUBNET_ID" \
+        --assign-public-ip true \
+        --image-id "$IMAGE_ID" \
+        --metadata "file://$META_FILE" \
+        --wait-for-state RUNNING \
+        --output json 2>&1)
+    else
+      out=$(oci "${oci_args[@]}" compute instance launch \
+        --availability-domain "$AD_NAME" \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --shape "$COMPUTE_SHAPE" \
+        --display-name "$INST_DN" \
+        --subnet-id "$SUBNET_ID" \
+        --assign-public-ip true \
+        --image-id "$IMAGE_ID" \
+        --metadata "file://$META_FILE" \
+        --wait-for-state RUNNING \
+        --output json 2>&1)
+    fi
     rc=$?
     set -e
     if [[ $rc -eq 0 ]]; then

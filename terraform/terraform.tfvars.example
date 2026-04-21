@@ -1,3 +1,8 @@
+# Oracle Cloud (OCI) stack — default Terraform root under terraform/.
+# Composable-module layout aligns with https://github.com/gfs-sre/terraform-framework-example-stack
+#
+# AWS: use terraform/stacks/aws/ (separate root; see scripts/bootstrap.sh aws).
+#
 # Copy to terraform.tfvars (gitignored) and fill in. Do not commit secrets.
 
 tenancy_ocid     = "ocid1.tenancy.oc1..aaaaaaaa..."
