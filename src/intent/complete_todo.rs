@@ -41,8 +41,10 @@ fn tokenize_command_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// When the message is only list positions plus completion filler (e.g. `7, 11 done`),
-/// map 1-based positions → database ids. Otherwise `None` so Claude can interpret.
+/// When the message is only numeric tokens plus completion filler, resolve either as
+/// **database ids** (every token matches an open todo's `id` — typical when Wolf echoes
+/// `- [id]` / `4.` style labels from chat) or as **1-based checklist positions** (e.g.
+/// `7, 11 done` when those are row numbers, not keys). Otherwise `None` so Claude can interpret.
 fn try_ids_from_strict_list_command(text: &str, list: &[TodoItem]) -> Option<Vec<u64>> {
     const SKIP: &[&str] = &[
         "done",
@@ -76,26 +78,43 @@ fn try_ids_from_strict_list_command(text: &str, list: &[TodoItem]) -> Option<Vec
     if tokens.is_empty() {
         return None;
     }
-    let mut positions = Vec::new();
+    let mut numbers = Vec::new();
     for t in tokens {
         let tl = t.to_lowercase();
         if SKIP.iter().any(|k| *k == tl.as_str()) {
             continue;
         }
         let n: u32 = t.parse().ok()?;
-        if n == 0 || n as usize > list.len() {
+        if n == 0 {
             return None;
         }
-        positions.push(n);
+        numbers.push(n);
     }
-    if positions.is_empty() {
+    if numbers.is_empty() {
         return None;
     }
+
+    let id_set: HashSet<u64> = list.iter().map(|t| t.id).collect();
+    let all_match_ids = numbers
+        .iter()
+        .all(|&n| id_set.contains(&(n as u64)));
+    let all_match_positions = numbers
+        .iter()
+        .all(|&n| (n as usize) <= list.len());
+
+    let raw_ids: Vec<u64> = if all_match_ids {
+        numbers.iter().map(|&n| n as u64).collect()
+    } else if all_match_positions {
+        numbers.iter().map(|&n| list[n as usize - 1].id).collect()
+    } else {
+        return None;
+    };
+
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
-    for n in positions {
-        if seen.insert(n) {
-            ids.push(list[n as usize - 1].id);
+    for id in raw_ids {
+        if seen.insert(id) {
+            ids.push(id);
         }
     }
     Some(ids)
@@ -245,6 +264,20 @@ mod tests {
     fn strict_list_command_rejects_out_of_range() {
         let list = sample_open_list();
         assert!(try_ids_from_strict_list_command("7, 99 done", &list).is_none());
+    }
+
+    /// Slack / ask replies often number lines by database id; "15" can exceed checklist length.
+    #[test]
+    fn strict_list_command_resolves_db_ids_when_any_token_exceeds_list_len() {
+        let list = vec![
+            todo_row(4, "Contact Datadog"),
+            todo_row(10, "Physio"),
+            todo_row(15, "OCI"),
+        ];
+        assert_eq!(
+            try_ids_from_strict_list_command("mark 4, 15 done", &list).unwrap(),
+            vec![4, 15]
+        );
     }
 
     #[test]
