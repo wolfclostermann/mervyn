@@ -1,6 +1,8 @@
 services:
   mervyn:
     build: .
+    # Stabilises tags for pre-built images (see scripts/deploy-gcp.sh --local-build).
+    image: mervyn:deploy
     restart: unless-stopped
     volumes:
       - ./data:/app/data
