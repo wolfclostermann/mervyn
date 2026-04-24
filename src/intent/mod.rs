@@ -1,4 +1,5 @@
 pub mod add_event;
+pub mod add_event_claude_time;
 pub mod add_note;
 pub mod add_reminder;
 pub mod ask;

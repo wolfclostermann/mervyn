@@ -14,6 +14,7 @@ pub const TASK_INTENT_CLASSIFICATION: &str = "intent_classification";
 pub const TASK_MORNING_BRIEFING: &str = "morning_briefing";
 pub const TASK_FREEFORM_QUERY: &str = "freeform_query";
 pub const TASK_EVENT_TITLE_EXTRACTION: &str = "event_title_extraction";
+pub const TASK_EVENT_TIME_EXTRACTION: &str = "event_time_extraction";
 pub const TASK_REMOVE_EVENT: &str = "remove_event";
 pub const TASK_COMPLETE_TODO: &str = "complete_todo";
 pub const TASK_TODO_ITEMS_EXTRACTION: &str = "todo_items_extraction";
@@ -109,6 +110,38 @@ impl EventTitleExtractionV1 {
 pub struct EventTitleReplyV1 {
     #[serde(default)]
     pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EventTimeExtractionV1 {
+    pub api_version: u32,
+    pub task: &'static str,
+    pub message: String,
+    /// IANA time zone (matches app `scheduler.timezone`); the model should interpret the message in this zone.
+    pub interpret_in_timezone: String,
+}
+
+impl EventTimeExtractionV1 {
+    pub fn new(message: impl Into<String>, interpret_in_timezone: String) -> Self {
+        Self {
+            api_version: PROMPT_API_VERSION,
+            task: TASK_EVENT_TIME_EXTRACTION,
+            message: message.into(),
+            interpret_in_timezone,
+        }
+    }
+}
+
+/// Model reply for [`TASK_EVENT_TIME_EXTRACTION`]: instants in UTC.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EventTimeReplyV1 {
+    /// RFC 3339 in UTC, e.g. `2026-05-08T10:50:00Z`.
+    #[serde(default)]
+    pub start_utc: Option<String>,
+    #[serde(default)]
+    pub end_utc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

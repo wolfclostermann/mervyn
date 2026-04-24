@@ -372,14 +372,80 @@ fn to_24h_clock(
     }
 }
 
-/// Parsed start/end when the text carries a schedulable date and/or clock (same rules as events).
-/// `None` only when there is no ISO/month/today/tomorrow anchor and no `H:MM` clock — so callers
-/// can apply their own default (event: now+24h; reminder: tomorrow 09:00 UTC).
-pub(crate) fn try_parse_event_timing(
+/// Heuristic result for a new **calendar** event. When [`AddEventTimeFromText::UseLanguageModel`],
+/// the string did not state a day well enough (or only a time with no date), so a model should
+/// pick wall times; reminders still use [`try_parse_event_timing`].
+pub enum AddEventTimeFromText {
+    Deterministic {
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+    },
+    /// No anchor + time, or time-only (local “today” assumed) with no other date in text.
+    UseLanguageModel,
+}
+
+/// Same rules as [`try_parse_event_timing`], but classifies add-event: time-only on “today”
+/// (submission day) without any date in the text defers to a model instead of saving that false day.
+pub fn add_event_time_from_text(
     text: &str,
     now: DateTime<Utc>,
     tz: Tz,
-) -> Option<(DateTime<Utc>, Option<DateTime<Utc>>)> {
+) -> AddEventTimeFromText {
+    let Some((
+        start,
+        end,
+        time_only_anchored_local_today,
+    )) = try_parse_event_timing_internals(text, now, tz)
+    else {
+        return AddEventTimeFromText::UseLanguageModel;
+    };
+    if time_only_anchored_local_today {
+        return AddEventTimeFromText::UseLanguageModel;
+    }
+    AddEventTimeFromText::Deterministic { start, end }
+}
+
+/// Format a stored event range in `tz` (e.g. `Europe/London` shows **GMT** or **BST** as appropriate).
+pub fn format_event_range_for_reply(
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
+    tz: Tz,
+) -> String {
+    let ls = start.with_timezone(&tz);
+    let z = ls.format("%Z").to_string();
+    match end {
+        Some(utc_end) => {
+            let le = utc_end.with_timezone(&tz);
+            if le.date_naive() == ls.date_naive() {
+                format!(
+                    "{}–{} {}",
+                    ls.format("%Y-%m-%d %H:%M"),
+                    le.format("%H:%M"),
+                    z
+                )
+            } else {
+                format!(
+                    "{} {} – {} {}",
+                    ls.format("%Y-%m-%d %H:%M"),
+                    z,
+                    le.format("%Y-%m-%d %H:%M"),
+                    le.format("%Z")
+                )
+            }
+        }
+        None => format!("{} {}", ls.format("%Y-%m-%d %H:%M"), z),
+    }
+}
+
+fn try_parse_event_timing_internals(
+    text: &str,
+    now: DateTime<Utc>,
+    tz: Tz,
+) -> Option<(
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    /* time_only_anchored_local_today: */ bool,
+)> {
     let local_now = now.with_timezone(&tz);
     let today_utc = now.date_naive();
 
@@ -390,6 +456,7 @@ pub(crate) fn try_parse_event_timing(
 
     let mut anchor: Option<NaiveDate> = None;
     let mut nine_is_local = false;
+    let mut time_only_anchored_local_today = false;
 
     if let Some(d) = iso {
         anchor = Some(d);
@@ -416,6 +483,7 @@ pub(crate) fn try_parse_event_timing(
         if clock.is_some() {
             anchor = Some(local_now.date_naive());
             nine_is_local = true;
+            time_only_anchored_local_today = true;
         } else {
             return None;
         }
@@ -426,24 +494,53 @@ pub(crate) fn try_parse_event_timing(
     if let Some((h1, h2)) = hours_around_til(text) {
         let start_utc = naive_local_to_utc(date, h1, 0, tz)?;
         let end_utc = naive_local_to_utc(date, h2, 0, tz)?;
-        return Some((start_utc, Some(end_utc)));
+        return Some((
+            start_utc,
+            Some(end_utc),
+            time_only_anchored_local_today,
+        ));
     }
 
     if let Some((h, min, ampm)) = clock {
         if let Some((h24, m)) = to_24h_clock(h, min, ampm, date, local_now, tz) {
             if let Some(start_utc) = naive_local_to_utc(date, h24, m, tz) {
-                return Some((start_utc, None));
+                return Some((
+                    start_utc,
+                    None,
+                    time_only_anchored_local_today,
+                ));
             }
         }
     }
 
     if nine_is_local {
         let start_utc = naive_local_to_utc(date, 9, 0, tz)?;
-        return Some((start_utc, None));
+        return Some((
+            start_utc,
+            None,
+            time_only_anchored_local_today,
+        ));
     }
 
     let start_naive = date.and_hms_opt(9, 0, 0)?;
-    Some((start_naive.and_utc(), None))
+    Some((
+        start_naive.and_utc(),
+        None,
+        time_only_anchored_local_today,
+    ))
+}
+
+/// Parsed start/end when the text carries a schedulable date and/or clock (same rules as events).
+/// `None` only when there is no ISO/month/today/tomorrow anchor and no `H:MM` clock — so callers
+/// can apply their own default (reminder: tomorrow 09:00 UTC). Calendar `add_event` should use
+/// [`add_event_time_from_text`], not this, when deciding the submission-day default.
+pub(crate) fn try_parse_event_timing(
+    text: &str,
+    now: DateTime<Utc>,
+    tz: Tz,
+) -> Option<(DateTime<Utc>, Option<DateTime<Utc>>)> {
+    let (a, b, _) = try_parse_event_timing_internals(text, now, tz)?;
+    Some((a, b))
 }
 
 /// Event start/end: ISO / month-day / **today** / **tomorrow** / `H:MM` (see `tz`); else start = now + 24h.
@@ -487,6 +584,38 @@ mod tests {
         let (start, end) = event_timing_from_text("dentist sometime", now, chrono_tz::UTC);
         assert!(end.is_none());
         assert_eq!(start, now + Duration::hours(24));
+    }
+
+    #[test]
+    fn add_event_time_only_today_uses_model_path() {
+        let now = DateTime::parse_from_rfc3339("2026-04-14T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t = "haircut at 4pm";
+        assert!(matches!(
+            add_event_time_from_text(t, now, chrono_tz::Europe::London),
+            AddEventTimeFromText::UseLanguageModel
+        ));
+    }
+
+    #[test]
+    fn add_event_vague_uses_model_path() {
+        let now = Utc::now();
+        let t = "book something with the optician";
+        assert!(matches!(
+            add_event_time_from_text(t, now, chrono_tz::UTC),
+            AddEventTimeFromText::UseLanguageModel
+        ));
+    }
+
+    #[test]
+    fn format_reply_uses_local_zone_abbrev() {
+        let start = DateTime::parse_from_rfc3339("2026-05-08T10:50:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let s = format_event_range_for_reply(start, None, chrono_tz::Europe::London);
+        assert!(s.contains("11:50"));
+        assert!(s.contains("BST"));
     }
 
     /// "N(st|nd|th) of (month)": do not use submission day when a clock is present; prefer stated date.

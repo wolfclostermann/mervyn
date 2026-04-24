@@ -1,8 +1,9 @@
 use chrono::Utc;
 use chrono_tz::Tz;
 
+use crate::intent::add_event_claude_time;
 use crate::intent::event_title::resolve_event_title;
-use crate::intent::text_datetime::event_timing_from_text;
+use crate::intent::text_datetime::{add_event_time_from_text, format_event_range_for_reply, AddEventTimeFromText};
 use crate::state::AppState;
 use crate::storage::events::{self, Event};
 
@@ -25,10 +26,23 @@ pub async fn run(
             );
             chrono_tz::UTC
         });
-    let (start, end) = event_timing_from_text(text.trim(), now, tz);
+    let iana = &state.settings.scheduler.timezone;
+    let trimmed = text.trim();
+    let (start, end) = match add_event_time_from_text(trimmed, now, tz) {
+        AddEventTimeFromText::Deterministic { start, end } => (start, end),
+        AddEventTimeFromText::UseLanguageModel => {
+            add_event_claude_time::resolve_add_event_time_via_claude(
+                &state.claude,
+                trimmed,
+                situation.clone(),
+                iana,
+            )
+            .await?
+        }
+    };
     let title = resolve_event_title(
         &state.claude,
-        text.trim(),
+        trimmed,
         now.date_naive(),
         situation,
     )
@@ -42,14 +56,7 @@ pub async fn run(
         tags: vec![],
     };
     events::put(state.db.as_ref(), &e).map_err(|e| anyhow::anyhow!(e))?;
-    let time_line = match e.end {
-        Some(end) => format!(
-            "{}–{} (UTC)",
-            start.format("%Y-%m-%d %H:%M"),
-            end.format("%H:%M")
-        ),
-        None => format!("{} (UTC)", start.format("%Y-%m-%d %H:%M")),
-    };
+    let time_line = format_event_range_for_reply(e.start, e.end, tz);
     Ok(format!(
         "Event “{}” saved for {} — edit time/details in Obsidian or ask me to refine.",
         e.title, time_line

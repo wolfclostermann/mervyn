@@ -5,9 +5,9 @@
 use chrono::{DateTime, Utc};
 
 use super::payloads::{
-    CompleteTodoRequestV1, EventTitleExtractionV1, FreeformQueryV1, IntentClassificationV1,
-    MorningBriefingV1, RemoveEventCandidateV1, RemoveEventRequestV1, SystemContextV1,
-    TodoDoneCandidateV1, TodoItemsExtractionV1,
+    CompleteTodoRequestV1, EventTimeExtractionV1, EventTitleExtractionV1, FreeformQueryV1,
+    IntentClassificationV1, MorningBriefingV1, RemoveEventCandidateV1, RemoveEventRequestV1,
+    SystemContextV1, TodoDoneCandidateV1, TodoItemsExtractionV1,
 };
 
 /// Core behaviour and identity. A JSON [`SystemContextV1`] is appended by [`system_prompt_json`].
@@ -63,6 +63,15 @@ Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fenc
 - api_version: same integer as in the user's object
 - title: short calendar title (about 2–10 words): the core activity or subject only. Strip Slack mention markup mentally; omit dates, times, and filler like "I have a" unless needed for clarity. No trailing period unless it is part of a proper name."#;
 
+/// User message = JSON from [`event_time_extraction_user_json`].
+pub const SUPPLEMENT_EVENT_TIME_EXTRACTION: &str = r#"The user's message is one JSON object with task "event_time_extraction", message (raw text for a new calendar event), and interpret_in_timezone (IANA name, e.g. Europe/London). Wolf's wall-clock date and time for "now" are in the system JSON above; treat the message in interpret_in_timezone for any relative phrases, daylight rules (e.g. BST vs GMT in the UK), and implicit dates.
+
+Choose a start instant and, if the message names a range or end, an end instant. You must return times as UTC in RFC 3339 with a Z or explicit offset, e.g. 2026-05-08T10:50:00Z. If the message is too vague to pick any time, you may return null for start_utc. Put end_utc in null for a point event.
+
+Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fences, no other text). Fields:
+- start_utc: string or null (required key; use null if no reasonable time)
+- end_utc: string or null (optional; omit the key or use null for a single instant)"#;
+
 /// Append for todo line extraction. User message = JSON from [`todo_items_extraction_user_json`].
 pub const SUPPLEMENT_TODO_ITEMS_EXTRACTION: &str = r#"The user's message is one JSON object with task "todo_items_extraction" and message (raw Slack text — Wolf is adding to his personal todo list).
 
@@ -115,6 +124,14 @@ pub fn freeform_query_user_json(context: &str, question: &str) -> serde_json::Re
 /// User message body (JSON only) for calendar event title extraction.
 pub fn event_title_extraction_user_json(message: &str) -> serde_json::Result<String> {
     serde_json::to_string(&EventTitleExtractionV1::new(message))
+}
+
+/// User message body (JSON only) for inferring calendar start/end in UTC.
+pub fn event_time_extraction_user_json(message: &str, interpret_in_timezone: &str) -> serde_json::Result<String> {
+    serde_json::to_string(&EventTimeExtractionV1::new(
+        message,
+        interpret_in_timezone.to_string(),
+    ))
 }
 
 /// User message body (JSON only) for todo item extraction from a note-style message.
