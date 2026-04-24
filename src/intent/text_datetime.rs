@@ -67,6 +67,72 @@ fn english_month_day(text: &str, today: NaiveDate) -> Option<NaiveDate> {
         }
     }
     let (_, month, day) = best?;
+    year_wrap_month_day(today, month, day)
+}
+
+/// Digits of the day token immediately before ` of (monthname)` (e.g. "8" from "… on 8th ").
+fn parse_trailing_english_day(before: &str) -> Option<u32> {
+    let s = before.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut i = s.len();
+    while i > 0 && !bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let mut j = i;
+    while j > 0 && bytes[j - 1].is_ascii_digit() {
+        j -= 1;
+    }
+    s[j..i].parse().ok()
+}
+
+/// Patterns like `8th of may`, `25 of december` (day-of-month, then " of ", then month name).
+/// Does not match `maybe` (word boundary after month name).
+fn english_ordinal_of_month_name(text: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let lower = text.to_lowercase();
+    let mut best: Option<(usize, u32, u32)> = None; // (offset of " of " — leftmost wins)
+
+    for (name, month) in MONTH_PREFIXES {
+        let mut search = 0usize;
+        while let Some(rel) = lower[search..].find(" of ") {
+            let abs_of = search + rel;
+            let after = &lower[abs_of + 4..];
+            if !after.starts_with(*name) {
+                search = abs_of + 1;
+                continue;
+            }
+            if after.len() > name.len() {
+                if let Some(c) = after[name.len()..].chars().next() {
+                    if c.is_alphabetic() {
+                        search = abs_of + 1;
+                        continue;
+                    }
+                }
+            }
+            if let Some(day) = parse_trailing_english_day(&text[..abs_of]) {
+                if (1..=31).contains(&day) {
+                    let take = best
+                        .map(|(pos, _, _)| abs_of < pos)
+                        .unwrap_or(true);
+                    if take {
+                        best = Some((abs_of, *month, day));
+                    }
+                }
+            }
+            search = abs_of + 1;
+        }
+    }
+
+    let (_, month, day) = best?;
+    year_wrap_month_day(today, month, day)
+}
+
+fn year_wrap_month_day(today: NaiveDate, month: u32, day: u32) -> Option<NaiveDate> {
     let mut year = today.year();
     let nd = NaiveDate::from_ymd_opt(year, month, day)?;
     if nd < today {
@@ -78,7 +144,9 @@ fn english_month_day(text: &str, today: NaiveDate) -> Option<NaiveDate> {
 }
 
 pub fn naive_date_from_text(text: &str, today: NaiveDate) -> Option<NaiveDate> {
-    find_iso_date(text).or_else(|| english_month_day(text, today))
+    find_iso_date(text)
+        .or_else(|| english_ordinal_of_month_name(text, today))
+        .or_else(|| english_month_day(text, today))
 }
 
 /// If `text` contains ` on ` followed by a month name or `YYYY-MM-DD`, drop that clause (scheduling tail).
@@ -419,6 +487,22 @@ mod tests {
         let (start, end) = event_timing_from_text("dentist sometime", now, chrono_tz::UTC);
         assert!(end.is_none());
         assert_eq!(start, now + Duration::hours(24));
+    }
+
+    /// "N(st|nd|th) of (month)": do not use submission day when a clock is present; prefer stated date.
+    #[test]
+    fn ordinal_day_of_month_eighth_may() {
+        let now = DateTime::parse_from_rfc3339("2026-04-24T08:50:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let text = "I have a contact lens follow up appointment at 11:50am on 8th of may at Vision Express in Fareham. I need to wear my lenses for two hours beforehand";
+        let (start, end) = event_timing_from_text(text, now, chrono_tz::Europe::London);
+        assert!(end.is_none());
+        // May 8, 11:50 BST (UTC+1) → 10:50 UTC
+        let want = DateTime::parse_from_rfc3339("2026-05-08T10:50:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(start, want);
     }
 
     /// BST: 15:50 local → 14:50 UTC on 2026-04-14.
