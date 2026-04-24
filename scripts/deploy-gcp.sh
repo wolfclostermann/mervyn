@@ -4,12 +4,12 @@
 # Reads ciphertext .env.enc from the repo (same format as scripts/env-crypto.sh), decrypts
 # locally to a temp file, uploads it with the app bundle, then runs compose on the VM.
 #
-# With --local-build, the OCI image is built on this machine, saved with docker save, copied
-# to the instance, and loaded (docker load / podman load); the VM only runs compose up, which
-# skips a remote Rust build and is usually much faster. Default platform for that build is
-# linux/amd64 (GCE); override with MERVYN_DOCKER_PLATFORM (e.g. for arm64 instances).
+# With --local-build, the OCI image is built on this machine (podman preferred, else docker),
+# saved, copied to the instance, and loaded; the VM only runs compose up, which
+# skips a remote Rust build and is usually much faster. Default image platform is linux/arm64
+# (assumed remote); for an amd64 host set MERVYN_DOCKER_PLATFORM=linux/amd64.
 #
-# Runtime: prefers Docker (`docker compose`); otherwise Podman. We install
+# Runtime (GCE): prefers Podman (podman-compose, then `podman compose`); if none, Docker. We install
 # `podman-compose` via `pip install --user` (Jammy has no podman-compose deb) and prefer
 # that over `podman compose` so a non-interactive shell does not depend on Podman 4's
 # built-in compose subcommand (Podman 3 reports "unrecognized command compose").
@@ -26,9 +26,9 @@
 #   MERVYN_ENV_PASSPHRASE=... ./scripts/deploy-gcp.sh   # non-interactive decrypt
 #
 # Optional env: MERVYN_GCP_PROJECT, MERVYN_GCP_ZONE (else gcloud config defaults apply),
-#               MERVYN_DOCKER_PLATFORM (default: linux/amd64 for --local-build).
+#               MERVYN_DOCKER_PLATFORM (default: linux/arm64 for --local-build; use linux/amd64 for x86 VMs).
 # Optional flags: --project=ID --zone=ZONE --dry-run --use-local-env (use ./.env instead of .env.enc)
-#                 --local-build  build the image here (docker), then copy and load on the VM
+#                 --local-build  build the image here (podman, else docker), then copy and load on the VM
 #
 set -euo pipefail
 
@@ -49,6 +49,8 @@ POSITIONAL=()
 
 # Must match docker-compose.yml service mervyn image tag.
 readonly DEPLOY_IMAGE="mervyn:deploy"
+# Default: assume remote (GCE) is arm64; set MERVYN_DOCKER_PLATFORM=linux/amd64 for amd64.
+readonly MERVYN_DOCKER_PLATFORM_DEFAULT="linux/arm64"
 
 usage() {
   cat <<'EOF' >&2
@@ -61,7 +63,8 @@ Options:
   --zone=ZONE        gcloud --zone (or MERVYN_GCP_ZONE)
   --dry-run          print commands only (no decrypt, upload, or remote build)
   --use-local-env    upload ./.env instead of decrypting .env.enc (do not commit .env)
-  --local-build      build mervyn:deploy with docker here, copy image to VM, load, compose up (no --build on VM)
+  --local-build      build mervyn:deploy with podman (or docker) here, copy to VM, load, compose up (no --build on VM;
+                     default target is linux/arm64; set MERVYN_DOCKER_PLATFORM=linux/amd64 for an x86 VM)
   -h, --help         this help
 
 Decrypt:
@@ -121,7 +124,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "dry-run: instance=$INSTANCE project=${PROJECT:-<gcloud default>} zone=${ZONE:-<gcloud default>}"
   echo "dry-run: would decrypt .env.enc (or use --use-local-env), tar sources, then:"
   if [[ "$LOCAL_BUILD" == true ]]; then
-    echo "  docker build --platform \${MERVYN_DOCKER_PLATFORM:-linux/amd64} -t $DEPLOY_IMAGE -f ... && docker save $DEPLOY_IMAGE -o mervyn-image.tar"
+    echo "  podman (else docker) build --platform \${MERVYN_DOCKER_PLATFORM:-$MERVYN_DOCKER_PLATFORM_DEFAULT} -t $DEPLOY_IMAGE -f ... && (podman|docker) save ... $DEPLOY_IMAGE -o mervyn-image.tar"
     echo "  gcloud compute scp ... mervyn-image.tar ${INSTANCE}:~/mervyn-image.tar"
     echo "  gcloud compute ssh $INSTANCE --tunnel-through-iap ... --command='... load image ... up -d (no --build)'"
   else
@@ -184,16 +187,21 @@ tar czf "$ARCHIVE" \
 
 IMAGE_TAR=""
 if [[ "$LOCAL_BUILD" == true ]]; then
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "error: --local-build requires docker in PATH" >&2
+  LOCAL_OCI=""
+  if command -v podman >/dev/null 2>&1; then
+    LOCAL_OCI="podman"
+  elif command -v docker >/dev/null 2>&1; then
+    LOCAL_OCI="docker"
+  else
+    echo "error: --local-build requires podman or docker in PATH" >&2
     exit 1
   fi
-  DOCKER_PLATFORM="${MERVYN_DOCKER_PLATFORM:-linux/amd64}"
+  DOCKER_PLATFORM="${MERVYN_DOCKER_PLATFORM:-$MERVYN_DOCKER_PLATFORM_DEFAULT}"
   IMAGE_TAR="$STAGE/mervyn-image.tar"
-  echo "Local build: docker build -t $DEPLOY_IMAGE (platform: $DOCKER_PLATFORM) ..."
-  docker build --platform "$DOCKER_PLATFORM" -t "$DEPLOY_IMAGE" -f "$ROOT/Dockerfile" "$ROOT"
-  echo "Local build: docker save -> mervyn-image.tar"
-  docker save "$DEPLOY_IMAGE" -o "$IMAGE_TAR"
+  echo "Local build: $LOCAL_OCI build -t $DEPLOY_IMAGE (platform: $DOCKER_PLATFORM) ..."
+  "$LOCAL_OCI" build --platform "$DOCKER_PLATFORM" -t "$DEPLOY_IMAGE" -f "$ROOT/Dockerfile" "$ROOT"
+  echo "Local build: $LOCAL_OCI save -> mervyn-image.tar"
+  "$LOCAL_OCI" save -o "$IMAGE_TAR" "$DEPLOY_IMAGE"
 fi
 
 gcloud_ssh --command='mkdir -p ~/mervyn-worklog ~/mervyn/data/vault ~/mervyn'
@@ -209,28 +217,41 @@ set -euo pipefail
 export PATH="${HOME}/.local/bin:${PATH}"
 
 # A `docker` binary may exist without Compose (e.g. podman-docker shim) and break `docker compose up`.
+can_use_podman_compose() {
+  command -v podman >/dev/null 2>&1 || return 1
+  if command -v podman-compose >/dev/null 2>&1; then
+    return 0
+  fi
+  if podman compose version >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 has_working_compose() {
+  if can_use_podman_compose; then
+    return 0
+  fi
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     return 0
   fi
   if command -v docker-compose >/dev/null 2>&1; then
     return 0
   fi
-  if command -v podman >/dev/null 2>&1; then
-    if command -v podman-compose >/dev/null 2>&1; then
-      return 0
-    fi
-    if podman compose version >/dev/null 2>&1; then
-      return 0
-    fi
-  fi
   return 1
 }
 
 # Podman 3.x (Ubuntu universe) can hit buildah panics on multi-stage Dockerfiles; Podman 4+ fixes that.
 ensure_podman_recent_for_multistage_build() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    return 0
+  if can_use_podman_compose; then
+    :
+  else
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v docker-compose >/dev/null 2>&1; then
+      return 0
+    fi
   fi
   command -v apt-get >/dev/null 2>&1 || return 0
   [[ -r /etc/os-release ]] || return 0
@@ -312,23 +333,23 @@ maybe_fix_podman_cni_conflists() {
 }
 
 compose_cmd() {
+  if can_use_podman_compose; then
+    if command -v podman-compose >/dev/null 2>&1; then
+      podman_rootful podman-compose "$@"
+    elif podman_rootful podman compose version >/dev/null 2>&1; then
+      podman_rootful podman compose "$@"
+    else
+      echo "error: can_use_podman_compose is true but neither podman-compose nor \`podman compose\` is available" >&2
+      exit 1
+    fi
+    return
+  fi
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     docker compose "$@"
     return
   fi
   if command -v docker-compose >/dev/null 2>&1; then
     docker-compose "$@"
-    return
-  fi
-  if command -v podman >/dev/null 2>&1; then
-    if command -v podman-compose >/dev/null 2>&1; then
-      podman_rootful podman-compose "$@"
-    elif podman_rootful podman compose version >/dev/null 2>&1; then
-      podman_rootful podman compose "$@"
-    else
-      echo "error: podman is installed but neither podman-compose nor \`podman compose\` is available (e.g. python3 -m pip install --user podman-compose)." >&2
-      exit 1
-    fi
     return
   fi
   echo "error: no compose command found after ensure_container_runtime" >&2
@@ -342,14 +363,19 @@ load_prebuilt_image_if_local() {
     echo "error: expected ${t} (from --local-build deploy) but it is missing" >&2
     exit 1
   fi
-  if command -v docker >/dev/null 2>&1; then
+  if can_use_podman_compose; then
+    podman_rootful podman load -i "$t"
+  elif command -v docker >/dev/null 2>&1; then
     if docker compose version >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1; then
       docker load -i "$t"
-      rm -f "$t"
-      return 0
+    else
+      echo "error: cannot load mervyn-image.tar: no podman or docker compose stack" >&2
+      exit 1
     fi
+  else
+    echo "error: cannot load mervyn-image.tar: need podman or docker" >&2
+    exit 1
   fi
-  podman_rootful podman load -i "$t"
   rm -f "$t"
 }
 
