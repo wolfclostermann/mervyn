@@ -29,3 +29,6 @@ ssh_public_key = "ssh-ed25519 AAAA... you@host"
 
 # Optional: skip cloud-init Docker install and install manually
 # bootstrap_docker = false
+
+# Importing a manually created instance + matching network into state:
+#   scripts/terraform-import-oci-from-instance.sh '<instance-ocid>' [project-name]

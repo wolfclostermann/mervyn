@@ -4,6 +4,7 @@
 #
 # Usage:
 #   ./scripts/bootstrap.sh                       # OCI CLI bootstrap (default)
+#   ./scripts/deploy-oci.sh ubuntu@<public-ip>   # push app over SSH after bootstrap
 #   MERVYN_CLOUD_PROVIDER=aws ./scripts/bootstrap.sh
 #   ./scripts/bootstrap.sh oci [oci-bootstrap args...]
 #   ./scripts/bootstrap.sh aws                  # print Terraform AWS instructions

@@ -645,5 +645,5 @@ else
   echo "  Public IP:  $PUBLIC_IP"
   echo "  SSH:        ssh ubuntu@$PUBLIC_IP"
   echo ""
-  echo "Next: copy repo + .env, mkdir -p data/vault, put TLS on 443 for Slack (see README)."
+  echo "Next: ./scripts/deploy-oci.sh ubuntu@$PUBLIC_IP   # or copy repo + .env manually; TLS on 443 for Slack (README)."
 fi
