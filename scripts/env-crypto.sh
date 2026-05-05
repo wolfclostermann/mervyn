@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Encrypt or decrypt .env for committing a ciphertext blob (e.g. .env.enc) to GitHub.
-# Usage:
+# Encrypt or decrypt local secrets for Git using OpenSSL (same format as deploy scripts).
+#
+# App environment:
 #   ./scripts/env-crypto.sh encrypt   # reads .env, writes .env.enc
 #   ./scripts/env-crypto.sh decrypt   # reads .env.enc, writes .env
 #
-# Optional: ENV_FILE=my.env ./scripts/env-crypto.sh encrypt  → writes my.env.enc
+# Terraform variables (committed ciphertext: terraform/terraform.tfvars.enc):
+#   ENV_FILE=terraform/terraform.tfvars ./scripts/env-crypto.sh encrypt
+#   ENV_FILE=terraform/terraform.tfvars ./scripts/env-crypto.sh decrypt
+#
+# Optional paths:
+#   ENV_FILE=my.env ./scripts/env-crypto.sh encrypt   → writes my.env.enc
+#
+# Non-interactive decrypt (CI / scripts): set ENV_CRYPTO_PASSPHRASE (never commit it).
 
 set -euo pipefail
 
@@ -14,14 +22,14 @@ cd "$ROOT"
 ENV_FILE="${ENV_FILE:-.env}"
 ENC_FILE="${ENV_FILE}.enc"
 
-# OpenSSL-compatible defaults; adjust ITER only if you change it here and in decrypt.
+# OpenSSL-compatible defaults — keep in sync with scripts/deploy-gcp.sh and scripts/deploy-oci.sh.
 CIPHER="-aes-256-cbc"
 PBKDF2_ITER=600000
 
 usage() {
   echo "Usage: $0 {encrypt|decrypt}" >&2
-  echo "  Uses passphrase from the terminal (not stored in the repo)." >&2
-  echo "  ENV_FILE=my.env overrides the plaintext path (ciphertext is \\\${ENV_FILE}.enc)." >&2
+  echo "  Encrypt/decrypt uses the terminal passphrase unless ENV_CRYPTO_PASSPHRASE is set (decrypt only)." >&2
+  echo "  ENV_FILE=my.env overrides plaintext path (ciphertext is \\\${ENV_FILE}.enc)." >&2
   exit 1
 }
 
@@ -48,8 +56,13 @@ decrypt() {
     echo "error: $ENC_FILE not found" >&2
     exit 1
   fi
-  read -rsp "Passphrase: " pass
-  echo
+  local pass
+  if [[ -n "${ENV_CRYPTO_PASSPHRASE:-}" ]]; then
+    pass="$ENV_CRYPTO_PASSPHRASE"
+  else
+    read -rsp "Passphrase: " pass
+    echo
+  fi
   printf '%s' "$pass" | openssl enc -d "$CIPHER" -pbkdf2 -iter "$PBKDF2_ITER" \
     -in "$ENC_FILE" -out "$ENV_FILE" -pass stdin
   chmod 600 "$ENV_FILE" 2>/dev/null || true

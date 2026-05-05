@@ -51,7 +51,7 @@ INST_DN=$(echo "$INST_JSON" | jq -r '.data."display-name" // .data.displayName /
   exit 1
 }
 
-echo "    display-name: $INST_DN (Terraform expects ${PROJECT}-arm)" >&2
+echo "    display-name: $INST_DN (set instance_display_name in tfvars to match, or default is ${PROJECT}-arm)" >&2
 echo "    availability-domain: $AD_NAME" >&2
 
 VNIC_JSON=$(oci compute instance list-vnics --instance-id "$INSTANCE_OCID" --output json)

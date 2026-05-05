@@ -63,21 +63,45 @@ variable "http_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
+variable "instance_shape" {
+  type        = string
+  description = "OCI compute shape (e.g. VM.Standard.A1.Flex, VM.Standard.E2.1.Micro)."
+  default     = "VM.Standard.A1.Flex"
+}
+
 variable "instance_ocpus" {
   type        = number
-  description = "OCPUs for VM.Standard.A1.Flex (Always Free: up to 4 total OCPUs across all A1 instances in the region)."
+  description = "OCPUs for shape_config (E2.Micro: 1)."
   default     = 1
 }
 
 variable "instance_memory_gbs" {
   type        = number
-  description = "Memory in GB for A1.Flex (min 1 GB per OCPU)."
+  description = "Memory in GB for shape_config (A1.Flex default 6; E2.Micro: 1)."
   default     = 6
+}
+
+variable "instance_source_image_id" {
+  type        = string
+  description = "Optional boot image OCID; if empty, latest Ubuntu for ubuntu_version is selected."
+  default     = ""
+}
+
+variable "instance_display_name" {
+  type        = string
+  description = "Instance display name; leave empty for mervyn-arm style default from project_name."
+  default     = ""
+}
+
+variable "ssh_user" {
+  type        = string
+  description = "OS login for ssh output (ubuntu / opc)."
+  default     = "ubuntu"
 }
 
 variable "availability_domain_index" {
   type        = number
-  description = "Which AD in the region to use (0-based). Change if A1 capacity is unavailable in AD 0."
+  description = "AD index 0..n-1 (e.g. 1 for UK-LONDON-1-AD-2 when AD-1 is index 0)."
   default     = 0
 }
 

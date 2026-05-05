@@ -63,16 +63,40 @@ variable "http_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
+variable "instance_shape" {
+  type        = string
+  description = "Compute shape (e.g. VM.Standard.A1.Flex for Ampere, VM.Standard.E2.1.Micro for x86 Always Free)."
+  default     = "VM.Standard.A1.Flex"
+}
+
 variable "instance_ocpus" {
   type        = number
-  description = "OCPUs for VM.Standard.A1.Flex (Always Free: up to 4 total OCPUs across all A1 instances in the region)."
+  description = "OCPUs passed to shape_config (Flex: tune freely; E2.Micro: use 1)."
   default     = 1
 }
 
 variable "instance_memory_gbs" {
   type        = number
-  description = "Memory in GB for A1.Flex (min 1 GB per OCPU)."
+  description = "Memory in GB for shape_config (A1.Flex default 6; E2.Micro: 1)."
   default     = 6
+}
+
+variable "instance_source_image_id" {
+  type        = string
+  description = "Boot image OCID. Leave empty to resolve latest Canonical Ubuntu for ubuntu_version + instance_shape."
+  default     = ""
+}
+
+variable "instance_display_name" {
+  type        = string
+  description = "Compute display name; leave empty to use the project_name prefix and \"-arm\" (e.g. mervyn-arm)."
+  default     = ""
+}
+
+variable "ssh_user" {
+  type        = string
+  description = "SSH login for outputs (ubuntu on Canonical; opc on Oracle Linux)."
+  default     = "ubuntu"
 }
 
 variable "availability_domain_index" {

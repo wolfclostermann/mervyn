@@ -3,22 +3,30 @@ data "oci_identity_availability_domains" "ads" {
 }
 
 data "oci_core_images" "ubuntu_arm" {
+  count = var.instance_source_image_id == "" ? 1 : 0
+
   compartment_id           = var.compartment_ocid
   operating_system         = "Canonical Ubuntu"
   operating_system_version = var.ubuntu_version
-  shape                    = "VM.Standard.A1.Flex"
+  shape                    = var.instance_shape
   sort_by                  = "TIMECREATED"
   sort_order               = "DESC"
 }
 
 locals {
   ad_name = data.oci_identity_availability_domains.ads.availability_domains[var.availability_domain_index].name
-  # Prefer a non-Minimal image when several aarch64 builds exist (better default for Docker/cloud-init).
-  ubuntu_non_minimal = [
-    for img in data.oci_core_images.ubuntu_arm.images : img
+
+  instance_display_name = var.instance_display_name != "" ? var.instance_display_name : "${var.project_name}-arm"
+
+  # Prefer a non-Minimal image when several builds exist (better default for Docker/cloud-init).
+  ubuntu_non_minimal = length(data.oci_core_images.ubuntu_arm) > 0 ? [
+    for img in data.oci_core_images.ubuntu_arm[0].images : img
     if !can(regex("Minimal", img.display_name))
-  ]
-  image_id = length(local.ubuntu_non_minimal) > 0 ? local.ubuntu_non_minimal[0].id : data.oci_core_images.ubuntu_arm.images[0].id
+  ] : []
+
+  image_id = var.instance_source_image_id != "" ? var.instance_source_image_id : (
+    length(local.ubuntu_non_minimal) > 0 ? local.ubuntu_non_minimal[0].id : data.oci_core_images.ubuntu_arm[0].images[0].id
+  )
 
   instance_metadata = merge(
     {
@@ -121,8 +129,8 @@ resource "oci_core_subnet" "public" {
 resource "oci_core_instance" "mervyn" {
   compartment_id      = var.compartment_ocid
   availability_domain = local.ad_name
-  display_name        = "${var.project_name}-arm"
-  shape               = "VM.Standard.A1.Flex"
+  display_name        = local.instance_display_name
+  shape               = var.instance_shape
 
   shape_config {
     ocpus         = var.instance_ocpus

@@ -12,6 +12,6 @@ output "vcn_id" {
 }
 
 output "ssh_command" {
-  description = "Default user is ubuntu on Canonical images."
+  description = "ssh user comes from tfvars ssh_user (ubuntu or opc)."
   value       = module.oci_stack.ssh_command
 }

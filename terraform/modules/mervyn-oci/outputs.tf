@@ -12,6 +12,6 @@ output "vcn_id" {
 }
 
 output "ssh_command" {
-  description = "Default user is ubuntu on Canonical images."
-  value       = "ssh ubuntu@${oci_core_instance.mervyn.public_ip}"
+  description = "SSH hint (ubuntu on Canonical; opc on Oracle Linux)."
+  value       = "ssh ${var.ssh_user}@${oci_core_instance.mervyn.public_ip}"
 }
