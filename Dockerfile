@@ -7,7 +7,9 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
 FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/*
+# Mounted host repos (e.g. /worklog) are a different UID than this image user → trust bind mounts.
+RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/* \
+  && git config --system --add safe.directory '*'
 WORKDIR /app
 COPY --from=builder /app/target/release/mervyn .
 COPY config ./config

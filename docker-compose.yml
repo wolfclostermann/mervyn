@@ -5,13 +5,12 @@ services:
     image: mervyn:deploy
     restart: unless-stopped
     volumes:
-      - ./data:/app/data
+      # :z — SELinux (Podman on Oracle/RHEL): allow container write to host bind mounts under $HOME.
+      - ./data:/app/data:z
       # Sibling git worklog repo (host path). Uncomment so vault symlinks / pull target exist in-container.
-      - ../mervyn-worklog:/worklog
+      - ../mervyn-worklog:/worklog:z
     env_file:
       - .env
     environment:
-      - RUST_LOG=mervyn=debug,tower_http=info
-      # Must match the /worklog volume when using Docker; vault symlinks often break without this.
-      - MERVYN__WORKLOG_GIT__REPO_PATH=/worklog
-      # Private mervyn-worklog: configure git credentials inside /worklog (PAT, deploy key). See docs/vps-worklog-git.md.
+      RUST_LOG: mervyn=debug,tower_http=info
+      MERVYN__WORKLOG_GIT__REPO_PATH: /worklog
