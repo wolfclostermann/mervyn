@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap Mervyn on Oracle Cloud (default: Ampere VM.Standard.A1.Flex) using the OCI CLI —
-# similar in spirit to a one-shot gcloud run: network + Ubuntu + Docker cloud-init.
+# Bootstrap Mervyn on Oracle Cloud (default: Oracle Linux 9 + VM.Standard.E2.1.Micro + Podman cloud-init) using the OCI CLI —
+# similar in spirit to a one-shot gcloud run (see terraform/cloud-init-podman.yaml). Ubuntu/Ampere: set MERVYN_INSTANCE_OS=ubuntu.
 #
 # Prerequisites (install once):
 #   - Oracle Cloud Infrastructure CLI: https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm
@@ -25,12 +25,15 @@
 #   MERVYN_INSTANCE_DISPLAY_NAME  Compute display name for idempotency (default: ${PROJECT}-arm)
 #   MERVYN_OCPUS              Flex shapes only: OCPUs (default: 1)
 #   MERVYN_MEMORY_GBS         Flex shapes only: memory in GB (default: 6)
-#   MERVYN_UBUNTU_VERSION     e.g. 22.04 (default: 22.04)
+#   MERVYN_INSTANCE_OS        oracle-linux (default) or ubuntu — picks OCI marketplace image + SSH user hint
+#   MERVYN_ORACLE_LINUX_VERSION  e.g. 9 (default: 9) when MERVYN_INSTANCE_OS=oracle-linux
+#   MERVYN_UBUNTU_VERSION     e.g. 22.04 (default: 22.04) when MERVYN_INSTANCE_OS=ubuntu
+#   MERVYN_SSH_USER           override SSH hint at end (default opc / ubuntu from OS)
 #   MERVYN_SSH_ALLOWED_CIDRS  Comma-separated CIDRs for SSH (default: 0.0.0.0/0)
 #   MERVYN_HTTP_CIDRS         Comma-separated CIDRs for 80/443 (default: 0.0.0.0/0)
 #   MERVYN_EXPOSE_APP_PORT    If true, also open TCP 3000 from MERVYN_APP_PORT_CIDRS (default: false)
 #   MERVYN_APP_PORT_CIDRS     Comma-separated (default: 0.0.0.0/0)
-#   MERVYN_BOOTSTRAP_DOCKER   If true, pass cloud-init Docker install (default: true)
+#   MERVYN_BOOTSTRAP_DOCKER   If true, pass cloud-init (Podman + podman-compose; default: true)
 #
 # Example:
 #   export MERVYN_SSH_ALLOWED_CIDRS="$(curl -sS https://checkip.amazonaws.com)/32"
@@ -46,14 +49,21 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-CLOUD_INIT_FILE="${MERVYN_CLOUD_INIT_FILE:-$REPO_ROOT/terraform/cloud-init-docker.yaml}"
+CLOUD_INIT_FILE="${MERVYN_CLOUD_INIT_FILE:-$REPO_ROOT/terraform/cloud-init-podman.yaml}"
 
 OCI_CONFIG="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
 OCI_PROFILE="${OCI_CLI_PROFILE:-DEFAULT}"
 
 PROJECT="${MERVYN_PROJECT_NAME:-mervyn}"
-COMPUTE_SHAPE="${MERVYN_COMPUTE_SHAPE:-VM.Standard.A1.Flex}"
-INST_DN="${MERVYN_INSTANCE_DISPLAY_NAME:-${PROJECT}-arm}"
+INSTANCE_OS="${MERVYN_INSTANCE_OS:-oracle-linux}"
+ORACLE_LINUX_VER="${MERVYN_ORACLE_LINUX_VERSION:-9}"
+COMPUTE_SHAPE="${MERVYN_COMPUTE_SHAPE:-VM.Standard.E2.1.Micro}"
+if [[ "$INSTANCE_OS" == "ubuntu" ]]; then
+  INST_DN_DEFAULT="${PROJECT}-arm"
+else
+  INST_DN_DEFAULT="${PROJECT}-vm"
+fi
+INST_DN="${MERVYN_INSTANCE_DISPLAY_NAME:-$INST_DN_DEFAULT}"
 AD_INDEX="${MERVYN_AD_INDEX:-0}"
 OCPUS="${MERVYN_OCPUS:-1}"
 MEM_GB="${MERVYN_MEMORY_GBS:-6}"
@@ -205,16 +215,29 @@ shape_requires_flex_config() {
   esac
 }
 
-echo "==> Resolving Ubuntu ${UBUNTU_VER} image compatible with $COMPUTE_SHAPE..."
-IMAGES_JSON=$(oci "${oci_args[@]}" compute image list \
-  --compartment-id "$COMPARTMENT_OCID" \
-  --operating-system "Canonical Ubuntu" \
-  --operating-system-version "$UBUNTU_VER" \
-  --shape "$COMPUTE_SHAPE" \
-  --sort-by TIMECREATED \
-  --sort-order DESC \
-  --all \
-  --output json)
+if [[ "$INSTANCE_OS" == "ubuntu" ]]; then
+  echo "==> Resolving Canonical Ubuntu ${UBUNTU_VER} image compatible with $COMPUTE_SHAPE..."
+  IMAGES_JSON=$(oci "${oci_args[@]}" compute image list \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --operating-system "Canonical Ubuntu" \
+    --operating-system-version "$UBUNTU_VER" \
+    --shape "$COMPUTE_SHAPE" \
+    --sort-by TIMECREATED \
+    --sort-order DESC \
+    --all \
+    --output json)
+else
+  echo "==> Resolving Oracle Linux ${ORACLE_LINUX_VER} image compatible with $COMPUTE_SHAPE..."
+  IMAGES_JSON=$(oci "${oci_args[@]}" compute image list \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --operating-system "Oracle Linux" \
+    --operating-system-version "$ORACLE_LINUX_VER" \
+    --shape "$COMPUTE_SHAPE" \
+    --sort-by TIMECREATED \
+    --sort-order DESC \
+    --all \
+    --output json)
+fi
 
 IMAGE_ID=$(echo "$IMAGES_JSON" | jq -r '
   .data as $d
@@ -232,8 +255,17 @@ if [[ -n "$DISPLAY_PICKED" ]]; then
 fi
 
 if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "null" ]]; then
-  echo "error: no compatible Ubuntu image found for $COMPUTE_SHAPE (region or shape filter)" >&2
+  echo "error: no compatible ${INSTANCE_OS} image found for $COMPUTE_SHAPE (region or shape filter)" >&2
   exit 1
+fi
+
+SSH_USER_HINT="${MERVYN_SSH_USER:-}"
+if [[ -z "$SSH_USER_HINT" ]]; then
+  if [[ "$INSTANCE_OS" == "ubuntu" ]]; then
+    SSH_USER_HINT=ubuntu
+  else
+    SSH_USER_HINT=opc
+  fi
 fi
 
 # --- Networking (idempotent: reuse by display-name when already AVAILABLE) ---
@@ -643,7 +675,7 @@ else
   echo ""
   echo "Done."
   echo "  Public IP:  $PUBLIC_IP"
-  echo "  SSH:        ssh ubuntu@$PUBLIC_IP"
+  echo "  SSH:        ssh ${SSH_USER_HINT}@$PUBLIC_IP"
   echo ""
-  echo "Next: ./scripts/deploy-oci.sh ubuntu@$PUBLIC_IP   # or copy repo + .env manually; TLS on 443 for Slack (README)."
+  echo "Next: ./scripts/deploy-oci.sh ${SSH_USER_HINT}@$PUBLIC_IP   # or copy repo + .env manually; TLS on 443 for Slack (README)."
 fi

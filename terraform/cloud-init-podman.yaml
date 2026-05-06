@@ -1,0 +1,29 @@
+#cloud-config
+# Ubuntu: Kubic Podman 4+ (22.04/24.04) + podman-compose.
+# Oracle Linux: dnf podman + pip podman-compose (same as scripts/deploy-remote-setup.sh).
+package_update: true
+runcmd:
+  - |
+    set -eux
+    . /etc/os-release
+    case "${ID:-}" in
+      ubuntu)
+        install -m 0755 -d /etc/apt/keyrings
+        if [ "${VERSION_ID:-}" = "22.04" ] || [ "${VERSION_ID:-}" = "24.04" ]; then
+          curl -fsSL "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/Release.key" | gpg --batch --dearmor -o /etc/apt/keyrings/devel_kubic_libcontainers_stable.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/devel_kubic_libcontainers_stable.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+        fi
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg podman fuse-overlayfs slirp4netns uidmap iptables python3-pip
+        python3 -m pip install --break-system-packages podman-compose 2>/dev/null || python3 -m pip install podman-compose
+        ;;
+      ol)
+        dnf -y install ca-certificates curl
+        dnf -y install podman fuse-overlayfs slirp4netns iptables python3-pip
+        python3 -m pip install --break-system-packages podman-compose 2>/dev/null || python3 -m pip install podman-compose
+        ;;
+      *)
+        echo "cloud-init-podman: unsupported /etc/os-release ID=${ID:-unknown} (expected ubuntu or ol)"
+        exit 1
+        ;;
+    esac

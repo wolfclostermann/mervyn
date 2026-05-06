@@ -1,7 +1,5 @@
 # Oracle Cloud (OCI) stack — default Terraform root under terraform/.
-# Composable-module layout aligns with https://github.com/gfs-sre/terraform-framework-example-stack
-#
-# AWS: use terraform/stacks/aws/ (separate root; see scripts/bootstrap.sh aws).
+# Default OS: Oracle Linux 9 + Podman (cloud-init-podman.yaml). Ubuntu/Ampere: set instance_image_os = "ubuntu".
 #
 # Copy to terraform.tfvars (gitignored), fill in secrets, then encrypt like .env.enc:
 #   cp terraform/terraform.tfvars.example terraform/terraform.tfvars
@@ -22,22 +20,24 @@ compartment_ocid = "ocid1.compartment.oc1..aaaaaaaa..."
 # Must match the SSH public key on the instance (metadata) when managing an imported VM.
 ssh_public_key = "ssh-rsa AAAA... or ssh-ed25519 AAAA... you@host"
 
-# --- Stack aligned with import + live resources (see scripts/terraform-import-oci-from-instance.sh) ---
-# VCN/subnet/SL names: mervyn-vcn, mervyn-public, mervyn-public-sl; instance display name mervyn-1; AD ccuG:UK-LONDON-1-AD-2
+# --- Default: Oracle Linux 9 (x86 E2.Micro Always Free) + cloud-init Podman ---
+project_name              = "mervyn"
+availability_domain_index = 0
 
-project_name = "mervyn"
+instance_shape       = "VM.Standard.E2.1.Micro"
+instance_ocpus       = 1
+instance_memory_gbs  = 1
+instance_source_image_id = ""
+instance_display_name    = ""
+instance_image_os        = "oracle-linux"
+oracle_linux_version     = "9"
+# ssh_user defaults to opc when instance_image_os is oracle-linux
 
-availability_domain_index = 1
-
-instance_shape           = "VM.Standard.E2.1.Micro"
-instance_ocpus           = 1
-instance_memory_gbs      = 1
-instance_source_image_id = "ocid1.image.oc1.uk-london-1.aaaaaaaapkaf5prv2ub3i25ccsnhbzzrcg5t3fq6ate2wfhpr2y7j2mc5pqa"
-instance_display_name    = "mervyn-1"
-ssh_user                 = "opc"
-bootstrap_docker         = false
-
-# cloud-init in this repo targets Ubuntu; this image is Oracle Linux 9 — install Docker by hand or switch to Ubuntu ARM.
+# Cloud-init Podman on first boot only. Set false for an existing instance so Terraform does not
+# replace it (user_data change forces new VM). Use ./scripts/deploy-oci.sh for deps over SSH instead.
+bootstrap_docker = true
+# Optional: short OL-only script (matches cloud-init pasted for manual Ampere instances).
+# oci_cloud_init_file = "cloud-init-podman-ol-minimal.yaml"
 
 # Optional: lock SSH to your IP
 # ssh_allowed_cidrs = ["203.0.113.10/32"]
@@ -45,16 +45,18 @@ bootstrap_docker         = false
 # Optional: expose Mervyn on 3000 from the internet
 # expose_app_port = true
 
-# --- Fresh Ampere / Ubuntu alternative (disable the block above and use this instead) ---
-# project_name              = "mervyn"
-# availability_domain_index = 0
-# instance_shape            = "VM.Standard.A1.Flex"
-# instance_ocpus            = 1
-# instance_memory_gbs       = 6
-# instance_source_image_id  = ""
-# instance_display_name     = ""
-# ssh_user                  = "ubuntu"
-# bootstrap_docker          = true
+# --- Ubuntu / Ampere alternative ---
+# instance_shape       = "VM.Standard.A1.Flex"
+# instance_ocpus       = 1
+# instance_memory_gbs  = 6
+# instance_image_os    = "ubuntu"
+# ubuntu_version       = "22.04"
+# bootstrap_docker     = true
+
+# --- Import example (fixed image / display name) ---
+# instance_source_image_id = "ocid1.image.oc1.uk-london-1...."
+# instance_display_name    = "mervyn-1"
+# ssh_user                 = "opc"
 
 # Import existing OCI resources into state:
 #   scripts/terraform-import-oci-from-instance.sh '<instance-ocid>' mervyn

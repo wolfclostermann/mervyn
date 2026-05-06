@@ -261,6 +261,8 @@ else
   chmod +x "$GSSH_WRAPPER"
   _cleanup_gssh_wrapper() { rm -f "${GSSH_WRAPPER:-}"; }
   trap _cleanup_gssh_wrapper EXIT
+  # Literal /bin/sh wrapper text (must not expand here).
+  # shellcheck disable=SC2016,SC1003
   {
     echo '#!/bin/sh'
     echo 'set -e'

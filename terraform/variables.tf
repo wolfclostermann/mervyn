@@ -65,38 +65,56 @@ variable "http_cidrs" {
 
 variable "instance_shape" {
   type        = string
-  description = "OCI compute shape (e.g. VM.Standard.A1.Flex, VM.Standard.E2.1.Micro)."
-  default     = "VM.Standard.A1.Flex"
+  description = "OCI compute shape (default x86 Always Free E2.Micro; use A1.Flex for Ampere)."
+  default     = "VM.Standard.E2.1.Micro"
 }
 
 variable "instance_ocpus" {
   type        = number
-  description = "OCPUs for shape_config (E2.Micro: 1)."
+  description = "OCPUs for shape_config (Flex only; E2.Micro fixed at 1)."
   default     = 1
 }
 
 variable "instance_memory_gbs" {
   type        = number
-  description = "Memory in GB for shape_config (A1.Flex default 6; E2.Micro: 1)."
-  default     = 6
+  description = "Memory in GB for shape_config (Flex only; E2.Micro fixed at 1)."
+  default     = 1
 }
 
 variable "instance_source_image_id" {
   type        = string
-  description = "Optional boot image OCID; if empty, latest Ubuntu for ubuntu_version is selected."
+  description = "Optional boot image OCID; if empty, latest image for instance_image_os is selected."
   default     = ""
+}
+
+variable "instance_image_os" {
+  type        = string
+  description = "Boot image when instance_source_image_id is empty: oracle-linux (default) or ubuntu."
+  default     = "oracle-linux"
+
+  validation {
+    condition     = contains(["oracle-linux", "ubuntu"], var.instance_image_os)
+    error_message = "instance_image_os must be oracle-linux or ubuntu."
+  }
+}
+
+variable "oracle_linux_version" {
+  type        = string
+  description = "Oracle Linux version for OCI image list (e.g. 9)."
+  default     = "9"
 }
 
 variable "instance_display_name" {
   type        = string
-  description = "Instance display name; leave empty for mervyn-arm style default from project_name."
+  description = "Instance display name; empty defaults to mervyn-vm (oracle-linux) or mervyn-arm (ubuntu)."
   default     = ""
 }
 
 variable "ssh_user" {
   type        = string
-  description = "OS login for ssh output (ubuntu / opc)."
-  default     = "ubuntu"
+  description = "SSH user for outputs; default opc on oracle-linux, ubuntu on ubuntu."
+  default     = null
+  nullable    = true
 }
 
 variable "availability_domain_index" {
@@ -113,6 +131,12 @@ variable "ubuntu_version" {
 
 variable "bootstrap_docker" {
   type        = bool
-  description = "Cloud-init: install Docker Engine + Compose plugin (Ubuntu)."
+  description = "If true, pass cloud-init user_data (OCI default: Podman + podman-compose via cloud-init-podman.yaml)."
   default     = true
+}
+
+variable "oci_cloud_init_file" {
+  type        = string
+  description = "Filename under terraform/ for bootstrap user_data when bootstrap_docker is true (e.g. cloud-init-podman-ol-minimal.yaml for a short OL-only script)."
+  default     = "cloud-init-podman.yaml"
 }

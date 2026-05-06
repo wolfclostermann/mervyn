@@ -83,20 +83,38 @@ variable "instance_memory_gbs" {
 
 variable "instance_source_image_id" {
   type        = string
-  description = "Boot image OCID. Leave empty to resolve latest Canonical Ubuntu for ubuntu_version + instance_shape."
+  description = "Boot image OCID. Leave empty to resolve latest image for instance_image_os + instance_shape."
   default     = ""
+}
+
+variable "instance_image_os" {
+  type        = string
+  description = "Boot image family when instance_source_image_id is empty: oracle-linux (default) or ubuntu."
+  default     = "oracle-linux"
+
+  validation {
+    condition     = contains(["oracle-linux", "ubuntu"], var.instance_image_os)
+    error_message = "instance_image_os must be oracle-linux or ubuntu."
+  }
+}
+
+variable "oracle_linux_version" {
+  type        = string
+  description = "Oracle Linux version string as listed by OCI images (e.g. 9)."
+  default     = "9"
 }
 
 variable "instance_display_name" {
   type        = string
-  description = "Compute display name; leave empty to use the project_name prefix and \"-arm\" (e.g. mervyn-arm)."
+  description = "Compute display name; leave empty for mervyn-vm (Oracle Linux) or mervyn-arm (Ubuntu)."
   default     = ""
 }
 
 variable "ssh_user" {
   type        = string
-  description = "SSH login for outputs (ubuntu on Canonical; opc on Oracle Linux)."
-  default     = "ubuntu"
+  description = "SSH login for outputs; default opc on oracle-linux, ubuntu on ubuntu."
+  default     = null
+  nullable    = true
 }
 
 variable "availability_domain_index" {
@@ -113,11 +131,11 @@ variable "ubuntu_version" {
 
 variable "bootstrap_docker" {
   type        = bool
-  description = "Cloud-init: install Docker Engine + Compose plugin (Ubuntu)."
+  description = "If true, pass cloud-init user_data (Podman + podman-compose when using cloud-init-podman.yaml)."
   default     = true
 }
 
 variable "cloud_init_file" {
   type        = string
-  description = "Absolute or module-relative path to cloud-init YAML (Docker bootstrap)."
+  description = "Path to cloud-init YAML (cloud-init-podman.yaml: Ubuntu + Oracle Linux)."
 }

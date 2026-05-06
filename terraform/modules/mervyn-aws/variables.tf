@@ -28,13 +28,13 @@ variable "ssh_public_key" {
 }
 
 variable "ssh_allowed_cidrs" {
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
+  type    = list(string)
+  default = ["0.0.0.0/0"]
 }
 
 variable "http_cidrs" {
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
+  type    = list(string)
+  default = ["0.0.0.0/0"]
 }
 
 variable "expose_app_port" {

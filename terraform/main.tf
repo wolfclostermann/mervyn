@@ -23,11 +23,13 @@ module "oci_stack" {
   instance_ocpus            = var.instance_ocpus
   instance_memory_gbs       = var.instance_memory_gbs
   instance_source_image_id  = var.instance_source_image_id
+  instance_image_os         = var.instance_image_os
+  oracle_linux_version      = var.oracle_linux_version
   instance_display_name     = var.instance_display_name
   ssh_user                  = var.ssh_user
   availability_domain_index = var.availability_domain_index
   ubuntu_version            = var.ubuntu_version
   bootstrap_docker          = var.bootstrap_docker
 
-  cloud_init_file = "${path.root}/cloud-init-docker.yaml"
+  cloud_init_file = "${path.root}/${var.oci_cloud_init_file}"
 }

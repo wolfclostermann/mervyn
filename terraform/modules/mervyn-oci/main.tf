@@ -3,7 +3,7 @@ data "oci_identity_availability_domains" "ads" {
 }
 
 data "oci_core_images" "ubuntu_arm" {
-  count = var.instance_source_image_id == "" ? 1 : 0
+  count = var.instance_source_image_id == "" && var.instance_image_os == "ubuntu" ? 1 : 0
 
   compartment_id           = var.compartment_ocid
   operating_system         = "Canonical Ubuntu"
@@ -13,19 +13,45 @@ data "oci_core_images" "ubuntu_arm" {
   sort_order               = "DESC"
 }
 
+data "oci_core_images" "oracle_linux" {
+  count = var.instance_source_image_id == "" && var.instance_image_os == "oracle-linux" ? 1 : 0
+
+  compartment_id           = var.compartment_ocid
+  operating_system         = "Oracle Linux"
+  operating_system_version = var.oracle_linux_version
+  shape                    = var.instance_shape
+  sort_by                  = "TIMECREATED"
+  sort_order               = "DESC"
+}
+
 locals {
   ad_name = data.oci_identity_availability_domains.ads.availability_domains[var.availability_domain_index].name
 
-  instance_display_name = var.instance_display_name != "" ? var.instance_display_name : "${var.project_name}-arm"
+  instance_display_name = var.instance_display_name != "" ? var.instance_display_name : (
+    var.instance_image_os == "oracle-linux" ? "${var.project_name}-vm" : "${var.project_name}-arm"
+  )
 
-  # Prefer a non-Minimal image when several builds exist (better default for Docker/cloud-init).
+  ssh_user_effective = var.ssh_user != null ? var.ssh_user : (
+    var.instance_image_os == "oracle-linux" ? "opc" : "ubuntu"
+  )
+
+  # Prefer a non-Minimal image when several builds exist (better default for cloud-init / containers).
   ubuntu_non_minimal = length(data.oci_core_images.ubuntu_arm) > 0 ? [
     for img in data.oci_core_images.ubuntu_arm[0].images : img
     if !can(regex("Minimal", img.display_name))
   ] : []
 
+  oracle_non_minimal = length(data.oci_core_images.oracle_linux) > 0 ? [
+    for img in data.oci_core_images.oracle_linux[0].images : img
+    if !can(regex("Minimal", img.display_name))
+  ] : []
+
   image_id = var.instance_source_image_id != "" ? var.instance_source_image_id : (
-    length(local.ubuntu_non_minimal) > 0 ? local.ubuntu_non_minimal[0].id : data.oci_core_images.ubuntu_arm[0].images[0].id
+    var.instance_image_os == "oracle-linux" ? (
+      length(local.oracle_non_minimal) > 0 ? local.oracle_non_minimal[0].id : data.oci_core_images.oracle_linux[0].images[0].id
+      ) : (
+      length(local.ubuntu_non_minimal) > 0 ? local.ubuntu_non_minimal[0].id : data.oci_core_images.ubuntu_arm[0].images[0].id
+    )
   )
 
   instance_metadata = merge(

@@ -2,13 +2,13 @@
 # Deploy Mervyn to an OCI (or any Ubuntu) VM over SSH — same bundle and remote logic as deploy-gcp.sh,
 # but uses scp/ssh instead of gcloud IAP.
 #
-# Target host should match oci-bootstrap.sh / Terraform: Ubuntu user `ubuntu`, Docker or Podman from cloud-init.
+# Target host should match oci-bootstrap.sh / Terraform: default user `opc` on Oracle Linux, `ubuntu` on Ubuntu — Podman + podman-compose from cloud-init or deploy-remote-setup.sh.
 #
 # Reads ciphertext .env.enc from the repo (same format as scripts/env-crypto.sh), decrypts locally,
 # uploads with the app bundle, then runs compose on the VM.
 #
 # With --local-build, build the image locally (podman preferred, else docker), save, copy, load on the VM.
-# Default platform is linux/arm64 (Ampere); set MERVYN_DOCKER_PLATFORM=linux/amd64 for x86 VMs.
+# Default MERVYN_DOCKER_PLATFORM follows terraform.tfvars instance_shape (A1 → arm64, else amd64) when unset.
 #
 # Usage:
 #   ./scripts/deploy-oci.sh ubuntu@203.0.113.7
@@ -16,11 +16,15 @@
 #   MERVYN_ENV_PASSPHRASE=... ./scripts/deploy-oci.sh ubuntu@host
 #
 # Optional env: MERVYN_DOCKER_PLATFORM, MERVYN_SSH_OPTS (extra ssh/scp words, e.g. -o ProxyJump=jumphost)
+# Optional: MERVYN_TFVARS=/path/to/terraform.tfvars (default: terraform/terraform.tfvars)
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# shellcheck disable=SC1091
+# Source path uses $ROOT at runtime (not analyzable as a static relative path).
+source "$ROOT/scripts/lib/mervyn-deploy-config.sh"
 
 OPENSSL_CIPHER="-aes-256-cbc"
 OPENSSL_PBKDF2_ITER=600000
@@ -40,7 +44,7 @@ usage() {
   cat <<'EOF' >&2
 Usage: deploy-oci.sh [options] [user@host]
 
-  user@host          SSH destination (or set MERVYN_OCI_SSH)
+  user@host          SSH destination (optional if terraform.tfvars + terraform output work)
 
 Options:
   --ssh=user@host    same as positional (wins over MERVYN_OCI_SSH if both given)
@@ -53,6 +57,7 @@ Decrypt:
   Interactive passphrase, or MERVYN_ENV_PASSPHRASE for non-interactive use.
 
 Examples:
+  ./scripts/deploy-oci.sh
   ./scripts/deploy-oci.sh ubuntu@$(terraform -chdir=terraform output -raw instance_public_ip)
   MERVYN_SSH_OPTS='-o StrictHostKeyChecking=accept-new' ./scripts/deploy-oci.sh ubuntu@203.0.113.7
 EOF
@@ -91,7 +96,14 @@ if [[ -n "$SSH_EXPLICIT" ]]; then
 fi
 
 if [[ -z "$SSH_DEST" ]]; then
-  echo "error: set MERVYN_OCI_SSH or pass user@host (see --help)" >&2
+  if SSH_AUTO=$(mervyn_oci_ssh_from_tfvars_and_terraform "$ROOT" 2>/dev/null); then
+    SSH_DEST="$SSH_AUTO"
+    echo "deploy-oci: using SSH destination from terraform.tfvars + terraform output: $SSH_DEST" >&2
+  fi
+fi
+
+if [[ -z "$SSH_DEST" ]]; then
+  echo "error: pass user@host, set MERVYN_OCI_SSH, or use terraform.tfvars + terraform output instance_public_ip (see --help)" >&2
   exit 1
 fi
 
@@ -106,19 +118,30 @@ if [[ -n "${MERVYN_SSH_OPTS:-}" ]]; then
   SSH_BASE_OPTS=( $MERVYN_SSH_OPTS )
 fi
 
+# argv is expanded locally on purpose (remote sees separate words, e.g. `bash -s`).
+# shellcheck disable=SC2029
 run_ssh() {
-  ssh "${SSH_BASE_OPTS[@]}" "$SSH_DEST" "$@"
+  # With `set -u`, expanding "${SSH_BASE_OPTS[@]}" on an empty array errors on some Bash builds.
+  if ((${#SSH_BASE_OPTS[@]} > 0)); then
+    ssh "${SSH_BASE_OPTS[@]}" "$SSH_DEST" "$@"
+  else
+    ssh "$SSH_DEST" "$@"
+  fi
 }
 
 run_scp() {
-  scp "${SSH_BASE_OPTS[@]}" "$@"
+  if ((${#SSH_BASE_OPTS[@]} > 0)); then
+    scp "${SSH_BASE_OPTS[@]}" "$@"
+  else
+    scp "$@"
+  fi
 }
 
 if [[ "$DRY_RUN" == true ]]; then
   echo "dry-run: ssh_dest=$SSH_DEST"
   echo "dry-run: would decrypt .env.enc (or --use-local-env), tar sources, then:"
   if [[ "$LOCAL_BUILD" == true ]]; then
-    echo "  (local) podman|docker build ... && save -> mervyn-image.tar"
+    echo "  (local) podman (else docker) build ... && save -> mervyn-image.tar"
     echo "  scp ... mervyn-image.tar ${SSH_DEST}:~/mervyn-image.tar"
   fi
   echo "  scp ... mervyn-deploy.tgz ${SSH_DEST}:~/mervyn-deploy.tgz"
@@ -136,6 +159,8 @@ trap cleanup EXIT
 
 ENV_LOCAL="$STAGE/.env"
 ARCHIVE="$STAGE/mervyn-deploy.tgz"
+REMOTE_CFG="$STAGE/mervyn-deploy-config.env"
+mervyn_write_deploy_remote_env_from_tfvars "$ROOT" "$REMOTE_CFG"
 
 if [[ "$USE_LOCAL_ENV" == true ]]; then
   if [[ ! -f "$ROOT/.env" ]]; then
@@ -187,6 +212,12 @@ if [[ "$LOCAL_BUILD" == true ]]; then
     echo "error: --local-build requires podman or docker in PATH" >&2
     exit 1
   fi
+  if [[ -z "${MERVYN_DOCKER_PLATFORM:-}" ]]; then
+    if p=$(mervyn_docker_platform_hint_from_tfvars "$ROOT" 2>/dev/null); then
+      MERVYN_DOCKER_PLATFORM="$p"
+      echo "deploy-oci: MERVYN_DOCKER_PLATFORM=$MERVYN_DOCKER_PLATFORM (from terraform.tfvars instance_shape)" >&2
+    fi
+  fi
   DOCKER_PLATFORM="${MERVYN_DOCKER_PLATFORM:-$MERVYN_DOCKER_PLATFORM_DEFAULT}"
   IMAGE_TAR="$STAGE/mervyn-image.tar"
   echo "Local build: $LOCAL_OCI build -t $DEPLOY_IMAGE (platform: $DOCKER_PLATFORM) ..."
@@ -195,14 +226,25 @@ if [[ "$LOCAL_BUILD" == true ]]; then
   "$LOCAL_OCI" save -o "$IMAGE_TAR" "$DEPLOY_IMAGE"
 fi
 
-run_ssh mkdir -p ~/mervyn-worklog ~/mervyn/data/vault ~/mervyn
+echo "deploy-oci: preparing directories on ${SSH_DEST}..." >&2
+# Quote so ~ is expanded on the remote (unquoted ~ would expand to the laptop's $HOME).
+run_ssh 'mkdir -p ~/mervyn-worklog ~/mervyn/data/vault ~/mervyn'
 
+if [[ -s "$REMOTE_CFG" ]]; then
+  echo "deploy-oci: copying deploy hints → ${SSH_DEST}:~/mervyn-deploy-config.env ..." >&2
+  run_scp "$REMOTE_CFG" "${SSH_DEST}:~/mervyn-deploy-config.env"
+fi
+
+echo "deploy-oci: copying bundle → ${SSH_DEST}:~/mervyn-deploy.tgz ..." >&2
 run_scp "$ARCHIVE" "${SSH_DEST}:~/mervyn-deploy.tgz"
 if [[ -n "$IMAGE_TAR" ]]; then
+  echo "deploy-oci: copying image tarball → ${SSH_DEST}:~/mervyn-image.tar ..." >&2
   run_scp "$IMAGE_TAR" "${SSH_DEST}:~/mervyn-image.tar"
 fi
+echo "deploy-oci: copying .env → ${SSH_DEST}:~/mervyn/.env ..." >&2
 run_scp "$ENV_LOCAL" "${SSH_DEST}:~/mervyn/.env"
 
+echo "deploy-oci: running remote setup on ${SSH_DEST} (Podman install / compose up — can take a long time, especially --build)..." >&2
 {
   if [[ "$LOCAL_BUILD" == true ]]; then
     echo 'export MERVYN_DEPLOY_MODE=local'
@@ -211,7 +253,7 @@ run_scp "$ENV_LOCAL" "${SSH_DEST}:~/mervyn/.env"
 } | run_ssh bash -s
 
 if [[ ${#SSH_BASE_OPTS[@]} -gt 0 ]]; then
-  echo "Deployed to ${SSH_DEST}. SSH: ssh ${SSH_BASE_OPTS[*]} $SSH_DEST"
+  echo "Deployed to ${SSH_DEST}. SSH: ssh ${SSH_BASE_OPTS[*]} ${SSH_DEST}"
 else
-  echo "Deployed to ${SSH_DEST}. SSH: ssh $SSH_DEST"
+  echo "Deployed to ${SSH_DEST}. SSH: ssh ${SSH_DEST}"
 fi

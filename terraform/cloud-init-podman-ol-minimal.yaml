@@ -1,0 +1,8 @@
+#cloud-config
+package_update: true
+runcmd:
+  - |
+    set -eux
+    dnf -y install ca-certificates curl
+    dnf -y install podman fuse-overlayfs slirp4netns iptables python3-pip
+    python3 -m pip install --break-system-packages podman-compose 2>/dev/null || python3 -m pip install podman-compose

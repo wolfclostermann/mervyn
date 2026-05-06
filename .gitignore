@@ -1,5 +1,7 @@
 /target
 /data
+# Local data snapshots from manual rsync/backup (never commit)
+/data.backup.*/
 .env
 .DS_Store
 
