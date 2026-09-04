@@ -1,5 +1,4 @@
-# AWS stack root. Composable layout aligns with:
-# https://github.com/gfs-sre/terraform-framework-example-stack
+# AWS stack root.
 
 module "aws_stack" {
   source = "../../modules/mervyn-aws"

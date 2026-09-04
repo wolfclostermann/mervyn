@@ -129,6 +129,24 @@ Schedules and timezone come from [`config/default.toml`](config/default.toml) (`
 | `POST /slack/events` | Slack Events API (signing secret verification, URL challenge, event callbacks). |
 | `GET /admin/slack-ingest` | Optional: JSON view of ingest log when `MERVYN_ADMIN_TOKEN` is set (Bearer auth). |
 
+## GitHub account
+
+This repo lives under, and should stay under, the personal `wolfclostermann` GitHub account —
+not any work-linked account. Two things enforce that:
+
+- **git push/pull** already route through the personal identity via an SSH host alias
+  (`git@me.github.com` → personal key, see `~/.ssh/config` / `~/.gitconfig` `insteadOf` rule).
+  Commit authorship in this repo is set locally (`git config user.email`) to the personal
+  account's GitHub noreply address, independent of your global git identity.
+- **`gh` CLI** (`gh pr create`, `gh issue`, `gh api`, etc.) has no per-directory account
+  awareness — it uses whichever account is globally active. To scope it to personal here
+  without touching your global `gh auth switch` state, this repo has an `.envrc`
+  ([direnv](https://direnv.net)) that exports `GH_TOKEN` for the personal account while you're
+  inside this directory. Run `direnv allow` once after installing direnv and logging in with
+  `gh auth login -h github.com -u wolfclostermann`. Without direnv, run the same export
+  manually before `gh` commands in this repo:
+  `export GH_TOKEN=$(gh auth token -h github.com -u wolfclostermann)`.
+
 ## Docker Compose
 
 Compose loads secrets and optional `MERVYN__*` overrides from a **`.env` file next to `docker-compose.yml`** ([`env_file` in `docker-compose.yml`](docker-compose.yml)). That is the same file as in [Quick start](#quick-start-dev): copy [`.env.example`](.env.example) to `.env`, fill in the required variables, and **do not commit `.env`** (it is gitignored).
