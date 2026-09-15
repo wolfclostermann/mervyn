@@ -8,7 +8,7 @@ pub mod event_title;
 pub mod log_work;
 pub mod remember_briefing;
 pub mod remove_event;
-pub mod slack_clean;
+pub mod text_clean;
 pub mod text_datetime;
 pub mod todo_items;
 
@@ -102,8 +102,7 @@ pub async fn dispatch(
     state: &AppState,
     label: IntentLabel,
     user_text: &str,
-    channel: &str,
-    thread_parent_ts: Option<&str>,
+    chat_id: i64,
     situation: Option<String>,
 ) -> anyhow::Result<()> {
     let reply = match label {
@@ -117,8 +116,8 @@ pub async fn dispatch(
         IntentLabel::Ask => ask::run(state, user_text).await?,
     };
     state
-        .slack
-        .post_message(channel, &reply, thread_parent_ts)
+        .telegram
+        .send_message(&chat_id.to_string(), &reply)
         .await?;
     Ok(())
 }

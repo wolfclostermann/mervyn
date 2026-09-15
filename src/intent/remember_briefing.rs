@@ -2,14 +2,14 @@
 
 use chrono::Utc;
 
-use crate::intent::slack_clean::{collapse_whitespace, strip_slack_mentions};
+use crate::intent::text_clean::collapse_whitespace;
 use crate::state::AppState;
 use crate::storage::worklog::{self, WorklogEntry};
 
 pub(crate) const WORKLOG_TAG: &str = "briefing";
 
 pub async fn run(state: &AppState, text: &str) -> anyhow::Result<String> {
-    let body = collapse_whitespace(&strip_slack_mentions(text.trim()));
+    let body = collapse_whitespace(&text.trim());
     if body.is_empty() {
         return Ok("Say what you want called out in the next briefing.".into());
     }

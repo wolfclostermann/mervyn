@@ -6,26 +6,45 @@ use redb::Database;
 
 use crate::claude::client::ClaudeClient;
 use crate::config::AppConfig;
-use crate::slack::client::SlackClient;
+use crate::telegram::client::TelegramClient;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Secrets {
     pub anthropic_api_key: String,
-    pub slack_bot_token: String,
-    pub slack_signing_secret: String,
-    pub slack_channel_id: String,
-    /// When set, enables `GET /admin/slack-ingest` with `Authorization: Bearer <token>`.
+    pub telegram_bot_token: String,
+    /// The only chat Mervyn answers. Everything else is dropped before it reaches Claude.
+    pub telegram_chat_id: i64,
+    /// When set, enables `GET /admin/message-ingest` with `Authorization: Bearer <token>`.
     pub admin_token: Option<String>,
+}
+
+/// Redacted on purpose: a derived `Debug` would print every credential the moment anyone
+/// added a `{:?}` to a log line, and the Telegram token in particular also travels in a URL.
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("anthropic_api_key", &"<redacted>")
+            .field("telegram_bot_token", &"<redacted>")
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field("admin_token", &self.admin_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Secrets {
     pub fn from_env() -> anyhow::Result<Self> {
+        let chat_id_raw = std::env::var("TELEGRAM_CHAT_ID").context("TELEGRAM_CHAT_ID")?;
+        let telegram_chat_id: i64 = chat_id_raw
+            .trim()
+            .parse()
+            .with_context(|| format!("TELEGRAM_CHAT_ID must be a number, got {chat_id_raw:?}"))?;
+        // A zero/unset id would otherwise pair with an update that has no chat and look like a match.
+        anyhow::ensure!(telegram_chat_id != 0, "TELEGRAM_CHAT_ID must not be 0");
+
         Ok(Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY")?,
-            slack_bot_token: std::env::var("SLACK_BOT_TOKEN").context("SLACK_BOT_TOKEN")?,
-            slack_signing_secret: std::env::var("SLACK_SIGNING_SECRET")
-                .context("SLACK_SIGNING_SECRET")?,
-            slack_channel_id: std::env::var("SLACK_CHANNEL_ID").context("SLACK_CHANNEL_ID")?,
+            telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN")?,
+            telegram_chat_id,
             admin_token: std::env::var("MERVYN_ADMIN_TOKEN")
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -40,6 +59,24 @@ pub struct AppState {
     pub secrets: Arc<Secrets>,
     pub db: Arc<Database>,
     pub claude: Arc<ClaudeClient>,
-    pub slack: Arc<SlackClient>,
+    pub telegram: Arc<TelegramClient>,
     pub vault_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_does_not_leak_secrets() {
+        let s = Secrets {
+            anthropic_api_key: "sk-ant-supersecret".into(),
+            telegram_bot_token: "123456:AAHsupersecret".into(),
+            telegram_chat_id: 42,
+            admin_token: Some("adm-supersecret".into()),
+        };
+        let rendered = format!("{s:?}");
+        assert!(!rendered.contains("supersecret"), "leaked: {rendered}");
+        assert!(rendered.contains("42"), "chat id should stay visible: {rendered}");
+    }
 }

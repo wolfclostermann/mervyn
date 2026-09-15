@@ -15,7 +15,6 @@ pub struct Update {
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
-    pub message_id: i64,
     /// Absent for messages sent to a channel.
     #[serde(default)]
     pub from: Option<User>,
@@ -23,7 +22,6 @@ pub struct Message {
     /// Absent for non-text messages (photos, stickers, service messages).
     #[serde(default)]
     pub text: Option<String>,
-    pub date: i64,
 }
 
 #[derive(Debug, Deserialize)]

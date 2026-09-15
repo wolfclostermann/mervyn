@@ -6,4 +6,6 @@
 //! the sender allowlist is what keeps it private.
 
 pub mod client;
+pub mod handler;
+pub mod poller;
 pub mod updates;

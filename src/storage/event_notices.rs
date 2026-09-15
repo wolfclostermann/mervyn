@@ -1,4 +1,4 @@
-//! Per-event flags for appointment Slack reminders (advance + start).
+//! Per-event flags for appointment chat reminders (advance + start).
 
 use redb::Database;
 use serde::{Deserialize, Serialize};

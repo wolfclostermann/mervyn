@@ -18,7 +18,7 @@ const QUERY_EVENTS_MD_MAX_CHARS: usize = 12_000;
 /// Cap for `worklog.md` mirror in query context (git-synced file may be ahead of redb briefly).
 const QUERY_WORKLOG_MD_MAX_CHARS: usize = 16_000;
 
-/// Slack-queued briefing lines stay visible to the morning job for this long.
+/// Chat-queued briefing lines stay visible to the morning job for this long.
 const BRIEFING_QUEUE_MAX_AGE: Duration = Duration::hours(48);
 
 pub struct ContextAssembler {
@@ -130,7 +130,7 @@ impl ContextAssembler {
             let mut parts = Vec::new();
             if !briefing_queue.is_empty() {
                 parts.push(format!(
-                    "### Queued for this morning briefing (from Slack, last 48h)\n{}",
+                    "### Queued for this morning briefing (from chat, last 48h)\n{}",
                     format_worklog(&briefing_queue)
                 ));
             }

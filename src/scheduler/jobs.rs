@@ -10,7 +10,7 @@ use crate::context::ContextAssembler;
 use crate::state::AppState;
 use crate::storage::reminders;
 use crate::user_situation;
-use crate::storage::slack_ingest;
+use crate::storage::message_ingest;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio::process::Command;
 
@@ -33,8 +33,8 @@ async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
     let user = prompts::morning_briefing_user_json(&ev, &rem, &wl)?;
     let text = state.claude.complete(Some(&system), &user).await?;
     state
-        .slack
-        .post_message(&state.secrets.slack_channel_id, &text, None)
+        .telegram
+        .send_message(&state.secrets.telegram_chat_id.to_string(), &text)
         .await?;
     Ok(())
 }
@@ -46,8 +46,8 @@ async fn run_reminder_check(state: &AppState) -> anyhow::Result<()> {
     for mut r in due {
         let msg = format!("Reminder: {}", r.body);
         state
-            .slack
-            .post_message(&state.secrets.slack_channel_id, &msg, None)
+            .telegram
+            .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
             .await?;
         if let Some(next) = reminders::next_due_after_fire(&r) {
             r.due = next;
@@ -125,13 +125,13 @@ pub async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_slack_ingest_prune(state: &AppState) -> anyhow::Result<()> {
+async fn run_message_ingest_prune(state: &AppState) -> anyhow::Result<()> {
     let now_ms = Utc::now().timestamp_millis();
-    let report = slack_ingest::prune(
+    let report = message_ingest::prune(
         state.db.as_ref(),
         now_ms,
-        state.settings.storage.slack_ingest_retention_days,
-        state.settings.storage.slack_ingest_keep_last,
+        state.settings.storage.message_ingest_retention_days,
+        state.settings.storage.message_ingest_keep_last,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     if report.total_removed() > 0 {
@@ -144,10 +144,10 @@ async fn run_slack_ingest_prune(state: &AppState) -> anyhow::Result<()> {
         tracing::debug!("slack_ingest prune: nothing to remove");
     }
 
-    let sweep = slack_ingest::sweep_stale_pending(
+    let sweep = message_ingest::sweep_stale_pending(
         state.db.as_ref(),
         now_ms,
-        state.settings.storage.slack_ingest_stale_pending_minutes,
+        state.settings.storage.message_ingest_stale_pending_minutes,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     if sweep.rewound > 0 {
@@ -207,12 +207,12 @@ pub async fn spawn_scheduler(state: AppState) -> anyhow::Result<()> {
         .await?;
 
     let st = state.clone();
-    let c = st.settings.scheduler.slack_ingest_prune_cron.clone();
+    let c = st.settings.scheduler.message_ingest_prune_cron.clone();
     sched
         .add(Job::new_async_tz(c.as_str(), tz, move |_uuid, _lock| {
             let st = st.clone();
             Box::pin(async move {
-                if let Err(e) = run_slack_ingest_prune(&st).await {
+                if let Err(e) = run_message_ingest_prune(&st).await {
                     tracing::error!(error = %e, "slack_ingest_prune job");
                 }
             })

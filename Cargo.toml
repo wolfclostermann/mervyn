@@ -36,18 +36,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
 base64 = "0.22"
 constant_time_eq = "0.4"
-bytes = "1"
 fnv = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 serde_yaml = "0.9"
-ngrok = "0.18.0"
-# Explicit provider so binaries that only use ngrok (e.g. `check_ngrok`) and the main binary agree on one Rustls backend.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

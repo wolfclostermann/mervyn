@@ -33,7 +33,7 @@ pub fn load_for_prompts(settings: &AppConfig) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, ClaudeSection, NgrokSection, SchedulerSection, ServerSection, StorageSection,
+        AppConfig, ClaudeSection, SchedulerSection, ServerSection, StorageSection,
         UserContextSection, WorklogGitSection,
     };
 
@@ -49,7 +49,7 @@ mod tests {
                 morning_briefing_cron: "0 0 7 * * *".into(),
                 reminder_check_cron: "0 * * * * *".into(),
                 vault_sync_cron: "0 */5 * * * *".into(),
-                slack_ingest_prune_cron: "0 0 4 * * *".into(),
+                message_ingest_prune_cron: "0 0 4 * * *".into(),
                 timezone: "Europe/London".into(),
                 appointment_reminders_enabled: true,
                 appointment_reminder_advance_minutes: 30,
@@ -58,12 +58,11 @@ mod tests {
             storage: StorageSection {
                 db_path: "/tmp/x.redb".into(),
                 vault_path: v.to_string_lossy().into_owned(),
-                slack_ingest_retention_days: None,
-                slack_ingest_keep_last: None,
-                slack_ingest_stale_pending_minutes: 0,
+                message_ingest_retention_days: None,
+                message_ingest_keep_last: None,
+                message_ingest_stale_pending_minutes: 0,
             },
             server: ServerSection { port: 3000 },
-            ngrok: NgrokSection::default(),
             user_context: UserContextSection {
                 enabled: true,
                 situation_file: "mervyn-situation.md".into(),
