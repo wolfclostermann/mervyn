@@ -215,6 +215,47 @@ compose_cmd() {
   exit 1
 }
 
+# docker-compose.yml pins `image: mervyn:deploy`; keep that ref in one place.
+readonly DEPLOY_IMAGE="${MERVYN_DEPLOY_IMAGE:-mervyn:deploy}"
+
+# Same runtime choice as compose_cmd, for plain container CLI calls (image inspect / ps).
+runtime_cmd() {
+  if can_use_podman_compose; then
+    podman_rootful podman "$@"
+  elif command -v docker >/dev/null 2>&1; then
+    docker "$@"
+  else
+    return 1
+  fi
+}
+
+# `compose up -d` can exit 0 while leaving the previous container in place: podman-compose treats an
+# already-running container as satisfied, so a freshly loaded :deploy tag never reaches it and the
+# deploy silently ships nothing (reports success, keeps running the old image). --force-recreate is
+# the fix; this check is the backstop for any compose that ignores it.
+verify_running_image() {
+  local want got cid ids
+  if ! want=$(runtime_cmd image inspect "$DEPLOY_IMAGE" --format '{{.Id}}' 2>/dev/null) || [[ -z "$want" ]]; then
+    echo "[deploy-remote-setup] warn: cannot inspect ${DEPLOY_IMAGE}; skipping image verification" >&2
+    return 0
+  fi
+  want="${want#sha256:}"
+  ids=$(runtime_cmd ps --filter "name=mervyn" --format '{{.ID}}' 2>/dev/null) || ids=""
+  for cid in $ids; do
+    got=$(runtime_cmd inspect "$cid" --format '{{.Image}}' 2>/dev/null) || continue
+    got="${got#sha256:}"
+    if [[ "$got" == "$want" ]]; then
+      echo "[deploy-remote-setup] verified: container ${cid} runs ${DEPLOY_IMAGE} (${want:0:12})" >&2
+      return 0
+    fi
+    echo "[deploy-remote-setup] container ${cid} runs image ${got:0:12}, expected ${want:0:12}" >&2
+  done
+  echo "error: no running container uses ${DEPLOY_IMAGE} (${want:0:12}) after compose up." >&2
+  echo "       The previous container was left in place, so this deploy shipped nothing." >&2
+  echo "       On the VM: cd ~/mervyn && compose down && compose up -d" >&2
+  exit 1
+}
+
 load_prebuilt_image_if_local() {
   [[ "${MERVYN_DEPLOY_MODE:-}" == "local" ]] || return 0
   local t="${HOME}/mervyn-image.tar"
@@ -253,13 +294,16 @@ echo "[deploy-remote-setup] fixing Podman CNI conflist versions if needed..." >&
 maybe_fix_podman_cni_conflists
 
 if [[ "${MERVYN_DEPLOY_MODE:-}" == "local" ]]; then
-  echo "[deploy-remote-setup] compose up -d (pre-built image, no --build)..." >&2
-  compose_cmd up -d
+  echo "[deploy-remote-setup] compose up -d --force-recreate (pre-built image, no --build)..." >&2
+  compose_cmd up -d --force-recreate
 else
-  echo "[deploy-remote-setup] compose up -d --build (Rust/image build can take many minutes; output may be sparse)..." >&2
-  compose_cmd up -d --build
+  echo "[deploy-remote-setup] compose up -d --build --force-recreate (Rust/image build can take many minutes; output may be sparse)..." >&2
+  compose_cmd up -d --build --force-recreate
 fi
 
 echo "[deploy-remote-setup] running compose ps:" >&2
 compose_cmd ps
+
+echo "[deploy-remote-setup] verifying the running container picked up the new image..." >&2
+verify_running_image
 echo "[deploy-remote-setup] done." >&2
