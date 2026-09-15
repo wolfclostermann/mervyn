@@ -38,7 +38,9 @@ situation_max_chars = 12000
 # to the host clone do not resolve inside the container otherwise. When set, Ask/briefing also read
 # repo_path/worklog.md if vault worklog.md is missing or empty.
 [worklog_git]
-enabled = true
+# Disabled 2026-09-15 pending a worklog rework. Re-enable with MERVYN__WORKLOG_GIT__ENABLED=true
+# once the worklog source is sorted; the vault symlink expects /worklog/worklog.md in-container.
+enabled = false
 repo_path = "../mervyn-worklog"
 remote = "origin"
 branch = "main"
