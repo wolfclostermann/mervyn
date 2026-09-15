@@ -7,6 +7,7 @@ mod intent;
 mod ngrok_tunnel;
 mod scheduler;
 mod slack;
+mod telegram;
 mod state;
 mod storage;
 mod user_situation;
