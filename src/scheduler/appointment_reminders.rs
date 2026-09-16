@@ -1,4 +1,4 @@
-//! Advance + start Slack notifications for calendar events.
+//! Advance + start chat notifications for calendar events.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -6,7 +6,7 @@ use crate::state::AppState;
 use crate::storage::event_notices::{self, EventNoticeState};
 use crate::storage::events;
 
-/// Returns `(send_advance_slack, send_start_slack)` and updates `state` in place.
+/// Returns `(send_advance, send_start)` and updates `state` in place.
 pub(crate) fn tick_notice_state(
     state: &mut EventNoticeState,
     event_start: DateTime<Utc>,
@@ -110,8 +110,8 @@ pub async fn run(state: &AppState) -> anyhow::Result<()> {
                 }
             }
             state
-                .slack
-                .post_message(&state.secrets.slack_channel_id, &msg, None)
+                .telegram
+                .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
                 .await?;
         }
 
@@ -126,8 +126,8 @@ pub async fn run(state: &AppState) -> anyhow::Result<()> {
                 }
             }
             state
-                .slack
-                .post_message(&state.secrets.slack_channel_id, &msg, None)
+                .telegram
+                .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
                 .await?;
         }
 
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn start_too_late_skips_slack_but_marks_sent() {
+    fn start_too_late_skips_send_but_marks_sent() {
         let start = ts("2026-04-10T12:00:00Z");
         let advance = Duration::minutes(30);
         let grace = Duration::minutes(10);

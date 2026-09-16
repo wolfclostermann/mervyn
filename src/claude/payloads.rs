@@ -1,7 +1,7 @@
 //! Typed bodies for Claude prompts. Serialize with `serde_json` — user-derived text lives in
 //! fields and is escaped by the serializer (no manual `format!` interpolation).
 #![allow(dead_code)]
-// Types are used once callers (Slack, scheduler) wire Claude; kept as the public prompt API.
+// Types are used once callers (chat, scheduler) wire Claude; kept as the public prompt API.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::London;
@@ -184,7 +184,7 @@ pub struct RemoveEventReplyV1 {
 pub struct TodoDoneCandidateV1 {
     /// Stable `redb` primary key — not the same as checklist position.
     pub id: u64,
-    /// 1-based index in the ordered open-todo list (matches numbered lists in Slack replies).
+    /// 1-based index in the ordered open-todo list (matches numbered lists in chat replies).
     pub list_number: u32,
     pub body: String,
     pub created_rfc3339: String,

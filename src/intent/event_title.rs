@@ -6,7 +6,7 @@ use crate::claude::client::ClaudeClient;
 use crate::claude::payloads::EventTitleReplyV1;
 use crate::claude::prompts;
 use crate::intent::normalize_claude_json_block;
-use crate::intent::slack_clean::{collapse_whitespace, strip_slack_mentions};
+use crate::intent::text_clean::collapse_whitespace;
 use crate::intent::text_datetime::strip_date_clause_after_on;
 
 const LEADING_PREFIXES: &[&str] = &[
@@ -65,7 +65,7 @@ fn parse_claude_title(raw: &str) -> Option<String> {
 
 /// Fallback when Claude is unavailable or returns an unusable reply.
 pub(crate) fn heuristic_event_title(raw: &str, today: NaiveDate) -> String {
-    let cleaned = collapse_whitespace(&strip_slack_mentions(raw.trim()));
+    let cleaned = collapse_whitespace(&raw.trim());
     if cleaned.is_empty() {
         return "Event".to_string();
     }
@@ -74,7 +74,7 @@ pub(crate) fn heuristic_event_title(raw: &str, today: NaiveDate) -> String {
     s = collapse_whitespace(&s);
     let s = s.trim().to_string();
     if s.is_empty() {
-        let fb = collapse_whitespace(&strip_slack_mentions(raw.trim()));
+        let fb = collapse_whitespace(&raw.trim());
         return fb.chars().take(120).collect::<String>().trim().to_string();
     }
     let mut c = s.chars();
@@ -120,7 +120,7 @@ mod tests {
     fn dentist_on_april_8th_heuristic() {
         let today = NaiveDate::from_ymd_opt(2026, 4, 5).unwrap();
         let t = heuristic_event_title(
-            "<@U123> I have a dentist appointment on April 8th 9 til 11",
+            "I have a dentist appointment on April 8th 9 til 11",
             today,
         );
         assert_eq!(t, "Dentist appointment");

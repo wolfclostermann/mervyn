@@ -4,7 +4,7 @@
 
 This project is a personal AI assistant (internally called "Mervyn") built for a single user: a professional karaoke jockey and software developer based in Portsmouth, UK. The assistant should feel like a persistent, proactive second brain — not a chatbot. It runs headlessly on a VPS and pushes information to the user rather than waiting to be asked.
 
-The user interacts primarily via Slack on mobile and desktop. Obsidian is used as the human-readable write surface for adding notes, worklog entries, and reminders. The assistant calls the Anthropic Claude API for all reasoning.
+The user interacts primarily via Telegram on mobile and desktop (one personal account, no workspace or company tenancy involved). Obsidian is used as the human-readable write surface for adding notes, worklog entries, and reminders. The assistant calls the Anthropic Claude API for all reasoning.
 
 The user is an experienced Rust developer comfortable with async Rust, Tokio, Docker, and GCP/Kubernetes. Code quality expectations are high. Idiomatic Rust is preferred over pragmatic shortcuts.
 
@@ -12,8 +12,8 @@ The user is an experienced Rust developer comfortable with async Rust, Tokio, Do
 
 ## Goals
 
-- Morning briefing delivered to Slack each day: agenda, reminders, suggested todo list
-- Accept natural-language input via Slack and route it appropriately (add reminder, log work, ask a question, etc.)
+- Morning briefing delivered to Telegram each day: agenda, reminders, suggested todo list
+- Accept natural-language input via Telegram and route it appropriately (add reminder, log work, ask a question, etc.)
 - Sync with Obsidian vault (Markdown files) as the human-facing data layer
 - Store structured data (events, reminders, worklog) in `redb` (pure Rust embedded key-value database)
 - Call Claude API with assembled context to generate responses and briefings
@@ -28,9 +28,9 @@ The user is an experienced Rust developer comfortable with async Rust, Tokio, Do
 │                    VPS (Docker)                      │
 │                                                      │
 │   ┌──────────────────────────────────────────────┐  │
-│   │              Orchestrator (axum)             │  │
-│   │         Slack event receiver + router        │  │
-│   └────────┬──────────────┬─────────────────────┘  │
+│   │      Telegram long poll (getUpdates, out)    │  │
+│   │  update → authorize → ingest → dedupe → route│  │
+│   └────────┬──────────────┬──────────────────────┘  │
 │            │              │                          │
 │   ┌────────▼───┐   ┌──────▼──────┐                 │
 │   │ Context    │   │ Claude API  │                  │
@@ -52,13 +52,20 @@ The user is an experienced Rust developer comfortable with async Rust, Tokio, Do
 │   │    Cron scheduler (tokio-cron-scheduler)     │  │
 │   │    Briefing, reminders, vault sync (cron)    │  │
 │   └──────────────────────────────────────────────┘  │
+│                                                      │
+│   ┌──────────────────────────────────────────────┐  │
+│   │   axum HTTP (local only, nothing dials in)   │  │
+│   │   /health + optional /admin/message-ingest   │  │
+│   └──────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
          │                        │
    ┌─────▼──────┐         ┌──────▼──────┐
-   │   Slack    │         │  Obsidian   │
-   │  (user)    │         │  vault sync │
+   │  Telegram  │         │  Obsidian   │
+   │   (user)   │         │  vault sync │
    └────────────┘         └─────────────┘
 ```
+
+**Connection direction matters:** both arrows out of the VPS are **outbound**. Mervyn dials `api.telegram.org` (long polling for inbound messages, `sendMessage` for replies) and `api.anthropic.com`; nothing on the internet dials in. There is no webhook route, no tunnel and no reserved domain, and the axum server is not publicly reachable — see **Telegram Integration**.
 
 ### Deployment target
 
@@ -86,20 +93,21 @@ mervyn/
 │       ├── events.md
 │       └── notes/
 └── src/
-    ├── main.rs               # Tokio runtime, startup, service wiring
+    ├── main.rs               # Tokio runtime, startup, long-poll task, service wiring
     ├── config.rs             # Config loading (config crate: file + env + MERVYN__ env overrides)
     ├── error.rs              # Unified error type (thiserror)
-    ├── state.rs              # AppState, Secrets (env)
+    ├── state.rs              # AppState, Secrets (env; hand-written redacting Debug)
     │
     ├── api/
-    │   ├── mod.rs            # axum router, Slack events + optional admin routes
-    │   └── admin.rs          # Bearer-auth read-only slack_ingest listing (if MERVYN_ADMIN_TOKEN set)
+    │   ├── mod.rs            # axum router: /health + optional admin route (no inbound webhook)
+    │   └── admin.rs          # Bearer-auth read-only message_ingest listing (if MERVYN_ADMIN_TOKEN set)
     │
-    ├── slack/
+    ├── telegram/
     │   ├── mod.rs
-    │   ├── client.rs         # Outbound Slack Web API calls (reqwest)
-    │   ├── events.rs         # Envelope serde, signature verify, X-Slack-Retry-Num parse
-    │   └── handler.rs        # Ingest → dedupe → filter → intent pipeline
+    │   ├── client.rs         # Bot API via reqwest: getUpdates / getMe / sendMessage, 4096-char chunking, 429 backoff
+    │   ├── updates.rs        # Update + Message serde types and accessors (chat_id, text, is_from_bot)
+    │   ├── poller.rs         # Long-poll loop, persisted offset cursor, shutdown watch
+    │   └── handler.rs        # Authorize → ingest → dedupe → filter → intent pipeline
     │
     ├── claude/
     │   ├── mod.rs
@@ -119,8 +127,8 @@ mervyn/
     │   ├── events.rs         # CRUD for Event records
     │   ├── reminders.rs      # CRUD for Reminder records (+ recurrence advance helpers)
     │   ├── worklog.rs        # CRUD for WorklogEntry records
-    │   ├── meta.rs           # META_TABLE: Slack event_id dedupe claims
-    │   └── slack_ingest.rs   # Ingest log, prune, sweep stale Pending + meta release
+    │   ├── meta.rs           # META_TABLE: update_id dedupe claims + persisted poll offset
+    │   └── message_ingest.rs # Ingest log, prune, sweep stale Pending + meta release
     │
     ├── vault/
     │   ├── mod.rs
@@ -138,7 +146,7 @@ mervyn/
         ├── add_event.rs
         ├── log_work.rs
         ├── add_note.rs
-        └── ask.rs            # Freeform question → Claude → Slack reply
+        └── ask.rs            # Freeform question → Claude → Telegram reply
 ```
 
 ---
@@ -152,6 +160,7 @@ The committed manifest is the source of truth; it is reproduced here for the spe
 name = "mervyn"
 version = "0.1.0"
 edition = "2021"
+default-run = "mervyn"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -185,11 +194,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
+base64 = "0.22"
 constant_time_eq = "0.4"
-bytes = "1"
 fnv = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 serde_yaml = "0.9"
@@ -199,6 +205,8 @@ tempfile = "3"
 ```
 
 **TLS / `reqwest`:** Mervyn uses **`reqwest`** with **`default-features = false`** and **`rustls-tls`** only, so the binary does not pull **`native-tls`**. Re-evaluate an official or community SDK only if it exposes a rustls-only feature set that preserves that property.
+
+**No crypto dependencies:** `hmac`, `sha2`, `hex` and `bytes` were dropped when the Slack webhook went away — long polling has no inbound request whose signature must be verified, and no raw body to hold. **`constant_time_eq`** remains for the admin Bearer-token comparison only.
 
 **Vault YAML:** **`serde_yaml`** parses optional leading front matter in `vault/md.rs`. The upstream crate is marked deprecated on crates.io; if it stalls, migrate to a maintained YAML library and keep the same `strip_yaml_front_matter` contract.
 
@@ -214,11 +222,15 @@ Prefer maintained ecosystem crates over hand-rolled logic that duplicates specs 
 
 For streaming, tools, or large API surface area, consider an SDK **only if** it can be configured for rustls-only `reqwest` (see **Dependencies**); otherwise extend the in-tree types carefully.
 
-### Slack Events API
+### Telegram Bot API
 
-Outbound **`chat.postMessage`** responses are deserialized into a small private struct (`ok` / `error`) instead of ad hoc `serde_json::Value` indexing (`src/slack/client.rs`).
+**Implemented:** `src/telegram/client.rs` calls the Bot API directly with **`reqwest`** (workspace **`rustls-tls`**): `getUpdates` for long polling, `getMe` on startup, `sendMessage` for replies. Responses deserialize into a small generic `ApiResponse<T>` (`ok`, `description`, `error_code`, `parameters`) instead of ad hoc `serde_json::Value` indexing. The bot token sits in the **URL path** of every call, so `reqwest` errors are mapped through `without_url()` — otherwise a failed request would print the token into the logs.
 
-**Signature verification** must follow Slack’s rules: timestamp freshness, payload `v0:{timestamp}:{raw_body}`, HMAC-SHA256 with the signing secret, and **constant-time** comparison on the digest — using the **raw request body** before JSON parsing. Implement with the **`hmac`** and **`sha2`** crates and Slack’s docs, or use a **small, focused Slack signing helper** that encodes the same algorithm so behaviour stays aligned with [Verifying requests from Slack](https://api.slack.com/authentication/verifying-requests-from-slack). For heavier typing of envelopes and events, evaluate Slack-oriented crates; otherwise keep **`serde`** for minimal shapes.
+**There is no signature verification to implement.** Long polling has no inbound request to verify (see **Telegram Integration**); the access control is the single-chat allowlist, and the only remaining constant-time comparison is on the admin Bearer token.
+
+Two Telegram-specific behaviours live in the client, both kept as **pure functions so the policy is unit-testable without I/O**: `split_message` (Telegram caps `sendMessage` text at **4096 UTF-16 code units** — break on a newline where one exists, else on a character boundary) and `classify` (HTTP **429** → sleep `parameters.retry_after`, capped at 60s, max 3 retries per chunk). There is deliberately **no `Notifier` trait**: an async trait is not dyn-compatible without boxing or an added `async-trait` dependency, and there is only one implementation.
+
+If the surface ever grows beyond these endpoints (inline keyboards, media, multi-chat routing), evaluate a maintained bot framework such as **`teloxide`** — but only one that can be configured for rustls-only `reqwest` (see **Dependencies**); otherwise extend the in-tree types carefully.
 
 ### Reminder recurrence
 
@@ -234,7 +246,7 @@ Layer settings with the **`config`** crate: committed `config/default.toml` plus
 
 ### Storage CRUD
 
-The `events`, `reminders`, and `worklog` modules share the same put/get/delete/list pattern over `redb`. **Implemented:** `src/storage/table.rs` centralises postcard encode/decode + write/read/delete/`next_id` for `TableDefinition<u64, &[u8]>` (also used for `slack_ingest::put` / `append` id allocation). Domain modules keep filtered table scans.
+The `events`, `reminders`, and `worklog` modules share the same put/get/delete/list pattern over `redb`. **Implemented:** `src/storage/table.rs` centralises postcard encode/decode + write/read/delete/`next_id` for `TableDefinition<u64, &[u8]>` (also used for `message_ingest::put` / `append` id allocation). Domain modules keep filtered table scans.
 
 ### Already aligned (keep as-is)
 
@@ -308,7 +320,7 @@ use redb::{Database, TableDefinition};
 
 // Tables: value = postcard-serialised struct bytes.
 // u64 tables: domain ids (vault-derived rows use stable FNV-1a keys; others set id explicitly);
-// slack_ingest uses monotonic u64 row keys. META uses &str keys.
+// message_ingest uses monotonic u64 row keys. META uses &str keys.
 pub const EVENTS_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("events");
 
@@ -318,13 +330,14 @@ pub const REMINDERS_TABLE: TableDefinition<u64, &[u8]> =
 pub const WORKLOG_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("worklog");
 
-// Key-value metadata (e.g. Slack event_id dedupe claims: `slack:ev:{event_id}`)
+// Key-value metadata: update dedupe claims (`tg:update:{update_id}`)
+// and the persisted long-poll cursor (`tg:poll_offset`).
 pub const META_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("meta");
 
-// Append-only delivery log keyed by monotonic u64 (see storage/slack_ingest)
-pub const SLACK_INGEST_TABLE: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("slack_ingest");
+// Append-only delivery log keyed by monotonic u64 (see storage/message_ingest)
+pub const MESSAGE_INGEST_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("message_ingest");
 
 pub fn open(path: &str) -> anyhow::Result<Database> {
     let db = Database::create(path)?;
@@ -334,12 +347,14 @@ pub fn open(path: &str) -> anyhow::Result<Database> {
         let _ = write_txn.open_table(REMINDERS_TABLE)?;
         let _ = write_txn.open_table(WORKLOG_TABLE)?;
         let _ = write_txn.open_table(META_TABLE)?;
-        let _ = write_txn.open_table(SLACK_INGEST_TABLE)?;
+        let _ = write_txn.open_table(MESSAGE_INGEST_TABLE)?;
     }
     write_txn.commit()?;
     Ok(db)
 }
 ```
+
+The committed `src/storage/db.rs` also defines `TODOS_TABLE` and `EVENT_NOTICES_TABLE`; the block above is the transport-relevant core. The `slack_ingest` table was renamed to `message_ingest` with the Telegram cutover — the database was wiped in the same session, so no redb migration was needed.
 
 ### Claude client (`src/claude/client.rs`) — as implemented
 
@@ -351,71 +366,75 @@ See **Dependencies** above for the rustls-only `reqwest` setup.
 
 ---
 
-## Slack Integration
+## Telegram Integration
 
-Mervyn uses the Slack **Events API** (HTTP POST) rather than a persistent WebSocket connection. Slack sends a POST to your VPS endpoint when a message is received.
+Mervyn uses the Telegram **Bot API** over **long polling** (`getUpdates`), **not** webhooks. The process dials out to `api.telegram.org` and holds each request open for up to 30 seconds; nothing dials in. That removes the whole inbound surface a webhook would need — no public route, no HMAC signature verification on a raw body, no tunnel, no reserved domain, no TLS certificate for the app — at the cost of the transport no longer authenticating anything (see **Authorization** below).
 
 ### Setup steps (manual, one-time)
 
-1. Create a Slack app at api.slack.com/apps
-2. Enable **Event Subscriptions**, set the Request URL to `https://your-vps-domain.com/slack/events`
-3. Subscribe to the `message.channels` and `app_mention` bot events
-4. Add OAuth scopes: `chat:write`, `channels:history`, `app_mentions:read`
-5. Install the app to your workspace
-6. Copy the **Bot Token** (`xoxb-...`) and **Signing Secret** into `.env`
+1. Create a bot by messaging **@BotFather** on Telegram (`/newbot`): display name, then a username ending in `bot`. No workspace or company tenancy is involved — the user's own Telegram account on Desktop / web / iOS / Android is the client.
+2. Copy the HTTP API token into `.env` as **`TELEGRAM_BOT_TOKEN`**.
+3. Message the bot once, then read `result[].message.chat.id` from `https://api.telegram.org/bot<TOKEN>/getUpdates` and put that number in `.env` as **`TELEGRAM_CHAT_ID`** (positive for a direct chat, negative for a group). Do this before starting Mervyn — two pollers on one token compete for updates.
+4. For a group chat only: turn **Group Privacy** off in BotFather so ordinary, non-mentioning messages reach the bot.
 
-### Signature verification
+### Authorization: the single-chat allowlist
 
-Every incoming Slack event must be verified using the signing secret **on the raw body** before JSON parsing. In the current code this runs at the start of the `slack_events` handler in `src/api/mod.rs` (not a separate Tower layer). Follow **Crate preferences** — use `hmac` + `sha2` + **`constant_time_eq`** on the decoded digest (as in `src/slack/events.rs`); do not compare digests with short-circuiting equality on secret material.
+**Long polling has no transport-level authentication.** A webhook could at least be checked against a signing secret; here, any Telegram user who discovers the bot's username can message it and Telegram will deliver those updates. **`TELEGRAM_CHAT_ID` is therefore the only access control in the system** and must be treated as a security control, not a convenience setting.
 
-```rust
-// src/slack/events.rs — verify Slack request signature
-// See: https://api.slack.com/authentication/verifying-requests-from-slack
-// 1. Read X-Slack-Request-Timestamp header — reject if >5 min old
-// 2. Compute HMAC-SHA256 of "v0:{timestamp}:{raw_body}" using signing secret
-// 3. Compare with X-Slack-Signature header value (constant-time comparison)
-```
+- `telegram::handler::is_authorized` compares `update.chat_id()` with the configured id and runs **before the ingest write and before any Claude call**. An unauthorized sender is logged at `warn` and dropped: it cannot grow the database, cannot spend Anthropic quota, and gets no reply. (The originally planned `FilteredUnauthorizedSender` ingest outcome was deliberately dropped — recording a stranger's traffic would have handed them a write primitive.)
+- `Secrets::from_env` parses the id as `i64` and **rejects `0`**, so a misconfigured or empty value cannot pair with a chat-less update and compare equal.
+- `Secrets` does **not** derive `Debug`; it implements a redacting one, because a single `{:?}` would otherwise dump every credential. The bot token is doubly sensitive: it travels in the **URL path** of every Bot API call, so `reqwest` errors are mapped through `without_url()`.
+- Anyone holding the token can read every update the bot receives and post as it. Rotate via BotFather if it leaks.
+
+### Long-poll loop and cursor
+
+`telegram/poller.rs` runs as a Tokio task alongside the axum server and stops when the server begins draining (a `watch` channel). `getUpdates` is called with `timeout=30` and an `offset`, which is both the **server-side acknowledgement** (Telegram stops resending anything below it) and the replay guard. The offset is persisted in `META_TABLE` under `tg:poll_offset`, so a restart resumes instead of replaying, and it advances **after** a batch is handled — a crash mid-batch redelivers, which is why the per-update dedupe claim below is still required. A failed poll backs off 5 seconds rather than hot-looping, and the cursor advances past the whole batch regardless of individual outcomes so one poisoned update cannot wedge the loop into redelivering it forever.
 
 ### Delivery ingest, deduplication, and handler pipeline
 
-Every **verified** `event_callback` is recorded before any business logic runs, so retries and filtered noise still leave an audit trail in redb.
+Every **authorized** update is recorded before any business logic runs, so redeliveries and filtered noise still leave an audit trail in redb.
 
 | Step | Responsibility | Code |
 |------|----------------|------|
-| 1. **Ingest** | Append one row per HTTP delivery to `slack_ingest` (`SLACK_INGEST_TABLE`): `event_id`, `received_at_ms`, `retry_num` from `X-Slack-Retry-Num` (if present), inner `event.type`, initial outcome `Pending`. | `storage/slack_ingest::append` |
-| 2. **Dedupe** | Atomically claim Slack’s top-level `event_id` in `META_TABLE` (`slack:ev:{event_id}`). If the claim fails, this delivery is a duplicate of an already-handled event: set ingest outcome to `DuplicateDelivery` and stop (no Claude / no Slack replies). | `storage/meta::try_claim_slack_delivery` |
-| 3. **Filter** | Drop bot messages, subtyped events, unsupported `type`s, empty text. Release the dedupe claim when skipping so a later legitimate retry can run. Set ingest outcome (`FilteredBot`, `FilteredSubtype`, etc.). | `slack/handler.rs` |
-| 4. **Action** | Classify intent → dispatch. On success: outcome `Processed`. On handler `Err`: **release** dedupe claim (so Slack can retry), outcome `Failed` (truncated error string). | `intent/*` |
+| 0. **Authorize** | Drop any update whose `chat.id` is not `TELEGRAM_CHAT_ID` — before any write and before Claude. | `telegram::handler::is_authorized` |
+| 1. **Ingest** | Append one row per update to `message_ingest` (`MESSAGE_INGEST_TABLE`): `event_id` (the Telegram `update_id`), `received_at_ms`, `inner_type` (`text` or `other`), initial outcome `Pending`. | `storage/message_ingest::append` |
+| 2. **Dedupe** | Atomically claim the `update_id` in `META_TABLE` (`tg:update:{update_id}`). If the claim fails, this is a redelivery of an already-handled update: set outcome `DuplicateDelivery` and stop (no Claude, no reply). | `storage/meta::try_claim_delivery` |
+| 3. **Filter** | Drop bot messages, non-message updates, and non-text or empty messages. Release the dedupe claim when skipping so a later legitimate redelivery can run. Set outcome (`FilteredBot`, `FilteredNonText`, `FilteredEmptyText`). | `telegram/handler.rs` |
+| 4. **Action** | Classify intent → dispatch. On success: outcome `Processed`. On handler `Err`: **release** the dedupe claim (so a redelivery can retry), outcome `Failed` (truncated error string). | `intent/*` |
 
-**Do not** skip processing solely because `X-Slack-Retry-Num` is set; deduplication is keyed by `event_id`, not the retry header.
+The `retry_num` column survives from the Slack-era schema and is always `None` under Telegram — long polling has no per-delivery retry counter, and dedupe is keyed on `update_id` regardless.
 
-**Hardening:** A [`SlackMetaClaimGuard`](src/slack/handler.rs) releases the meta claim on panic after a successful dedupe claim (unless disarmed on the success path). Rows still stuck `Pending` (e.g. panic before the guard is installed, or persistence failure after disarm) are cleared by the scheduled [`sweep_stale_pending`](src/storage/slack_ingest.rs) run (same cron as prune; see **`slack_ingest_stale_pending_minutes`**).
+**Hardening:** A [`DeliveryClaimGuard`](src/telegram/handler.rs) releases the meta claim on drop (e.g. a panic) after a successful claim, unless disarmed on the success path. Rows still stuck `Pending` (panic before the guard is installed, or a persistence failure after disarm) are cleared by the scheduled [`sweep_stale_pending`](src/storage/message_ingest.rs) run (same cron as prune; see **`message_ingest_stale_pending_minutes`**).
 
-### Operator: `slack_ingest` listing
+### Outbound replies
 
-When **`MERVYN_ADMIN_TOKEN`** is set (non-empty), the router mounts **`GET /admin/slack-ingest`**. Clients send **`Authorization: Bearer <token>`** (compared with **`constant_time_eq`** on the suffix; reject wrong length without leaking timing on the secret). Query parameters (all optional except as noted):
+Replies go out via `sendMessage` as **plain text with no `parse_mode`**: Claude's output is Markdown-ish and appointment reminders embed curly quotes, every one of which `MarkdownV2` would demand be escaped. Text longer than Telegram's **4096-unit** cap is split by `split_message` (newline break preferred, character boundary otherwise, counting **UTF-16 code units** because that is what the cap measures — an emoji is one `char` but two units). HTTP **429** is honoured via `parameters.retry_after`, capped at 60s and at 3 retries per chunk; Telegram's per-chat limit is roughly one message per second and the reminder job posts serially in a loop.
+
+### Operator: `message_ingest` listing
+
+When **`MERVYN_ADMIN_TOKEN`** is set (non-empty), the router mounts **`GET /admin/message-ingest`**. Clients send **`Authorization: Bearer <token>`** (compared with **`constant_time_eq`** on the suffix; reject wrong length without leaking timing on the secret). Query parameters (all optional except as noted):
 
 | Param | Meaning |
 |-------|---------|
 | `limit` | Max rows, default **100**, clamped **1..=500** |
 | `since_ms` / `until_ms` | Inclusive window on `received_at_ms` (Unix millis) |
 | `outcome` | Variant filter: `Pending`, `Processed`, `Failed` (any failure), `DuplicateDelivery`, `FilteredBot`, … |
-| `event_id` | Exact match on stored Slack top-level `event_id` |
+| `event_id` | Exact match on the stored Telegram `update_id` |
 
-Response JSON: `{ "rows": [ { "id", "event_id", "received_at_ms", "retry_num", "inner_type", "outcome" } ] }` where `outcome` is a short string (`Failed: …` includes the message). Implementation scans the ingest table in memory (`storage::slack_ingest::list_recent`) — for debugging only, not a high-QPS API. If **`MERVYN_ADMIN_TOKEN`** is unset, the route is **not registered** (no probe surface).
+Response JSON: `{ "rows": [ { "id", "event_id", "received_at_ms", "retry_num", "inner_type", "outcome" } ] }` where `outcome` is a short string (`Failed: …` includes the message). Implementation scans the ingest table in memory (`storage::message_ingest::list_recent`) — for debugging only, not a high-QPS API. If **`MERVYN_ADMIN_TOKEN`** is unset, the route is **not registered** (no probe surface). The route is on the same local-only server as `/health` and is not published to the internet.
 
 ---
 
 ## Prompt design (JSON API)
 
-User-derived text must **not** be interpolated into prompt templates with `format!`. Use typed payloads in `src/claude/payloads.rs` (`Serialize`) and **`serde_json`** for the strings sent to Claude. JSON is used (not TOML): it handles nested text, multiline Slack messages, and escaping automatically; TOML remains for human-edited config files only.
+User-derived text must **not** be interpolated into prompt templates with `format!`. Use typed payloads in `src/claude/payloads.rs` (`Serialize`) and **`serde_json`** for the strings sent to Claude. JSON is used (not TOML): it handles nested text, multiline chat messages, and escaping automatically; TOML remains for human-edited config files only.
 
 ### Layout
 
 | Piece | Where | Role |
 |--------|--------|------|
 | Session context | `SystemContextV1` (+ nested profile / clock) | `assistant_name`, user facts, London date/time, `api_version` |
-| Task-specific user bodies | `IntentClassificationV1`, `MorningBriefingV1`, `FreeformQueryV1` | `task` discriminator + string fields (raw Slack text lives in JSON string values) |
+| Task-specific user bodies | `IntentClassificationV1`, `MorningBriefingV1`, `FreeformQueryV1` | `task` discriminator + string fields (raw chat text lives in JSON string values) |
 | Static prose | `prompts::SYSTEM_CORE`, `SUPPLEMENT_*` | Fixed `&'static str`; append the right supplement to `system` per call type |
 
 ### Call shape
@@ -434,14 +453,14 @@ Constants `PROMPT_API_VERSION` and `TASK_*` in `payloads.rs` identify the schema
 
 ## Scheduler Jobs
 
-Implemented with `tokio-cron-scheduler`. Cron expressions and timezone come from **`config/default.toml`** (`[scheduler]` — `morning_briefing_cron`, `reminder_check_cron`, `vault_sync_cron`, `slack_ingest_prune_cron`, `timezone`, e.g. `Europe/London` with DST). Defaults match the table below; override via TOML or `MERVYN__SCHEDULER__*` env vars.
+Implemented with `tokio-cron-scheduler`. Cron expressions and timezone come from **`config/default.toml`** (`[scheduler]` — `morning_briefing_cron`, `reminder_check_cron`, `vault_sync_cron`, `message_ingest_prune_cron`, `timezone`, e.g. `Europe/London` with DST). Defaults match the table below; override via TOML or `MERVYN__SCHEDULER__*` env vars.
 
 | Job | Default schedule | Description |
 |-----|------------------|-------------|
-| `morning_briefing` | `0 30 7 * * *` | Assemble context, call Claude, post to configured Slack channel |
-| `reminder_check` | `0 * * * * *` | Due pending reminders → Slack |
+| `morning_briefing` | `0 30 7 * * *` | Assemble context, call Claude, post to `TELEGRAM_CHAT_ID` |
+| `reminder_check` | `0 * * * * *` | Due pending reminders → Telegram (serially, so the client's 429 backoff matters) |
 | `vault_sync` | `0 */5 * * * *` | Re-read vault Markdown files into redb |
-| `slack_ingest_prune` | `0 0 4 * * *` | Age + row-cap pruning (`slack_ingest::prune`) and stale-`Pending` sweep (`slack_ingest::sweep_stale_pending`) |
+| `message_ingest_prune` | `0 0 4 * * *` | Age + row-cap pruning (`message_ingest::prune`) and stale-`Pending` sweep (`message_ingest::sweep_stale_pending`) |
 
 **Vault watcher:** In addition to the cron job, `src/vault/watcher.rs` watches the vault tree with **`notify`**, debounces, and calls `sync_vault_to_db` so Obsidian saves land in redb quickly.
 
@@ -506,10 +525,9 @@ Required variables are loaded in `Secrets::from_env` (`src/state.rs`). See **`.e
 
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_SIGNING_SECRET=...
-SLACK_CHANNEL_ID=C...      # Channel for morning briefing and reminder posts (bot must be a member)
-# Optional: MERVYN_ADMIN_TOKEN=...   # Enables GET /admin/slack-ingest (Bearer)
+TELEGRAM_BOT_TOKEN=123456789:AA...
+TELEGRAM_CHAT_ID=123456789  # The ONLY chat Mervyn answers, and where briefings/reminders go (numeric; negative for groups)
+# Optional: MERVYN_ADMIN_TOKEN=...   # Enables GET /admin/message-ingest (Bearer)
 ```
 
 ### `config/default.toml` (non-secret, committed)
@@ -523,11 +541,15 @@ max_tokens = 2048
 morning_briefing_cron = "0 30 7 * * *"
 reminder_check_cron = "0 * * * * *"
 vault_sync_cron = "0 */5 * * * *"
+message_ingest_prune_cron = "0 0 4 * * *"
 timezone = "Europe/London"
 
 [storage]
 db_path = "./data/mervyn.redb"
 vault_path = "./data/vault"
+message_ingest_retention_days = 90
+message_ingest_keep_last = 100000
+message_ingest_stale_pending_minutes = 30
 
 [server]
 port = 3000
@@ -579,7 +601,7 @@ services:
 
 ## Implementation Order
 
-Build and validate each layer before moving to the next. Each step should be independently testable. **As of the current tree, steps 1–11 are largely implemented** (storage, vault sync, Claude Messages client, context, prompts, scheduler, Slack client, Events API pipeline with ingest/dedupe, intents, Docker assets); use the checklist below for remaining hardening (see **Open TODOs**) and optional refactors from **Crate preferences**.
+Build and validate each layer before moving to the next. Each step should be independently testable. **As of the current tree, steps 1–11 are largely implemented** (storage, vault sync, Claude Messages client, context, prompts, scheduler, Telegram client, long-poll pipeline with ingest/dedupe, intents, Docker assets); use the checklist below for remaining hardening (see **Open TODOs**) and optional refactors from **Crate preferences**.
 
 1. **Storage layer** — `src/storage/`. Define tables, implement CRUD for all three record types (shared helpers in `storage/table.rs` per **Crate preferences**). Write unit tests using a temp file path for the database.
 
@@ -595,13 +617,13 @@ Build and validate each layer before moving to the next. Each step should be ind
 
 7. **Scheduler** — `src/scheduler/jobs.rs`. Wire up cron jobs. Test morning briefing job end-to-end (storage → context → Claude → print output).
 
-8. **Slack client** — `src/slack/client.rs`. Implement `post_message()`. Test by posting to the channel.
+8. **Telegram client** — `src/telegram/client.rs`. Implement `send_message()` (with chunking and 429 backoff) and `get_updates()`. Test by posting to the allowlisted chat.
 
-9. **Slack event receiver** — `src/api/mod.rs` + `src/slack/`. Axum endpoint, signature verification, envelope parsing, **ingest → dedupe → filter → action** (see *Delivery ingest, deduplication, and handler pipeline*), intent routing.
+9. **Telegram long-poll receiver** — `src/telegram/poller.rs` + `handler.rs`. Long-poll loop with a persisted offset, then **authorize → ingest → dedupe → filter → action** (see *Delivery ingest, deduplication, and handler pipeline*), intent routing. No inbound HTTP route is involved.
 
 10. **Intent handlers** — `src/intent/`. Implement each handler. Wire everything together in `main.rs`.
 
-11. **Docker** — Build image, test locally, deploy to VPS. Set up TLS termination (Caddy or nginx in front of port 3000).
+11. **Docker** — Build image, test locally, deploy to VPS. **No reverse proxy or TLS termination is required**: the container needs outbound HTTPS only, and port 3000 serves nothing that should be public.
 
 ---
 
@@ -609,20 +631,20 @@ Build and validate each layer before moving to the next. Each step should be ind
 
 The checklist below tracks production hardening; **core items are implemented** — extend with metrics/alerts, TLS fronting, and richer parsers per **Crate preferences** as needed.
 
-- [x] **`slack_ingest` retention** — Implemented: `storage::slack_ingest::prune` (age in days, then optional max row count by monotonic id), scheduled job `slack_ingest_prune` in `scheduler/jobs.rs`. Knobs: `storage.slack_ingest_retention_days`, `storage.slack_ingest_keep_last` (use `0` to disable each rule), `scheduler.slack_ingest_prune_cron`; env `MERVYN__STORAGE__SLACK_INGEST_*`, `MERVYN__SCHEDULER__SLACK_INGEST_PRUNE_CRON`.
-- [x] **Stuck `Pending` ingest rows** — Implemented: `SlackMetaClaimGuard` in `slack/handler.rs` releases dedupe meta on panic after claim (disarm on success/filter/error paths); `slack_ingest::sweep_stale_pending` on the prune cron marks long-`Pending` rows failed and releases meta (`storage.slack_ingest_stale_pending_minutes`, `0` = off). Metrics/alerts left to deployment.
-- [x] **Operator visibility** — Implemented: `GET /admin/slack-ingest` when `MERVYN_ADMIN_TOKEN` is set; Bearer auth; query filters `limit`, `since_ms`, `until_ms`, `outcome`, `event_id`; JSON body via `api/admin.rs` + `slack_ingest::list_recent`.
-- [ ] **Slack huddle AI notes → worklog** — Spike whether Slack’s Web API can read AI huddle note content (canvases in huddle threads; may need `canvases:*` plus channel/DM history scopes). If readable: scheduled job, dedupe canvas/file/thread ids in `META_TABLE`, append `WorklogEntry` (e.g. tag `slack-huddle`), extend `SlackClient`. If not: third-party huddle transcript/recording API or human-in-the-loop (paste/DM).
+- [x] **`message_ingest` retention** — Implemented: `storage::message_ingest::prune` (age in days, then optional max row count by monotonic id), scheduled job `message_ingest_prune` in `scheduler/jobs.rs`. Knobs: `storage.message_ingest_retention_days`, `storage.message_ingest_keep_last` (use `0` to disable each rule), `scheduler.message_ingest_prune_cron`; env `MERVYN__STORAGE__MESSAGE_INGEST_*`, `MERVYN__SCHEDULER__MESSAGE_INGEST_PRUNE_CRON`.
+- [x] **Stuck `Pending` ingest rows** — Implemented: `DeliveryClaimGuard` in `telegram/handler.rs` releases the dedupe meta on drop after a claim (disarmed on success/filter/error paths); `message_ingest::sweep_stale_pending` on the prune cron marks long-`Pending` rows failed and releases meta (`storage.message_ingest_stale_pending_minutes`, `0` = off). Metrics/alerts left to deployment.
+- [x] **Operator visibility** — Implemented: `GET /admin/message-ingest` when `MERVYN_ADMIN_TOKEN` is set; Bearer auth; query filters `limit`, `since_ms`, `until_ms`, `outcome`, `event_id`; JSON body via `api/admin.rs` + `message_ingest::list_recent`.
+- [ ] **Unauthorized-sender visibility** — Updates from other chats are dropped with a `warn` log and nothing persisted (deliberate: see **Authorization**). If the bot's username ever leaks widely, consider a counter or rate-limited log so a sustained probe is noticeable without giving strangers a write path.
 
 ---
 
 ## Notes for the Implementer
 
-- Read **Crate preferences (avoid reinventing wheels)** before implementing Slack signing, Claude HTTP, vault parsing, recurrence, config layering, and storage CRUD patterns.
+- Read **Crate preferences (avoid reinventing wheels)** before touching the Telegram client, Claude HTTP, vault parsing, recurrence, config layering, and storage CRUD patterns.
 - Use `Arc<redb::Database>` everywhere — the database handle is shared across the scheduler, the HTTP handler, cron-driven vault sync, and the **vault watcher thread** (notify debounce → `sync_vault_to_db`).
 - Immediate vault updates are driven by **`notify`** + **`notify-debouncer-mini`** in `vault/watcher.rs`, not by a Tokio broadcast channel (a broadcast channel remains an option if you add non-filesystem writers later).
-- Keep Claude-facing text out of Slack/intent handlers: build `system` / user JSON via `src/claude/prompts.rs` and `payloads.rs` only. Handlers pass structured inputs into those APIs; do not add ad hoc `format!` with user-controlled text.
+- Keep Claude-facing text out of the transport and intent handlers: build `system` / user JSON via `src/claude/prompts.rs` and `payloads.rs` only. Handlers pass structured inputs into those APIs; do not add ad hoc `format!` with user-controlled text.
 - The vault sync is one-directional for now: Obsidian → redb. Mervyn does not write back to the vault Markdown files in this initial version.
 - Error handling: use `anyhow` for application-level errors, `thiserror` for library-level error types. Never `.unwrap()` in async task bodies — a panic in a spawned task is silent unless you explicitly handle the `JoinHandle`.
 - Tracing: instrument every significant operation with `tracing::info!` / `tracing::debug!` spans. The Docker logs are your only observability.
-- Slack: ingest retention, stale-`Pending` sweep, and optional admin ingest listing (`MERVYN_ADMIN_TOKEN`) — see spec *Operator: slack_ingest listing*.
+- Telegram: the single-chat allowlist is the only access control — never move the authorization check after a write or a Claude call (see *Authorization: the single-chat allowlist*). Ingest retention, the stale-`Pending` sweep, and the optional admin listing (`MERVYN_ADMIN_TOKEN`) are covered in *Operator: message_ingest listing*.

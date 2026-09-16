@@ -9,12 +9,12 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::state::AppState;
-use crate::storage::slack_ingest::{self, IngestListFilters, SlackIngestOutcome};
+use crate::storage::message_ingest::{self, IngestListFilters, MessageIngestOutcome};
 
 const BEARER_PREFIX: &str = "Bearer ";
 
 #[derive(Debug, Deserialize)]
-pub struct SlackIngestQuery {
+pub struct MessageIngestQuery {
     /// Max rows (clamped 1–500 server-side).
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -22,7 +22,7 @@ pub struct SlackIngestQuery {
     pub until_ms: Option<i64>,
     /// Outcome discriminant: `Pending`, `Processed`, `Failed`, `DuplicateDelivery`, etc.
     pub outcome: Option<String>,
-    /// Exact Slack top-level `event_id`.
+    /// Exact chat top-level `event_id`.
     pub event_id: Option<String>,
 }
 
@@ -31,7 +31,7 @@ fn default_limit() -> usize {
 }
 
 #[derive(Debug, Serialize)]
-struct SlackIngestRowJson {
+struct MessageIngestRowJson {
     id: u64,
     event_id: String,
     received_at_ms: i64,
@@ -40,16 +40,15 @@ struct SlackIngestRowJson {
     outcome: String,
 }
 
-fn outcome_label(o: &SlackIngestOutcome) -> String {
+fn outcome_label(o: &MessageIngestOutcome) -> String {
     match o {
-        SlackIngestOutcome::Pending => "Pending".into(),
-        SlackIngestOutcome::DuplicateDelivery => "DuplicateDelivery".into(),
-        SlackIngestOutcome::FilteredBot => "FilteredBot".into(),
-        SlackIngestOutcome::FilteredSubtype => "FilteredSubtype".into(),
-        SlackIngestOutcome::FilteredUnsupportedType => "FilteredUnsupportedType".into(),
-        SlackIngestOutcome::FilteredEmptyText => "FilteredEmptyText".into(),
-        SlackIngestOutcome::Processed => "Processed".into(),
-        SlackIngestOutcome::Failed(s) => format!("Failed: {s}"),
+        MessageIngestOutcome::Pending => "Pending".into(),
+        MessageIngestOutcome::DuplicateDelivery => "DuplicateDelivery".into(),
+        MessageIngestOutcome::FilteredBot => "FilteredBot".into(),
+        MessageIngestOutcome::FilteredNonText => "FilteredNonText".into(),
+        MessageIngestOutcome::FilteredEmptyText => "FilteredEmptyText".into(),
+        MessageIngestOutcome::Processed => "Processed".into(),
+        MessageIngestOutcome::Failed(s) => format!("Failed: {s}"),
     }
 }
 
@@ -68,16 +67,16 @@ fn bearer_token_ok(expected: &str, headers: &HeaderMap) -> bool {
     a.len() == b.len() && constant_time_eq(a, b)
 }
 
-pub async fn list_slack_ingest(
+pub async fn list_message_ingest(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<SlackIngestQuery>,
+    Query(q): Query<MessageIngestQuery>,
 ) -> impl IntoResponse {
     let Some(token) = state.secrets.admin_token.as_deref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !bearer_token_ok(token, &headers) {
-        tracing::debug!("admin slack-ingest: unauthorized");
+        tracing::debug!("admin message-ingest: unauthorized");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -88,19 +87,19 @@ pub async fn list_slack_ingest(
         event_id: q.event_id.as_deref(),
     };
 
-    let rows = match slack_ingest::list_recent(state.db.as_ref(), filters, q.limit) {
+    let rows = match message_ingest::list_recent(state.db.as_ref(), filters, q.limit) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "admin slack-ingest list");
+            tracing::warn!(error = %e, "admin message-ingest list");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
-    tracing::debug!(count = rows.len(), "admin slack-ingest list");
+    tracing::debug!(count = rows.len(), "admin message-ingest list");
 
-    let body: Vec<SlackIngestRowJson> = rows
+    let body: Vec<MessageIngestRowJson> = rows
         .into_iter()
-        .map(|(id, e)| SlackIngestRowJson {
+        .map(|(id, e)| MessageIngestRowJson {
             id,
             event_id: e.event_id,
             received_at_ms: e.received_at_ms,

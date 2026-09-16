@@ -36,9 +36,9 @@ Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fenc
 /// Append for morning briefing. User message = JSON from [`morning_briefing_user_json`].
 pub const SUPPLEMENT_MORNING_BRIEFING: &str = r#"The user's message is one JSON object with task "morning_briefing" and string fields events, reminders, worklog (preformatted text blobs).
 
-The worklog blob may begin with a block headed "Queued for this morning briefing (from Slack, last 48h)" — those lines are explicit requests Wolf made in Slack to cover in this briefing. Weave them in (summary + suggested next step when they asked for one).
+The worklog blob may begin with a block headed "Queued for this morning briefing (from chat, last 48h)" — those lines are explicit requests Wolf made in chat to cover in this briefing. Weave them in (summary + suggested next step when they asked for one).
 
-It may also include "Open todos (database)" — tasks Wolf added as notes in Slack; treat them as his active checklist and fold them into the suggested todo list for today (dedupe against briefing queue items when they overlap).
+It may also include "Open todos (database)" — tasks Wolf added as notes in chat; treat them as his active checklist and fold them into the suggested todo list for today (dedupe against briefing queue items when they overlap).
 
 Produce:
 1. A brief summary of what today looks like (2-3 sentences max)
@@ -50,18 +50,18 @@ Be concise. Plain text, no markdown headers. Bullet points are fine."#;
 /// Append for Q&A. User message = JSON from [`freeform_query_user_json`].
 pub const SUPPLEMENT_FREEFORM_QUERY: &str = r#"The user's message is one JSON object with task "freeform_query", context (assembled background), and question (Wolf's question).
 
-The context includes upcoming events (database, next several weeks, plus vault events.md when present), pending reminders, **open todos** (database rows Wolf added via note-style Slack messages; lines show numeric ids in brackets), recent worklog from the database, and **vault worklog.md** (the Markdown file on disk, or the same file from the configured git worklog clone when the vault copy is missing — e.g. Docker). Git-synced lines may be newer than the database snapshot. For "what did I work on today" or recent activity, prefer the **worklog Markdown** section when it lists dated `## YYYY-MM-DD` headings; use the database slice as a supplement. For "what's on my list" or errands, use the open todos section. This is Wolf's Mervyn data, not an external calendar API. Answer from that context; if the context does not list something, say it is not in the supplied data.
+The context includes upcoming events (database, next several weeks, plus vault events.md when present), pending reminders, **open todos** (database rows Wolf added via note-style chat messages; lines show numeric ids in brackets), recent worklog from the database, and **vault worklog.md** (the Markdown file on disk, or the same file from the configured git worklog clone when the vault copy is missing — e.g. Docker). Git-synced lines may be newer than the database snapshot. For "what did I work on today" or recent activity, prefer the **worklog Markdown** section when it lists dated `## YYYY-MM-DD` headings; use the database slice as a supplement. For "what's on my list" or errands, use the open todos section. This is Wolf's Mervyn data, not an external calendar API. Answer from that context; if the context does not list something, say it is not in the supplied data.
 
-Wolf can remove duplicate or wrong calendar rows by asking you in Slack to delete events (Mervyn runs a remove_event handler against the database). He can **mark todos done** with phrasing like "mark the plumber todo complete" or "done with todo 4" (Mervyn runs a complete_todo handler). He can queue a topic for the next morning briefing with a remember_briefing request—do not claim the assistant has no write access to its own database for those actions; if he needs that, tell him to phrase it as delete/remove events, complete todos, or ask to remember for the briefing.
+Wolf can remove duplicate or wrong calendar rows by asking you in chat to delete events (Mervyn runs a remove_event handler against the database). He can **mark todos done** with phrasing like "mark the plumber todo complete" or "done with todo 4" (Mervyn runs a complete_todo handler). He can queue a topic for the next morning briefing with a remember_briefing request—do not claim the assistant has no write access to its own database for those actions; if he needs that, tell him to phrase it as delete/remove events, complete todos, or ask to remember for the briefing.
 
 The context may begin with "Wolf's standing context" — the same Markdown as in the session JSON `situation` field (projects, priorities, life context). Align your answer with it."#;
 
 /// Append for event title extraction. User message = JSON from [`event_title_extraction_user_json`].
-pub const SUPPLEMENT_EVENT_TITLE_EXTRACTION: &str = r#"The user's message is one JSON object with task "event_title_extraction" and message (raw Slack text for a new calendar event).
+pub const SUPPLEMENT_EVENT_TITLE_EXTRACTION: &str = r#"The user's message is one JSON object with task "event_title_extraction" and message (raw chat text for a new calendar event).
 
 Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fences, no other text). Fields:
 - api_version: same integer as in the user's object
-- title: short calendar title (about 2–10 words): the core activity or subject only. Strip Slack mention markup mentally; omit dates, times, and filler like "I have a" unless needed for clarity. No trailing period unless it is part of a proper name."#;
+- title: short calendar title (about 2–10 words): the core activity or subject only. Omit dates, times, and filler like "I have a" unless needed for clarity. No trailing period unless it is part of a proper name."#;
 
 /// User message = JSON from [`event_time_extraction_user_json`].
 pub const SUPPLEMENT_EVENT_TIME_EXTRACTION: &str = r#"The user's message is one JSON object with task "event_time_extraction", message (raw text for a new calendar event), and interpret_in_timezone (IANA name, e.g. Europe/London). Wolf's wall-clock date and time for "now" are in the system JSON above; treat the message in interpret_in_timezone for any relative phrases, daylight rules (e.g. BST vs GMT in the UK), and implicit dates.
@@ -73,7 +73,7 @@ Respond with a single JSON object only (UTF-8, snake_case keys, no markdown fenc
 - end_utc: string or null (optional; omit the key or use null for a single instant)"#;
 
 /// Append for todo line extraction. User message = JSON from [`todo_items_extraction_user_json`].
-pub const SUPPLEMENT_TODO_ITEMS_EXTRACTION: &str = r#"The user's message is one JSON object with task "todo_items_extraction" and message (raw Slack text — Wolf is adding to his personal todo list).
+pub const SUPPLEMENT_TODO_ITEMS_EXTRACTION: &str = r#"The user's message is one JSON object with task "todo_items_extraction" and message (raw chat text — Wolf is adding to his personal todo list).
 
 Extract one or more short actionable tasks. Strip meta phrases like "make a note that", "remember to", "I need to" where the task is still clear without them. Split joint sentences ("X and I need to Y") into separate items. Each item should be a concise verb phrase (typically 3–12 words). Drop duplicates and empty noise.
 

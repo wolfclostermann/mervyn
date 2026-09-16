@@ -4,9 +4,8 @@ mod config;
 mod context;
 mod error;
 mod intent;
-mod ngrok_tunnel;
 mod scheduler;
-mod slack;
+mod telegram;
 mod state;
 mod storage;
 mod user_situation;
@@ -21,7 +20,7 @@ use anyhow::Context;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::claude::client::ClaudeClient;
-use crate::slack::client::SlackClient;
+use crate::telegram::client::TelegramClient;
 use crate::state::{AppState, Secrets};
 
 #[tokio::main]
@@ -51,14 +50,14 @@ async fn main() -> anyhow::Result<()> {
         settings.claude.model.clone(),
         settings.claude.max_tokens,
     ));
-    let slack = Arc::new(SlackClient::new(secrets.slack_bot_token.clone()));
+    let telegram = Arc::new(TelegramClient::new(secrets.telegram_bot_token.clone()));
 
     let app_state = AppState {
         settings: settings.clone(),
         secrets,
         db,
         claude,
-        slack,
+        telegram,
         vault_path: vault_path.to_path_buf(),
     };
 
@@ -68,23 +67,25 @@ async fn main() -> anyhow::Result<()> {
 
     vault::watcher::spawn_vault_watcher(app_state.db.clone(), app_state.vault_path.clone());
 
-    let _ngrok_forwarder = ngrok_tunnel::start(&settings.ngrok, settings.server.port)
-        .await
-        .context("start ngrok tunnel")?;
-
     if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {
         tracing::error!(error = %e, "worklog git pull on startup");
     }
 
-    let startup_msg = "Hello! Mervyn is up and running.";
-    match app_state
-        .slack
-        .post_message(&app_state.secrets.slack_channel_id, startup_msg, None)
-        .await
-    {
-        Ok(()) => tracing::info!("slack startup greeting sent"),
-        Err(e) => tracing::warn!(error = %e, "slack startup greeting failed"),
+    match app_state.telegram.get_me().await {
+        Ok(username) => tracing::info!(bot = %username, "telegram bot authenticated"),
+        Err(e) => tracing::warn!(error = %e, "telegram getMe failed; check TELEGRAM_BOT_TOKEN"),
     }
+
+    let chat_id = app_state.secrets.telegram_chat_id.to_string();
+    let startup_msg = "Hello! Mervyn is up and running.";
+    match app_state.telegram.send_message(&chat_id, startup_msg).await {
+        Ok(()) => tracing::info!("telegram startup greeting sent"),
+        Err(e) => tracing::warn!(error = %e, "telegram startup greeting failed"),
+    }
+
+    // Long polling runs alongside the HTTP server and stops when the server begins draining.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let poller = tokio::spawn(telegram::poller::run(app_state.clone(), shutdown_rx));
 
     tracing::info!(port = settings.server.port, "mervyn starting");
 
@@ -98,14 +99,19 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    let _ = shutdown_tx.send(true);
+    if let Err(e) = poller.await {
+        tracing::warn!(error = %e, "telegram poller join");
+    }
+
     let shutdown_msg = "Goodbye! Mervyn is shutting down.";
     match state_for_shutdown
-        .slack
-        .post_message(&state_for_shutdown.secrets.slack_channel_id, shutdown_msg, None)
+        .telegram
+        .send_message(&state_for_shutdown.secrets.telegram_chat_id.to_string(), shutdown_msg)
         .await
     {
-        Ok(()) => tracing::info!("slack shutdown message sent"),
-        Err(e) => tracing::warn!(error = %e, "slack shutdown message failed"),
+        Ok(()) => tracing::info!("telegram shutdown message sent"),
+        Err(e) => tracing::warn!(error = %e, "telegram shutdown message failed"),
     }
 
     Ok(())

@@ -1,5 +1,5 @@
 output "instance_public_ip" {
-  description = "Public IPv4 for SSH and (after TLS) Slack Events URL."
+  description = "Public IPv4, for SSH. Mervyn exposes no public endpoint: it reaches Telegram by outbound long polling."
   value       = aws_instance.mervyn.public_ip
 }
 

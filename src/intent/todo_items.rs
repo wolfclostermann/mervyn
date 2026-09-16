@@ -6,7 +6,7 @@ use crate::claude::client::ClaudeClient;
 use crate::claude::payloads::TodoItemsReplyV1;
 use crate::claude::prompts;
 use crate::intent::normalize_claude_json_block;
-use crate::intent::slack_clean::{collapse_whitespace, strip_slack_mentions};
+use crate::intent::text_clean::collapse_whitespace;
 
 const MAX_ITEMS: usize = 15;
 const MAX_ITEM_CHARS: usize = 400;
@@ -105,7 +105,7 @@ fn normalize_item_list(raw: Vec<String>) -> Vec<String> {
 
 /// Fallback when Claude is unavailable or returns nothing usable.
 pub(crate) fn heuristic_todo_items(raw: &str) -> Vec<String> {
-    let cleaned = collapse_whitespace(&strip_slack_mentions(raw.trim()));
+    let cleaned = collapse_whitespace(&raw.trim());
     if cleaned.is_empty() {
         return vec![];
     }

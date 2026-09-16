@@ -1,5 +1,5 @@
-//! Append-only log of Slack event callback deliveries (every HTTP attempt), then updated in-place
-//! with a final [`SlackIngestOutcome`] after dedupe / filter / handler steps.
+//! Append-only log of chat event callback deliveries (every HTTP attempt), then updated in-place
+//! with a final [`MessageIngestOutcome`] after dedupe / filter / handler steps.
 
 use std::collections::HashSet;
 
@@ -8,31 +8,30 @@ use redb::{Database, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::codec;
-use super::db::SLACK_INGEST_TABLE;
+use super::db::MESSAGE_INGEST_TABLE;
 use super::error::Result;
 use super::meta;
 use super::table;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SlackIngestOutcome {
+pub enum MessageIngestOutcome {
     /// Written on append; should be replaced before the worker returns.
     Pending,
     DuplicateDelivery,
     FilteredBot,
-    FilteredSubtype,
-    FilteredUnsupportedType,
+    FilteredNonText,
     FilteredEmptyText,
     Processed,
     Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlackIngestEntry {
+pub struct MessageIngestEntry {
     pub event_id: String,
     pub received_at_ms: i64,
     pub retry_num: Option<u32>,
     pub inner_type: String,
-    pub outcome: SlackIngestOutcome,
+    pub outcome: MessageIngestOutcome,
 }
 
 /// Record one delivery attempt. Always call [`set_outcome`] (or leave `Pending` only on panic).
@@ -42,33 +41,33 @@ pub fn append(
     retry_num: Option<u32>,
     inner_type: String,
 ) -> Result<u64> {
-    let id = table::next_id_u64(db, SLACK_INGEST_TABLE)?;
-    let entry = SlackIngestEntry {
+    let id = table::next_id_u64(db, MESSAGE_INGEST_TABLE)?;
+    let entry = MessageIngestEntry {
         event_id,
         received_at_ms: Utc::now().timestamp_millis(),
         retry_num,
         inner_type,
-        outcome: SlackIngestOutcome::Pending,
+        outcome: MessageIngestOutcome::Pending,
     };
     put(db, id, &entry)?;
     Ok(id)
 }
 
-pub(super) fn put(db: &Database, id: u64, entry: &SlackIngestEntry) -> Result<()> {
-    table::put_u64(db, SLACK_INGEST_TABLE, id, entry)
+pub(super) fn put(db: &Database, id: u64, entry: &MessageIngestEntry) -> Result<()> {
+    table::put_u64(db, MESSAGE_INGEST_TABLE, id, entry)
 }
 
-pub fn set_outcome(db: &Database, id: u64, outcome: SlackIngestOutcome) -> Result<()> {
+pub fn set_outcome(db: &Database, id: u64, outcome: MessageIngestOutcome) -> Result<()> {
     let w = db.begin_write()?;
     {
-        let mut t = w.open_table(SLACK_INGEST_TABLE)?;
+        let mut t = w.open_table(MESSAGE_INGEST_TABLE)?;
         let raw: Option<Vec<u8>> = t.get(id)?.map(|g| g.value().to_vec());
         let Some(raw) = raw else {
             drop(t);
             w.commit()?;
             return Ok(());
         };
-        let mut entry: SlackIngestEntry = codec::decode(&raw)?;
+        let mut entry: MessageIngestEntry = codec::decode(&raw)?;
         entry.outcome = outcome;
         let bytes = codec::encode(&entry)?;
         t.insert(id, bytes.as_slice())?;
@@ -90,7 +89,7 @@ impl PruneReport {
     }
 }
 
-/// Delete old or excess `slack_ingest` rows. `retention_days` / `keep_last` of `None` or `Some(0)` disable that rule.
+/// Delete old or excess `message_ingest` rows. `retention_days` / `keep_last` of `None` or `Some(0)` disable that rule.
 pub fn prune(
     db: &Database,
     now_ms: i64,
@@ -105,14 +104,14 @@ pub fn prune(
     }
 
     let r = db.begin_read()?;
-    let t = r.open_table(SLACK_INGEST_TABLE)?;
-    let mut rows: Vec<(u64, SlackIngestEntry)> = Vec::new();
+    let t = r.open_table(MESSAGE_INGEST_TABLE)?;
+    let mut rows: Vec<(u64, MessageIngestEntry)> = Vec::new();
     for row in t.iter()? {
         let (k, v) = row?;
         let id = k.value();
         match codec::decode(v.value()) {
             Ok(e) => rows.push((id, e)),
-            Err(e) => tracing::warn!(row_id = id, error = %e, "slack_ingest prune: skip corrupt row"),
+            Err(e) => tracing::warn!(row_id = id, error = %e, "message_ingest prune: skip corrupt row"),
         }
     }
     drop(t);
@@ -153,7 +152,7 @@ pub fn prune(
 
     let w = db.begin_write()?;
     {
-        let mut tbl = w.open_table(SLACK_INGEST_TABLE)?;
+        let mut tbl = w.open_table(MESSAGE_INGEST_TABLE)?;
         for id in &to_delete {
             let _ = tbl.remove(*id)?;
         }
@@ -174,7 +173,7 @@ pub struct StalePendingSweepReport {
     pub rewound: usize,
 }
 
-/// For each `Pending` row older than `stale_after_minutes`, release the Slack dedupe meta key (if any) and set outcome to [`SlackIngestOutcome::Failed`].
+/// For each `Pending` row older than `stale_after_minutes`, release the chat dedupe meta key (if any) and set outcome to [`MessageIngestOutcome::Failed`].
 pub fn sweep_stale_pending(
     db: &Database,
     now_ms: i64,
@@ -186,15 +185,15 @@ pub fn sweep_stale_pending(
     let threshold_ms = i64::from(stale_after_minutes).saturating_mul(60_000);
 
     let r = db.begin_read()?;
-    let t = r.open_table(SLACK_INGEST_TABLE)?;
-    let mut stale: Vec<(u64, SlackIngestEntry)> = Vec::new();
+    let t = r.open_table(MESSAGE_INGEST_TABLE)?;
+    let mut stale: Vec<(u64, MessageIngestEntry)> = Vec::new();
     for row in t.iter()? {
         let (k, v) = row?;
         let id = k.value();
-        let Ok(entry) = codec::decode::<SlackIngestEntry>(v.value()) else {
+        let Ok(entry) = codec::decode::<MessageIngestEntry>(v.value()) else {
             continue;
         };
-        if !matches!(entry.outcome, SlackIngestOutcome::Pending) {
+        if !matches!(entry.outcome, MessageIngestOutcome::Pending) {
             continue;
         }
         if now_ms.saturating_sub(entry.received_at_ms) <= threshold_ms {
@@ -211,8 +210,8 @@ pub fn sweep_stale_pending(
 
     let mut rewound = 0usize;
     for (id, entry) in stale {
-        let _ = meta::release_slack_delivery(db, &entry.event_id);
-        set_outcome(db, id, SlackIngestOutcome::Failed(STALE_PENDING_MSG.into()))?;
+        let _ = meta::release_delivery(db, &entry.event_id);
+        set_outcome(db, id, MessageIngestOutcome::Failed(STALE_PENDING_MSG.into()))?;
         rewound += 1;
     }
 
@@ -221,7 +220,7 @@ pub fn sweep_stale_pending(
 
 /// Optional filters for [`list_recent`]. All conditions are ANDed. `outcome` matches the variant
 /// discriminant (`Pending`, `Processed`, `Failed`, `DuplicateDelivery`, …). `Failed` matches any
-/// [`SlackIngestOutcome::Failed`].
+/// [`MessageIngestOutcome::Failed`].
 #[derive(Debug, Clone, Default)]
 pub struct IngestListFilters<'a> {
     pub since_ms: Option<i64>,
@@ -230,17 +229,16 @@ pub struct IngestListFilters<'a> {
     pub event_id: Option<&'a str>,
 }
 
-fn outcome_matches_filter(o: &SlackIngestOutcome, filter: &str) -> bool {
+fn outcome_matches_filter(o: &MessageIngestOutcome, filter: &str) -> bool {
     match o {
-        SlackIngestOutcome::Failed(_) if filter == "Failed" => true,
-        SlackIngestOutcome::Pending if filter == "Pending" => true,
-        SlackIngestOutcome::DuplicateDelivery if filter == "DuplicateDelivery" => true,
-        SlackIngestOutcome::FilteredBot if filter == "FilteredBot" => true,
-        SlackIngestOutcome::FilteredSubtype if filter == "FilteredSubtype" => true,
-        SlackIngestOutcome::FilteredUnsupportedType if filter == "FilteredUnsupportedType" => true,
-        SlackIngestOutcome::FilteredEmptyText if filter == "FilteredEmptyText" => true,
-        SlackIngestOutcome::Processed if filter == "Processed" => true,
-        SlackIngestOutcome::Failed(_) => false,
+        MessageIngestOutcome::Failed(_) if filter == "Failed" => true,
+        MessageIngestOutcome::Pending if filter == "Pending" => true,
+        MessageIngestOutcome::DuplicateDelivery if filter == "DuplicateDelivery" => true,
+        MessageIngestOutcome::FilteredBot if filter == "FilteredBot" => true,
+        MessageIngestOutcome::FilteredNonText if filter == "FilteredNonText" => true,
+        MessageIngestOutcome::FilteredEmptyText if filter == "FilteredEmptyText" => true,
+        MessageIngestOutcome::Processed if filter == "Processed" => true,
+        MessageIngestOutcome::Failed(_) => false,
         _ => false,
     }
 }
@@ -251,15 +249,15 @@ pub fn list_recent(
     db: &Database,
     filters: IngestListFilters<'_>,
     limit: usize,
-) -> Result<Vec<(u64, SlackIngestEntry)>> {
+) -> Result<Vec<(u64, MessageIngestEntry)>> {
     let limit = limit.clamp(1, 500);
     let r = db.begin_read()?;
-    let t = r.open_table(SLACK_INGEST_TABLE)?;
-    let mut rows: Vec<(u64, SlackIngestEntry)> = Vec::new();
+    let t = r.open_table(MESSAGE_INGEST_TABLE)?;
+    let mut rows: Vec<(u64, MessageIngestEntry)> = Vec::new();
     for row in t.iter()? {
         let (k, v) = row?;
         let id = k.value();
-        let Ok(entry) = codec::decode::<SlackIngestEntry>(v.value()) else {
+        let Ok(entry) = codec::decode::<MessageIngestEntry>(v.value()) else {
             continue;
         };
         if let Some(s) = filters.since_ms {
@@ -298,13 +296,13 @@ mod tests {
     use crate::storage::meta;
     use tempfile::NamedTempFile;
 
-    fn sample_entry(received_at_ms: i64) -> SlackIngestEntry {
-        SlackIngestEntry {
+    fn sample_entry(received_at_ms: i64) -> MessageIngestEntry {
+        MessageIngestEntry {
             event_id: "Ev".into(),
             received_at_ms,
             retry_num: None,
             inner_type: "message".into(),
-            outcome: SlackIngestOutcome::Processed,
+            outcome: MessageIngestOutcome::Processed,
         }
     }
 
@@ -313,12 +311,12 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = db::open(tmp.path().to_str().unwrap()).unwrap();
         let id = append(&db, "Ev1".into(), Some(0), "message".into()).unwrap();
-        set_outcome(&db, id, SlackIngestOutcome::Processed).unwrap();
+        set_outcome(&db, id, MessageIngestOutcome::Processed).unwrap();
         let r = db.begin_read().unwrap();
-        let t = r.open_table(SLACK_INGEST_TABLE).unwrap();
+        let t = r.open_table(MESSAGE_INGEST_TABLE).unwrap();
         let g = t.get(id).unwrap().unwrap();
-        let e: SlackIngestEntry = codec::decode(g.value()).unwrap();
-        assert_eq!(e.outcome, SlackIngestOutcome::Processed);
+        let e: MessageIngestEntry = codec::decode(g.value()).unwrap();
+        assert_eq!(e.outcome, MessageIngestOutcome::Processed);
         assert_eq!(e.retry_num, Some(0));
     }
 
@@ -334,7 +332,7 @@ mod tests {
         assert_eq!(r.removed_by_age, 1);
         assert_eq!(r.removed_by_cap, 0);
         let read = db.begin_read().unwrap();
-        let t = read.open_table(SLACK_INGEST_TABLE).unwrap();
+        let t = read.open_table(MESSAGE_INGEST_TABLE).unwrap();
         assert!(t.get(1).unwrap().is_none());
         assert!(t.get(2).unwrap().is_some());
     }
@@ -351,7 +349,7 @@ mod tests {
         assert_eq!(r.removed_by_age, 0);
         assert_eq!(r.removed_by_cap, 3);
         let read = db.begin_read().unwrap();
-        let t = read.open_table(SLACK_INGEST_TABLE).unwrap();
+        let t = read.open_table(MESSAGE_INGEST_TABLE).unwrap();
         assert!(t.get(1).unwrap().is_none());
         assert!(t.get(2).unwrap().is_none());
         assert!(t.get(3).unwrap().is_none());
@@ -374,33 +372,33 @@ mod tests {
     fn sweep_stale_pending_releases_meta_and_sets_failed() {
         let tmp = NamedTempFile::new().unwrap();
         let db = db::open(tmp.path().to_str().unwrap()).unwrap();
-        assert!(meta::try_claim_slack_delivery(&db, "EvStale").unwrap());
+        assert!(meta::try_claim_delivery(&db, "EvStale").unwrap());
 
         let now_ms = 1_800_000_000_000_i64;
         let old_ms = now_ms - 120 * 60_000;
         put(
             &db,
             1,
-            &SlackIngestEntry {
+            &MessageIngestEntry {
                 event_id: "EvStale".into(),
                 received_at_ms: old_ms,
                 retry_num: None,
                 inner_type: "message".into(),
-                outcome: SlackIngestOutcome::Pending,
+                outcome: MessageIngestOutcome::Pending,
             },
         )
         .unwrap();
 
         let r = sweep_stale_pending(&db, now_ms, 30).unwrap();
         assert_eq!(r.rewound, 1);
-        assert!(meta::try_claim_slack_delivery(&db, "EvStale").unwrap());
+        assert!(meta::try_claim_delivery(&db, "EvStale").unwrap());
 
         let read = db.begin_read().unwrap();
-        let t = read.open_table(SLACK_INGEST_TABLE).unwrap();
-        let e: SlackIngestEntry = codec::decode(t.get(1).unwrap().unwrap().value()).unwrap();
+        let t = read.open_table(MESSAGE_INGEST_TABLE).unwrap();
+        let e: MessageIngestEntry = codec::decode(t.get(1).unwrap().unwrap().value()).unwrap();
         assert!(matches!(
             e.outcome,
-            SlackIngestOutcome::Failed(ref s) if s == STALE_PENDING_MSG
+            MessageIngestOutcome::Failed(ref s) if s == STALE_PENDING_MSG
         ));
     }
 
@@ -411,12 +409,12 @@ mod tests {
         put(
             &db,
             1,
-            &SlackIngestEntry {
+            &MessageIngestEntry {
                 event_id: "Ev".into(),
                 received_at_ms: 0,
                 retry_num: None,
                 inner_type: "message".into(),
-                outcome: SlackIngestOutcome::Pending,
+                outcome: MessageIngestOutcome::Pending,
             },
         )
         .unwrap();
@@ -431,24 +429,24 @@ mod tests {
         put(
             &db,
             1,
-            &SlackIngestEntry {
+            &MessageIngestEntry {
                 event_id: "A".into(),
                 received_at_ms: 100,
                 retry_num: None,
                 inner_type: "message".into(),
-                outcome: SlackIngestOutcome::Pending,
+                outcome: MessageIngestOutcome::Pending,
             },
         )
         .unwrap();
         put(
             &db,
             2,
-            &SlackIngestEntry {
+            &MessageIngestEntry {
                 event_id: "B".into(),
                 received_at_ms: 200,
                 retry_num: None,
                 inner_type: "message".into(),
-                outcome: SlackIngestOutcome::Processed,
+                outcome: MessageIngestOutcome::Processed,
             },
         )
         .unwrap();

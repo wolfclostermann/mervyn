@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-fn default_slack_ingest_prune_cron() -> String {
+fn default_message_ingest_prune_cron() -> String {
     "0 0 4 * * *".to_string()
 }
 
@@ -12,8 +12,6 @@ pub struct AppConfig {
     pub scheduler: SchedulerSection,
     pub storage: StorageSection,
     pub server: ServerSection,
-    #[serde(default)]
-    pub ngrok: NgrokSection,
     #[serde(default)]
     pub user_context: UserContextSection,
     /// Optional scheduled `git pull` for a worklog (or vault) repo while Mervyn is running.
@@ -44,11 +42,11 @@ pub struct SchedulerSection {
     pub morning_briefing_cron: String,
     pub reminder_check_cron: String,
     pub vault_sync_cron: String,
-    /// Cron for pruning `slack_ingest` rows (see `[storage]` retention options).
-    #[serde(default = "default_slack_ingest_prune_cron")]
-    pub slack_ingest_prune_cron: String,
+    /// Cron for pruning `message_ingest` rows (see `[storage]` retention options).
+    #[serde(default = "default_message_ingest_prune_cron")]
+    pub message_ingest_prune_cron: String,
     pub timezone: String,
-    /// Post Slack for calendar events this many minutes before `start`, and at `start`.
+    /// Post chat for calendar events this many minutes before `start`, and at `start`.
     #[serde(default = "default_appointment_reminders_enabled")]
     pub appointment_reminders_enabled: bool,
     #[serde(default = "default_appointment_reminder_advance_minutes")]
@@ -62,41 +60,25 @@ pub struct SchedulerSection {
 pub struct StorageSection {
     pub db_path: String,
     pub vault_path: String,
-    /// Delete `slack_ingest` rows older than this many days (`None` / omit = no age pruning).
+    /// Delete `message_ingest` rows older than this many days (`None` / omit = no age pruning).
     #[serde(default)]
-    pub slack_ingest_retention_days: Option<u32>,
+    pub message_ingest_retention_days: Option<u32>,
     /// After age pruning, keep at most this many rows, dropping lowest ids first (`None` = no cap).
     #[serde(default)]
-    pub slack_ingest_keep_last: Option<u64>,
-    /// Ingest rows still `Pending` after this many minutes are marked failed and Slack `event_id` meta claims released (scheduled with prune). `0` disables.
-    #[serde(default = "default_slack_ingest_stale_pending_minutes")]
-    pub slack_ingest_stale_pending_minutes: u32,
+    pub message_ingest_keep_last: Option<u64>,
+    /// Ingest rows still `Pending` after this many minutes are marked failed and their delivery
+    /// meta claims released (scheduled with prune). `0` disables.
+    #[serde(default = "default_message_ingest_stale_pending_minutes")]
+    pub message_ingest_stale_pending_minutes: u32,
 }
 
-fn default_slack_ingest_stale_pending_minutes() -> u32 {
+fn default_message_ingest_stale_pending_minutes() -> u32 {
     30
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerSection {
     pub port: u16,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct NgrokSection {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub domain: Option<String>,
-}
-
-impl Default for NgrokSection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            domain: None,
-        }
-    }
 }
 
 fn default_user_context_enabled() -> bool {
