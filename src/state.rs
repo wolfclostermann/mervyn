@@ -31,9 +31,19 @@ impl std::fmt::Debug for Secrets {
     }
 }
 
+/// Read a required variable, treating present-but-empty as missing.
+///
+/// `std::env::var` returns `Ok("")` for a var that is set to nothing, so a half-filled `.env`
+/// would otherwise start and only fail later inside the poll loop.
+fn require_env(name: &'static str) -> anyhow::Result<String> {
+    let v = std::env::var(name).context(name)?;
+    anyhow::ensure!(!v.trim().is_empty(), "{name} is set but empty");
+    Ok(v)
+}
+
 impl Secrets {
     pub fn from_env() -> anyhow::Result<Self> {
-        let chat_id_raw = std::env::var("TELEGRAM_CHAT_ID").context("TELEGRAM_CHAT_ID")?;
+        let chat_id_raw = require_env("TELEGRAM_CHAT_ID")?;
         let telegram_chat_id: i64 = chat_id_raw
             .trim()
             .parse()
@@ -42,8 +52,8 @@ impl Secrets {
         anyhow::ensure!(telegram_chat_id != 0, "TELEGRAM_CHAT_ID must not be 0");
 
         Ok(Self {
-            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY")?,
-            telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN")?,
+            anthropic_api_key: require_env("ANTHROPIC_API_KEY")?,
+            telegram_bot_token: require_env("TELEGRAM_BOT_TOKEN")?,
             telegram_chat_id,
             admin_token: std::env::var("MERVYN_ADMIN_TOKEN")
                 .ok()
