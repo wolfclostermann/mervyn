@@ -1,10 +1,10 @@
 # Mervyn
 
-Personal AI assistant: Slack Events API, Obsidian vault sync into `redb`, scheduled jobs, and Claude. Runs headlessly in Docker (deployment is often an **Oracle Cloud Ampere** ARM64 VPS—see the spec).
+Personal AI assistant: Telegram bot (long polling), Obsidian vault sync into `redb`, scheduled jobs, and Claude. Runs headlessly in Docker (deployment is often an **Oracle Cloud Ampere** ARM64 VPS—see the spec).
 
-See [mervyn_project_spec.md](mervyn_project_spec.md) for architecture, Slack ingest/dedupe pipeline, and implementation notes.
+See [mervyn_project_spec.md](mervyn_project_spec.md) for architecture, the message ingest/dedupe pipeline, and implementation notes.
 
-**Runtime:** On startup, the binary opens `redb`, builds shared [`AppState`](src/state.rs) (config, secrets, Claude + Slack clients, DB, vault path), spawns the **cron scheduler** ([`scheduler/jobs.rs`](src/scheduler/jobs.rs)), and starts a **debounced vault file watcher** ([`vault/watcher.rs`](src/vault/watcher.rs)) so Markdown edits sync to the database without waiting for the periodic vault job.
+**Runtime:** On startup, the binary opens `redb`, builds shared [`AppState`](src/state.rs) (config, secrets, Claude + Telegram clients, DB, vault path), spawns the **cron scheduler** ([`scheduler/jobs.rs`](src/scheduler/jobs.rs)), starts a **debounced vault file watcher** ([`vault/watcher.rs`](src/vault/watcher.rs)) so Markdown edits sync to the database without waiting for the periodic vault job, and starts the **Telegram long-poll loop** ([`telegram/poller.rs`](src/telegram/poller.rs)) alongside the local HTTP server.
 
 **Claude:** The Messages API is called with **`reqwest`** ( **`rustls-tls`**, default features off) and small request/response types in [`claude/client.rs`](src/claude/client.rs). Prompt bodies still use the JSON API — typed structs in [`claude/payloads.rs`](src/claude/payloads.rs) and static copy in [`claude/prompts.rs`](src/claude/prompts.rs). See the spec *Prompt design (JSON API)*.
 
@@ -18,63 +18,52 @@ Mervyn calls the **Claude Messages API** using an API key (no OAuth flow in the 
 
 The default model and token limit are in [`config/default.toml`](config/default.toml) under `[claude]`; you can override with `MERVYN__CLAUDE__MODEL` and `MERVYN__CLAUDE__MAX_TOKENS` if needed.
 
-## Slack app (Events API)
+## Telegram bot
 
-Slack delivers events over HTTPS to **`POST /slack/events`** on your Mervyn host. The app verifies each request with the **signing secret** ([Verifying requests from Slack](https://api.slack.com/authentication/verifying-requests-from-slack)).
+Mervyn talks to Telegram over **long polling**: it calls [`getUpdates`](https://core.telegram.org/bots/api#getupdates) on `api.telegram.org`, waits up to 30s for new messages, and replies with `sendMessage` ([`telegram/client.rs`](src/telegram/client.rs), [`telegram/poller.rs`](src/telegram/poller.rs)). **Every connection is outbound.** There is no webhook, no public endpoint, no tunnel, no reserved domain and no request signature to verify — nothing on the internet needs to reach your host, and the HTTP server stays private.
 
-### 1. Create the app
+> ### ⚠️ The chat allowlist is the only thing keeping the bot private
+>
+> Long polling has no transport-level authentication. Unlike a Slack signing secret, nothing stops a stranger who discovers your bot's username from messaging it, and Telegram will deliver those messages to you. **`TELEGRAM_CHAT_ID`** is an allowlist of **exactly one chat**, checked in [`telegram/handler.rs`](src/telegram/handler.rs) **before** anything is written to the database and **before** any Claude call — so an unknown sender cannot grow your database, spend your Anthropic quota, or see a reply. Unauthorised updates are logged at `warn` and dropped.
+>
+> Consequences worth taking seriously: set the id correctly (a wrong id means the bot answers someone else's chat, not yours), keep **`TELEGRAM_BOT_TOKEN`** secret — it sits in the URL of every API call and anyone holding it controls the bot — and rotate it via [@BotFather](https://t.me/BotFather) if it leaks. A `TELEGRAM_CHAT_ID` of `0` is rejected at startup so an empty or misconfigured value cannot pair with a chat-less update and look like a match.
 
-1. Go to [Your Apps](https://api.slack.com/apps) and choose **Create New App** (from scratch is fine).
-2. Pick your workspace and a name (e.g. Mervyn).
+### 1. Create the bot
 
-### 2. Bot token scopes
+1. Open Telegram — **Desktop, web, iOS or Android, all on one account**; there is no workspace to join or pay for — and start a chat with **[@BotFather](https://t.me/BotFather)**.
+2. Send **`/newbot`** and follow the prompts: a display name, then a username ending in `bot`.
+3. BotFather replies with the **HTTP API token** (`123456789:AA…`). Copy it into `.env` as **`TELEGRAM_BOT_TOKEN`** (see [`.env.example`](.env.example)).
 
-Under **OAuth & Permissions** → **Scopes** → **Bot Token Scopes**, add at least:
+Optional, under `/mybots` → your bot → **Bot Settings**: give it a description, and note **Group Privacy**. It is *on* by default, which means that in a **group** the bot only receives commands and messages that mention it. If you intend to talk to Mervyn in a group rather than in a direct chat, turn Group Privacy **off** so ordinary messages reach it (then re-add the bot to the group for the change to take effect). A direct chat with the bot is unaffected.
 
-| Scope | Why |
-| ----- | --- |
-| `chat:write` | Post briefings, reminders, and replies (`chat.postMessage`) |
-| `channels:history` | Read message text in **public** channels (for `message.channels` events) |
-| `groups:history` | Read message text in **private** channels the bot is in (for `message.groups` events) — **required** if Mervyn lives in a private channel |
-| `app_mentions:read` | Receive `app_mention` events |
+### 2. Get the chat id (`TELEGRAM_CHAT_ID`)
 
-DMs would need `im:history` and `message.im` if you ever wire that; not required for channel use.
+Do this **before** starting Mervyn — two long pollers on the same token compete for updates, so `getUpdates` by hand will steal messages from a running instance (and vice versa).
 
-### 3. Event subscriptions
+1. Open the chat Mervyn should live in — a direct chat with your bot, or a group you added it to — and **send it any message** (`/start` is fine).
+2. Ask Telegram for the pending updates:
 
-1. Under **Event Subscriptions**, turn **Enable Events** on.
-2. Set **Request URL** to `https://<your-public-host>/slack/events` (must be HTTPS and reachable from Slack’s servers). Mervyn includes an **[ngrok](https://ngrok.com/) HTTP tunnel** ([`src/ngrok_tunnel.rs`](src/ngrok_tunnel.rs)): enable it with **`NGROK_AUTHTOKEN`** and **`MERVYN__NGROK__ENABLED=true`** in `.env` (or `[ngrok]` in [`config/default.toml`](config/default.toml)). On startup the process connects to ngrok, forwards to the local server port, and **logs the public URL** and the exact Slack path to use—no separate ngrok agent binary is required. Optional **`MERVYN__NGROK__DOMAIN`** sets a reserved domain on paid ngrok plans. If you prefer not to use it, terminate HTTPS with your own reverse proxy or another tunnel ([Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/), etc.).
-3. Slack will send a URL verification challenge; Mervyn answers it when the route is wired correctly.
-4. Under **Subscribe to bot events**, add:
+   ```bash
+   curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates"
+   ```
 
-   - `message.channels` — ordinary messages in **public** channels the bot is in  
-   - `message.groups` — ordinary messages in **private** channels the bot is in (without this, only `@mentions` reach Mervyn in private channels)  
-   - `app_mention` — when someone `@mentions` the bot  
+3. Read **`result[].message.chat.id`** from the JSON and put it in `.env` as **`TELEGRAM_CHAT_ID`**. It is a plain number: **positive** for a direct chat, **negative** for a group or supergroup. No quotes, no `@username`.
 
-After changing scopes or events, open **OAuth & Permissions** and **Reinstall to Workspace** so the bot token picks up new permissions.
+That same chat is where the **morning briefing** and **due reminders** are posted. Mervyn also sends a short greeting on startup and a goodbye on shutdown, which is the quickest way to confirm the token and the id are both right; `getMe` is called at startup too and logs a warning if the token is bad.
 
-### 4. Install and copy secrets
+### 3. How replies look
 
-1. **Install to Workspace** (still under **OAuth & Permissions**).
-2. Copy **Bot User OAuth Token** (`xoxb-...`) → **`SLACK_BOT_TOKEN`** in `.env`.
-3. Under **Basic Information** → **App Credentials**, copy **Signing Secret** → **`SLACK_SIGNING_SECRET`** in `.env`.
-
-### 5. Channel ID (`SLACK_CHANNEL_ID`)
-
-Scheduled briefings and reminders are posted to a single channel. Invite the bot to that channel, then set **`SLACK_CHANNEL_ID`** to that channel’s ID (from **About** / channel details or the channel URL — public is often `C…`, private is often `G…`). Typical ways to get it:
-
-- In the Slack desktop app: open the channel → channel name → **About** / details, or copy a link to the channel and take the ID from the URL.
-- Or call [`conversations.list`](https://api.slack.com/methods/conversations.list) with your bot token and find the channel.
+Replies are sent as **plain text with no `parse_mode`** — Claude's output is Markdown-ish and appointment reminders embed curly quotes, every one of which MarkdownV2 would demand be escaped. Anything longer than Telegram's **4096-character** limit is split across several messages, breaking on a newline where one is available ([`telegram/client.rs`](src/telegram/client.rs)). The client also honours Telegram's `retry_after` on HTTP 429 (capped at 60s), which matters when a burst of due reminders is posted in one pass.
 
 ## Quick start (dev)
 
-After [Claude](#claude-anthropic) and [Slack](#slack-app-events-api) setup:
+After [Claude](#claude-anthropic) and [Telegram](#telegram-bot) setup:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with all required variables (`ANTHROPIC_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, **`SLACK_CHANNEL_ID`** for briefings and reminder posts). Optional: override `config/default.toml` with `MERVYN__` env vars (see `.env.example`).
+Edit `.env` with all required variables (`ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, **`TELEGRAM_CHAT_ID`** — the allowlisted chat, and where briefings and reminder posts go). Optional: override `config/default.toml` with `MERVYN__` env vars (see `.env.example`).
 
 ```bash
 mkdir -p data/vault
@@ -83,30 +72,30 @@ cargo run
 
 Default listen port comes from `config/default.toml` (`[server] port`, usually **3000**). Health check: `GET http://localhost:3000/health`
 
-Optional **operator** JSON: set `MERVYN_ADMIN_TOKEN` in `.env`, then `GET /admin/slack-ingest` with header `Authorization: Bearer <token>` and query params `limit`, `since_ms`, `until_ms`, `outcome`, `event_id` (see spec).
+Optional **operator** JSON: set `MERVYN_ADMIN_TOKEN` in `.env`, then `GET /admin/message-ingest` with header `Authorization: Bearer <token>` and query params `limit`, `since_ms`, `until_ms`, `outcome`, `event_id` (see spec).
 
-**Slack HTTPS URL:** enable the **built-in ngrok tunnel** with `NGROK_AUTHTOKEN` and `MERVYN__NGROK__ENABLED=true` in `.env`, then run `cargo run`. Logs include the public base URL and `/slack/events` path for [Event subscriptions](#3-event-subscriptions). Optional `MERVYN__NGROK__DOMAIN` for a reserved ngrok hostname.
+**No inbound setup is needed.** The bot works as soon as the token and chat id are right: no tunnel, no reverse proxy, no TLS certificate, no DNS name and no firewall rule for the app port. The HTTP server is there for `/health` and the optional admin route only.
 
 ## Usage
 
-Interaction is the same whether you run with **`cargo run`** or **Docker Compose**: Slack and the vault are the main surfaces; HTTP is for health, Slack delivery, and optional admin.
+Interaction is the same whether you run with **`cargo run`** or **Docker Compose**: Telegram and the vault are the main surfaces; HTTP is only for health and the optional admin route.
 
-### Slack
+### Telegram
 
-1. **Invite the bot** into the public channel you care about (the one whose ID you set as `SLACK_CHANNEL_ID`, and any other channels you want it to read from).
-2. **Send a normal message** in that channel, or **@mention the bot**. In **public** channels that requires `message.channels`; in **private** channels it requires **`message.groups`** plus `groups:history` (see above). Mervyn ignores its own bot messages and most message subtypes.
-3. **Natural language in, structured action out:** your text is sent to Claude for **intent classification**, then one handler runs and Mervyn **replies in Slack** (in the same channel; replies stay in the thread when Slack sends a thread timestamp). If classification fails, the message is treated as a plain **question** (`ask`).
+1. **Open the chat** whose id you set as `TELEGRAM_CHAT_ID` — a direct chat with the bot, or the group you added it to (in a group, see the Group Privacy note above).
+2. **Send a normal message.** Mervyn ignores messages from bots and non-text updates (stickers, photos, service events), and anything from another chat is dropped by the allowlist before it is even recorded.
+3. **Natural language in, structured action out:** your text is sent to Claude for **intent classification**, then one handler runs and Mervyn **replies in the same chat**. If classification fails, the message is treated as a plain **question** (`ask`).
 
 Roughly what each intent does (you do **not** type these labels yourself—describe what you want in ordinary sentences):
 
 | Intent (internal) | What it does |
 | ----------------- | ------------ |
-| **Reminder** | Stores a reminder in `redb`. If the message contains an ISO date `YYYY-MM-DD`, that day is used (default time 09:00 UTC); otherwise due time defaults to about **tomorrow** at 09:00 UTC. Due reminders are **posted to `SLACK_CHANNEL_ID`** on a schedule (see below). |
+| **Reminder** | Stores a reminder in `redb`. If the message contains an ISO date `YYYY-MM-DD`, that day is used (default time 09:00 UTC); otherwise due time defaults to about **tomorrow** at 09:00 UTC. Due reminders are **posted to `TELEGRAM_CHAT_ID`** on a schedule (see below). |
 | **Event** | Saves a calendar-style **event** in `redb` with a default start around **24 hours** ahead; refine times and detail in Obsidian (`events.md`) if needed. |
 | **Work log** | Appends a **worklog** entry with the current UTC timestamp. |
 | **Note** | Parses one or more **todo** lines and stores them in **`redb`** (open until marked done). They appear in **morning briefing** context and **ask** context. For long-form writing you can still use **`data/vault/notes/`** in Obsidian. |
 | **Complete todo** | Loads **open** todos, uses Claude to match your wording (or numeric id) to rows, then sets **`done`** in **`redb`**. |
-| **Ask** | Builds **context** from `redb` plus vault Markdown and asks Claude for an answer, then returns that text in Slack. |
+| **Ask** | Builds **context** from `redb` plus vault Markdown and asks Claude for an answer, then returns that text in Telegram (split into 4096-character messages if it is long). |
 
 ### Obsidian vault (`data/vault`)
 
@@ -116,18 +105,19 @@ Treat **`data/vault`** as the human-readable layer (e.g. synced Obsidian folder)
 
 Schedules and timezone come from [`config/default.toml`](config/default.toml) (`[scheduler]`); override with `MERVYN__SCHEDULER__…` if needed.
 
-- **Morning briefing** — generated from vault + `redb` and **posted to `SLACK_CHANNEL_ID`** (default cron **07:30** in **`Europe/London`**).
-- **Reminder check** — runs **every minute**; posts due reminders to **`SLACK_CHANNEL_ID`** and advances or completes them.
+- **Morning briefing** — generated from vault + `redb` and **posted to `TELEGRAM_CHAT_ID`** (default cron **07:30** in **`Europe/London`**).
+- **Reminder check** — runs **every minute**; posts due reminders to **`TELEGRAM_CHAT_ID`** and advances or completes them.
 - **Vault sync** — periodic import from Markdown into `redb` (default **every five minutes**), in addition to the live watcher.
-- **Slack ingest maintenance** — prunes old ingest rows and sweeps stuck “pending” deliveries (housekeeping, not user-facing).
+- **Message ingest maintenance** — prunes old `message_ingest` rows and sweeps stuck “pending” deliveries (housekeeping, not user-facing).
 
 ### HTTP endpoints
+
+The server binds locally so the process has a liveness probe and a clean shutdown path. Telegram is reached by **outbound** long polling, so neither route needs to be published to the internet.
 
 | Method / path | Purpose |
 | ------------- | ------- |
 | `GET /health` | Liveness; responds with `ok`. |
-| `POST /slack/events` | Slack Events API (signing secret verification, URL challenge, event callbacks). |
-| `GET /admin/slack-ingest` | Optional: JSON view of ingest log when `MERVYN_ADMIN_TOKEN` is set (Bearer auth). |
+| `GET /admin/message-ingest` | Optional: JSON view of the ingest log when `MERVYN_ADMIN_TOKEN` is set (Bearer auth). Not registered at all when the token is unset. |
 
 ## Docker Compose
 
@@ -135,7 +125,7 @@ Compose loads secrets and optional `MERVYN__*` overrides from a **`.env` file ne
 
 **Before first run**
 
-1. **`.env`** — populated with real `ANTHROPIC_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and `SLACK_CHANNEL_ID` (and any optional keys from `.env.example`). Compose injects these into the container; there is no separate “Docker secrets” step unless you choose to add one yourself.
+1. **`.env`** — populated with real `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` (and any optional keys from `.env.example`). Compose injects these into the container; there is no separate “Docker secrets” step unless you choose to add one yourself.
 2. **`data/`** — create the vault directory on the host so the bind mount exists and is writable:
 
    ```bash
@@ -146,7 +136,7 @@ Compose loads secrets and optional `MERVYN__*` overrides from a **`.env` file ne
 
 **Already in the image** — [`config/default.toml`](config/default.toml) is copied into the image at build time (`Dockerfile`), so you do not need to mount `config/` for a default run. Override behaviour with `MERVYN__…` environment variables in `.env` if you need different ports, paths, or schedules.
 
-**Slack** — Prefer the **built-in ngrok tunnel**: set `NGROK_AUTHTOKEN` and `MERVYN__NGROK__ENABLED=true` in the same `.env` Compose loads; Mervyn inside the container opens the tunnel to its HTTP port, so Slack uses ngrok’s HTTPS URL and you **do not** need a separate tunnel binary or inbound firewall rules to the app port on a cloud host. Check logs for the Request URL. **Host port:** the default [`docker-compose.yml`](docker-compose.yml) does **not** publish port **3000**; for `curl` / browser on your machine use [`docker-compose.local.yml`](docker-compose.local.yml): `docker compose -f docker-compose.yml -f docker-compose.local.yml up --build`. If `[ngrok]` stays off, use that override or another reverse proxy so Slack can reach the server.
+**Networking** — the container needs **outbound HTTPS only** (`api.telegram.org` and `api.anthropic.com`). Nothing connects in, so no inbound firewall rule, published port, tunnel or TLS termination is required for the bot to work. Accordingly the default [`docker-compose.yml`](docker-compose.yml) does **not** publish port **3000**; if you want `curl` / browser access to `/health` from your machine, use [`docker-compose.local.yml`](docker-compose.local.yml), which binds it to `127.0.0.1` only: `docker compose -f docker-compose.yml -f docker-compose.local.yml up --build`.
 
 ```bash
 docker compose up --build

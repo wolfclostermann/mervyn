@@ -59,7 +59,7 @@ variable "app_port_cidrs" {
 
 variable "http_cidrs" {
   type        = list(string)
-  description = "CIDRs allowed on TCP 80/443 (Slack, Let's Encrypt, browsers)."
+  description = "CIDRs allowed on TCP 80/443. Mervyn serves nothing publicly (it reaches Telegram by outbound long polling), so this is only for a web service you add yourself, e.g. Let's Encrypt HTTP-01."
   default     = ["0.0.0.0/0"]
 }
 

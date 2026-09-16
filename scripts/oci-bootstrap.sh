@@ -677,5 +677,5 @@ else
   echo "  Public IP:  $PUBLIC_IP"
   echo "  SSH:        ssh ${SSH_USER_HINT}@$PUBLIC_IP"
   echo ""
-  echo "Next: ./scripts/deploy-oci.sh ${SSH_USER_HINT}@$PUBLIC_IP   # or copy repo + .env manually; TLS on 443 for Slack (README)."
+  echo "Next: ./scripts/deploy-oci.sh ${SSH_USER_HINT}@$PUBLIC_IP   # or copy repo + .env manually; no inbound ports needed (README)."
 fi
