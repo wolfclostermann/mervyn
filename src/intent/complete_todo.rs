@@ -266,7 +266,7 @@ mod tests {
         assert!(try_ids_from_strict_list_command("7, 99 done", &list).is_none());
     }
 
-    /// Slack / ask replies often number lines by database id; "15" can exceed checklist length.
+    /// Chat / ask replies often number lines by database id; "15" can exceed checklist length.
     #[test]
     fn strict_list_command_resolves_db_ids_when_any_token_exceeds_list_len() {
         let list = vec![

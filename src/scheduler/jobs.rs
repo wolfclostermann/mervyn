@@ -138,10 +138,10 @@ async fn run_message_ingest_prune(state: &AppState) -> anyhow::Result<()> {
         tracing::info!(
             removed_by_age = report.removed_by_age,
             removed_by_cap = report.removed_by_cap,
-            "slack_ingest pruned"
+            "message_ingest pruned"
         );
     } else {
-        tracing::debug!("slack_ingest prune: nothing to remove");
+        tracing::debug!("message_ingest prune: nothing to remove");
     }
 
     let sweep = message_ingest::sweep_stale_pending(
@@ -151,7 +151,7 @@ async fn run_message_ingest_prune(state: &AppState) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     if sweep.rewound > 0 {
-        tracing::info!(rewound = sweep.rewound, "slack_ingest stale Pending swept");
+        tracing::info!(rewound = sweep.rewound, "message_ingest stale Pending swept");
     }
 
     Ok(())
@@ -213,7 +213,7 @@ pub async fn spawn_scheduler(state: AppState) -> anyhow::Result<()> {
             let st = st.clone();
             Box::pin(async move {
                 if let Err(e) = run_message_ingest_prune(&st).await {
-                    tracing::error!(error = %e, "slack_ingest_prune job");
+                    tracing::error!(error = %e, "message_ingest_prune job");
                 }
             })
         })?)

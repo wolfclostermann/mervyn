@@ -76,7 +76,7 @@ pub async fn list_message_ingest(
         return StatusCode::NOT_FOUND.into_response();
     };
     if !bearer_token_ok(token, &headers) {
-        tracing::debug!("admin slack-ingest: unauthorized");
+        tracing::debug!("admin message-ingest: unauthorized");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -90,12 +90,12 @@ pub async fn list_message_ingest(
     let rows = match message_ingest::list_recent(state.db.as_ref(), filters, q.limit) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "admin slack-ingest list");
+            tracing::warn!(error = %e, "admin message-ingest list");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
-    tracing::debug!(count = rows.len(), "admin slack-ingest list");
+    tracing::debug!(count = rows.len(), "admin message-ingest list");
 
     let body: Vec<MessageIngestRowJson> = rows
         .into_iter()

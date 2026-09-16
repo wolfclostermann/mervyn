@@ -1,4 +1,4 @@
-//! Persist a Slack request into the worklog with a tag consumed by the morning briefing assembler.
+//! Persist a chat request into the worklog with a tag consumed by the morning briefing assembler.
 
 use chrono::Utc;
 
