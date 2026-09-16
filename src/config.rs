@@ -17,6 +17,11 @@ pub struct AppConfig {
     /// Optional scheduled `git pull` for a worklog (or vault) repo while Mervyn is running.
     #[serde(default)]
     pub worklog_git: WorklogGitSection,
+    /// Read in phase 1 of `docs/two-way-vault-sync.md`; parsed now so the setting can be present
+    /// in deployed configs before the code that honours it exists.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub vault: VaultSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +79,35 @@ pub struct StorageSection {
 
 fn default_message_ingest_stale_pending_minutes() -> u32 {
     30
+}
+
+fn default_backup_before_first_write() -> bool {
+    true
+}
+
+/// Vault write-back: the db → Markdown direction of sync. See `docs/two-way-vault-sync.md`.
+///
+/// Off by default, and deliberately so — every phase of the work ships dark, is verified from
+/// the logs against the real vault, and is only then enabled. Nothing here affects the
+/// long-standing Markdown → db direction, which always runs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultSection {
+    /// Allow Mervyn to modify files under `storage.vault_path`. `false` = read-only, as today.
+    #[serde(default)]
+    pub write_back_enabled: bool,
+    /// Copy the managed files to a timestamped sibling directory before the first write of a run.
+    #[serde(default = "default_backup_before_first_write")]
+    pub backup_before_first_write: bool,
+}
+
+impl Default for VaultSection {
+    fn default() -> Self {
+        Self {
+            write_back_enabled: false,
+            backup_before_first_write: default_backup_before_first_write(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

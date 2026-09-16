@@ -12,28 +12,61 @@ use serde_yaml::Value as YamlValue;
 
 use crate::storage::{Event, Recurrence, Reminder, WorklogEntry};
 
-/// Obsidian/Jekyll-style YAML block at the top of a file. Tolerant: unclosed fence → whole `raw` is the body.
-/// Closing line may be `---` or `...`. BOM is skipped. Invalid YAML still yields a stripped body; `meta` is `None`.
-pub fn strip_yaml_front_matter(raw: &str) -> (Option<YamlValue>, Cow<'_, str>) {
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let s = raw.trim_start();
+/// Obsidian/Jekyll-style YAML block at the top of a file, as `(parsed, body_offset)` where
+/// `body_offset` is a **byte offset into `raw`** — `&raw[body_offset..]` is the Markdown body.
+/// Returning an offset rather than an owned string is what lets write-back map a parsed item's
+/// span back onto a real position in the file; joining lines would also silently normalise CRLF.
+///
+/// Tolerant: unclosed fence → the whole file is the body. Closing line may be `---` or `...`.
+/// A BOM is skipped. Invalid YAML still yields a stripped body, with `None` for the metadata.
+pub fn front_matter(raw: &str) -> (Option<YamlValue>, usize) {
+    let bom_len = if raw.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let after_bom = &raw[bom_len..];
+    let start = bom_len + (after_bom.len() - after_bom.trim_start().len());
+    let s = &raw[start..];
     if !s.starts_with("---") {
-        return (None, Cow::Borrowed(raw));
+        return (None, bom_len);
     }
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.is_empty() || lines[0].trim() != "---" {
-        return (None, Cow::Borrowed(raw));
-    }
-    for i in 1..lines.len() {
-        let t = lines[i].trim();
-        if t == "---" || t == "..." {
-            let yaml_block = lines[1..i].join("\n");
-            let body = lines[i + 1..].join("\n");
-            let meta = serde_yaml::from_str(&yaml_block).ok();
-            return (meta, Cow::Owned(body));
+
+    let mut cursor = 0usize;
+    let mut yaml_start: Option<usize> = None;
+    loop {
+        let line_end = s[cursor..].find('\n').map_or(s.len(), |i| cursor + i);
+        let line = s[cursor..line_end].trim_end_matches('\r');
+        let next = if line_end < s.len() { line_end + 1 } else { s.len() };
+
+        match yaml_start {
+            // The opening fence has to be a bare `---` on its own line.
+            None => {
+                if line.trim() != "---" {
+                    return (None, bom_len);
+                }
+                yaml_start = Some(next);
+            }
+            Some(ys) => {
+                let t = line.trim();
+                if t == "---" || t == "..." {
+                    let meta = serde_yaml::from_str(&s[ys..cursor]).ok();
+                    return (meta, start + next);
+                }
+            }
         }
+
+        if line_end == s.len() {
+            return (None, bom_len);
+        }
+        cursor = next;
     }
-    (None, Cow::Borrowed(raw))
+}
+
+/// [`front_matter`] as a borrowed body slice, for callers that do not need offsets.
+pub fn strip_yaml_front_matter(raw: &str) -> (Option<YamlValue>, Cow<'_, str>) {
+    let (meta, offset) = front_matter(raw);
+    (meta, Cow::Borrowed(&raw[offset..]))
 }
 
 fn markdown_body(raw: &str) -> Cow<'_, str> {
@@ -369,6 +402,59 @@ pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn front_matter_offset_points_at_body_and_keeps_crlf() {
+        let raw = "---\r\ntitle: Reminders\r\n---\r\n- [ ] Do thing\r\n";
+        let (meta, off) = front_matter(raw);
+        assert_eq!(
+            meta.as_ref().unwrap()["title"],
+            serde_yaml::Value::String("Reminders".into())
+        );
+        // The body is a slice of the original bytes, so CRLF survives the round trip.
+        assert_eq!(&raw[off..], "- [ ] Do thing\r\n");
+    }
+
+    #[test]
+    fn front_matter_absent_leaves_whole_file_as_body() {
+        let raw = "# Reminders\n\n- [ ] Do thing\n";
+        let (meta, off) = front_matter(raw);
+        assert!(meta.is_none());
+        assert_eq!(off, 0);
+        assert_eq!(&raw[off..], raw);
+    }
+
+    #[test]
+    fn front_matter_bom_is_skipped_but_body_offset_stays_valid() {
+        let raw = "\u{feff}---\ntitle: x\n---\nbody\n";
+        let (meta, off) = front_matter(raw);
+        assert!(meta.is_some());
+        assert_eq!(&raw[off..], "body\n");
+    }
+
+    #[test]
+    fn front_matter_unclosed_fence_is_all_body() {
+        let raw = "---\ntitle: x\nno closing fence\n";
+        let (meta, off) = front_matter(raw);
+        assert!(meta.is_none());
+        assert_eq!(&raw[off..], raw);
+    }
+
+    #[test]
+    fn front_matter_dots_close_the_block() {
+        let raw = "---\ntitle: x\n...\nbody\n";
+        let (meta, off) = front_matter(raw);
+        assert!(meta.is_some());
+        assert_eq!(&raw[off..], "body\n");
+    }
+
+    #[test]
+    fn front_matter_invalid_yaml_still_strips_the_block() {
+        let raw = "---\n: : not yaml : :\n---\nbody\n";
+        let (meta, off) = front_matter(raw);
+        assert!(meta.is_none(), "invalid YAML parses to None");
+        assert_eq!(&raw[off..], "body\n", "but the block is still stripped");
+    }
 
     #[test]
     fn reminders_skip_yaml_front_matter() {

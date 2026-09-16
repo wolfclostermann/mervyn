@@ -59,13 +59,18 @@ async fn main() -> anyhow::Result<()> {
         claude,
         telegram,
         vault_path: vault_path.to_path_buf(),
+        vault: Arc::new(vault::write::VaultAccess::new()),
     };
 
     scheduler::spawn_scheduler(app_state.clone())
         .await
         .context("start scheduler")?;
 
-    vault::watcher::spawn_vault_watcher(app_state.db.clone(), app_state.vault_path.clone());
+    vault::watcher::spawn_vault_watcher(
+        app_state.db.clone(),
+        app_state.vault_path.clone(),
+        app_state.vault.clone(),
+    );
 
     if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {
         tracing::error!(error = %e, "worklog git pull on startup");

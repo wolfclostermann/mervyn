@@ -34,7 +34,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AppConfig, ClaudeSection, SchedulerSection, ServerSection, StorageSection,
-        UserContextSection, WorklogGitSection,
+        UserContextSection, VaultSection, WorklogGitSection,
     };
 
     fn cfg_with_vault(dir: &std::path::Path, file_body: &str) -> AppConfig {
@@ -69,6 +69,7 @@ mod tests {
                 situation_max_chars: 5000,
             },
             worklog_git: WorklogGitSection::default(),
+            vault: VaultSection::default(),
         }
     }
 

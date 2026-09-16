@@ -45,3 +45,11 @@ repo_path = "../mervyn-worklog"
 remote = "origin"
 branch = "main"
 pull_cron = "0 */5 * * * *"
+
+# db → Markdown write-back (see docs/two-way-vault-sync.md). Off by default: each phase of the
+# two-way work ships dark and is verified from the logs before it is allowed to touch the vault.
+# Markdown → db sync is unaffected and always runs. Enable with MERVYN__VAULT__WRITE_BACK_ENABLED=true.
+[vault]
+write_back_enabled = false
+# Copy the managed files to a timestamped sibling of the vault before the first write of a run.
+backup_before_first_write = true

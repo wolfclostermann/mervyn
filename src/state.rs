@@ -7,6 +7,7 @@ use redb::Database;
 use crate::claude::client::ClaudeClient;
 use crate::config::AppConfig;
 use crate::telegram::client::TelegramClient;
+use crate::vault::write::VaultAccess;
 
 #[derive(Clone)]
 pub struct Secrets {
@@ -71,6 +72,9 @@ pub struct AppState {
     pub claude: Arc<ClaudeClient>,
     pub telegram: Arc<TelegramClient>,
     pub vault_path: PathBuf,
+    /// Serialises vault reconcile cycles and suppresses the watcher's echo of Mervyn's own
+    /// writes. Shared, not cloned: every task must contend for the same lock.
+    pub vault: Arc<VaultAccess>,
 }
 
 #[cfg(test)]
