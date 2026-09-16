@@ -24,6 +24,8 @@ pub const SUPPLEMENT_INTENT_CLASSIFICATION: &str = r#"The user's message is one 
 
 Classify message into exactly one intent: add_reminder, add_event, log_work, add_note, remove_event, complete_todo, remember_briefing, ask.
 
+Use add_event for anything that belongs on the calendar at a specific date and time. This includes forwarded confirmations and appointment texts written in the third person (e.g. "Your appointment is confirmed for Tue 23 Sep at 08:30", "Your booking reference is..."). Treat those as a request to add the event, not as a question to answer or a note to file.
+Use add_reminder when they want a nudge at a time rather than an entry on the calendar.
 Use remove_event when the user wants to delete, remove, or cancel calendar events in Mervyn's database, or clean up duplicates and keep specific dates.
 Use complete_todo when they want to mark one or more **open todos** as done (finished, ticked off, "did the plumber", "mark todo 3 complete", "clear the gardener one", etc.).
 Use remember_briefing when they want something called out in the next morning briefing (progress update, reminder to mention a topic, "include this tomorrow", etc.).

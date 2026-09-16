@@ -346,7 +346,11 @@ fn format_events(events: &[crate::storage::Event]) -> String {
                 .unwrap_or_default()
         ));
         if let Some(desc) = &e.description {
-            s.push_str(&format!("  {desc}\n"));
+            // Descriptions may be multi-line (a forwarded confirmation, say); indent every line
+            // so continuation lines cannot read as top-level context in the prompt.
+            for line in desc.lines() {
+                s.push_str(&format!("  {line}\n"));
+            }
         }
         if !e.tags.is_empty() {
             s.push_str(&format!("  tags: {}\n", e.tags.join(", ")));
