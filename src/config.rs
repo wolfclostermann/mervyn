@@ -17,9 +17,6 @@ pub struct AppConfig {
     /// Optional scheduled `git pull` for a worklog (or vault) repo while Mervyn is running.
     #[serde(default)]
     pub worklog_git: WorklogGitSection,
-    /// Read in phase 1 of `docs/two-way-vault-sync.md`; parsed now so the setting can be present
-    /// in deployed configs before the code that honours it exists.
-    #[allow(dead_code)]
     #[serde(default)]
     pub vault: VaultSection,
 }
@@ -90,7 +87,6 @@ fn default_backup_before_first_write() -> bool {
 /// Off by default, and deliberately so — every phase of the work ships dark, is verified from
 /// the logs against the real vault, and is only then enabled. Nothing here affects the
 /// long-standing Markdown → db direction, which always runs.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct VaultSection {
     /// Allow Mervyn to modify files under `storage.vault_path`. `false` = read-only, as today.

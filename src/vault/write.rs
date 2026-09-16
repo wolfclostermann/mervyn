@@ -178,6 +178,20 @@ impl VaultAccess {
     }
 }
 
+/// Apply insertions to `raw`, returning the new text. Each edit is `(byte offset, text)`.
+///
+/// Applied back to front so that earlier offsets stay valid — the whole reason write-back splices
+/// into the original bytes instead of re-rendering the file is that everything the parser does not
+/// model (prose, bold, callouts, blank-line layout, front matter) has to survive untouched.
+pub fn splice(raw: &str, edits: &mut [(usize, String)]) -> String {
+    edits.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = raw.to_string();
+    for (at, text) in edits.iter() {
+        out.insert_str(*at, text);
+    }
+    out
+}
+
 /// The path a write should actually land on: the symlink's target if `path` is a link.
 fn resolve_write_target(path: &Path) -> io::Result<PathBuf> {
     let Ok(meta) = path.symlink_metadata() else {
@@ -204,6 +218,27 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::tempdir;
+
+    #[test]
+    fn splice_applies_every_edit_at_the_offset_it_was_measured_at() {
+        let raw = "- [ ] one\n- [ ] two\n";
+        let mut edits = vec![(9, " A".to_string()), (19, " B".to_string())];
+        assert_eq!(splice(raw, &mut edits), "- [ ] one A\n- [ ] two B\n");
+    }
+
+    #[test]
+    fn splice_is_order_independent() {
+        let raw = "abcdef";
+        let mut forwards = vec![(1, "1".to_string()), (4, "4".to_string())];
+        let mut backwards = vec![(4, "4".to_string()), (1, "1".to_string())];
+        assert_eq!(splice(raw, &mut forwards), splice(raw, &mut backwards));
+    }
+
+    #[test]
+    fn splice_with_no_edits_returns_the_original_bytes() {
+        let raw = "---\ntitle: x\n---\n\n## 2026-04-05 — **Gig**\n\n> callout\n";
+        assert_eq!(splice(raw, &mut []), raw);
+    }
 
     #[test]
     fn write_file_replaces_contents_and_leaves_no_temp_files() {

@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         app_state.db.clone(),
         app_state.vault_path.clone(),
         app_state.vault.clone(),
+        app_state.write_back_policy(),
     );
 
     if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {

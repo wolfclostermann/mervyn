@@ -14,13 +14,19 @@ use crate::storage::message_ingest;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio::process::Command;
 
+/// One vault cycle. Synchronous on purpose: it takes the vault lock internally, so it must not
+/// be held across an await — calling it as a plain expression keeps that impossible.
+fn sync_vault(state: &AppState) -> anyhow::Result<crate::vault::sync::SyncStats> {
+    crate::vault::sync::sync_vault_to_db(
+        state.db.as_ref(),
+        &state.vault_path,
+        state.vault.as_ref(),
+        state.write_back_policy(),
+    )
+}
+
 async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
-    // Scoped so the vault guard is released before the first await: a std guard held across
-    // one would make this future non-Send.
-    let stats = {
-        let _guard = state.vault.lock();
-        crate::vault::sync::sync_vault_to_db(state.db.as_ref(), &state.vault_path)
-    }?;
+    let stats = sync_vault(state)?;
     tracing::info!(?stats, "vault synced before morning briefing");
 
     let now = Utc::now();
@@ -68,10 +74,7 @@ async fn run_reminder_check(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn run_vault_sync(state: &AppState) -> anyhow::Result<()> {
-    let s = {
-        let _guard = state.vault.lock();
-        crate::vault::sync::sync_vault_to_db(state.db.as_ref(), &state.vault_path)
-    }?;
+    let s = sync_vault(state)?;
     tracing::debug!(?s, "scheduled vault sync");
     Ok(())
 }
@@ -128,10 +131,7 @@ pub async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
 
     tracing::info!(repo, remote = %cfg.remote, branch = %cfg.branch, "worklog git pull ok");
 
-    let s = {
-        let _guard = state.vault.lock();
-        crate::vault::sync::sync_vault_to_db(state.db.as_ref(), &state.vault_path)
-    }?;
+    let s = sync_vault(state)?;
     tracing::debug!(?s, "vault synced after worklog git pull");
     Ok(())
 }

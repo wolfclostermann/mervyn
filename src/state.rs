@@ -7,6 +7,7 @@ use redb::Database;
 use crate::claude::client::ClaudeClient;
 use crate::config::AppConfig;
 use crate::telegram::client::TelegramClient;
+use crate::vault::sync::WriteBackPolicy;
 use crate::vault::write::VaultAccess;
 
 #[derive(Clone)]
@@ -75,6 +76,16 @@ pub struct AppState {
     /// Serialises vault reconcile cycles and suppresses the watcher's echo of Mervyn's own
     /// writes. Shared, not cloned: every task must contend for the same lock.
     pub vault: Arc<VaultAccess>,
+}
+
+impl AppState {
+    /// Whether this process may write to the vault, from `[vault]` in the config.
+    pub fn write_back_policy(&self) -> WriteBackPolicy {
+        WriteBackPolicy {
+            enabled: self.settings.vault.write_back_enabled,
+            backup_before_first_write: self.settings.vault.backup_before_first_write,
+        }
+    }
 }
 
 #[cfg(test)]

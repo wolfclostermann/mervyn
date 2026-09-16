@@ -120,13 +120,23 @@ into it puts unstaged changes in that working tree, and `git pull --ff-only` in
 separate project. The pull is disabled at the moment, so the breakage is latent rather than
 visible — which is exactly why it is written down here. Chat `log_work` entries stay database-only.
 
-### 6. `todos.md` is the easy win
+### 6. Rendering waits for the timezone question
+
+Canonical renderers (`Reminder` → `- [ ] … — due …`) were planned for phase 1 and deferred to
+phase 2, because the grammar cannot yet express what a chat-created row holds. `— due 2026-04-10`
+parses to **noon UTC**; a reminder added from chat is due at, say, 09:00 local. Rendering it
+date-only and re-reading it would silently move it. So phase 2 has to settle two things together:
+an optional `HH:MM` in the grammar, and whether vault times are written in UTC or in
+`scheduler.timezone` — which is audit item 5, the timezone split, arriving from the other
+direction. Phase 1 therefore writes markers and nothing else.
+
+### 7. `todos.md` is the easy win
 
 Todos have no vault file at all and no legacy parser. A fresh `todos.md` of `- [ ] …` lines is the
 most Obsidian-native surface here, and both directions are obvious: tick in Obsidian →
 `todos::mark_done`; `complete_todo` in chat → the checkbox flips in the file.
 
-### 7. The assembler will double-count
+### 8. The assembler will double-count
 
 `build_query_context` feeds Claude *both* the database rows and the raw `events.md` /
 `worklog.md` text. Once the database is mirrored into the vault those are the same items — token
@@ -139,9 +149,9 @@ from the query context. This is part of the work, not a follow-up.
 
 | Phase | Content | Risk |
 |---|---|---|
-| **0** | Span-preserving front-matter strip; vault lock; atomic-write helper; self-write suppression; `[vault] write_back_enabled = false`; one-shot backup | None — no writes yet |
-| **1** | Marker grammar, canonical renderers, `into_offset_iter` parsing, marker back-fill write. **Fixes the orphan-on-edit bug on its own.** | First writes to the vault; deploy dark, verify in logs, then enable |
-| **2** | db → md: chat-created events / reminders / todos appear; `remove_event` strips lines; reminder firing ticks boxes; `todos.md` introduced | Medium |
+| **0** ✅ | Span-preserving front-matter strip; vault lock; atomic-write helper; self-write suppression; `[vault] write_back_enabled = false`; one-shot backup | None — no writes yet |
+| **1** ✅ | Marker grammar, `into_offset_iter` parsing, marker back-fill write. **Fixes the orphan-on-edit bug on its own.** | First writes to the vault; deploy dark, verify in logs, then enable |
+| **2** | Canonical renderers; db → md: chat-created events / reminders / todos appear; `remove_event` strips lines; reminder firing ticks boxes; `todos.md` introduced | Medium |
 | **3** | md → db deletes with tombstones; `vault_sync_state` three-way merge | Medium |
 | **4** | Assembler dedupe; README "Obsidian vault", spec, and the handoff's "Obsidian is an input, never a view" paragraph; close audit item 4 | Low |
 

@@ -4,12 +4,14 @@
 
 use std::borrow::Cow;
 use std::hash::Hasher;
+use std::ops::Range;
 
 use chrono::{NaiveDate, Utc};
 use fnv::FnvHasher;
 use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde_yaml::Value as YamlValue;
 
+use super::marker;
 use crate::storage::{Event, Recurrence, Reminder, WorklogEntry};
 
 /// Obsidian/Jekyll-style YAML block at the top of a file, as `(parsed, body_offset)` where
@@ -64,14 +66,10 @@ pub fn front_matter(raw: &str) -> (Option<YamlValue>, usize) {
 }
 
 /// [`front_matter`] as a borrowed body slice, for callers that do not need offsets.
+#[allow(dead_code)] // Read-only convenience; the sync path wants the offset.
 pub fn strip_yaml_front_matter(raw: &str) -> (Option<YamlValue>, Cow<'_, str>) {
     let (meta, offset) = front_matter(raw);
     (meta, Cow::Borrowed(&raw[offset..]))
-}
-
-fn markdown_body(raw: &str) -> Cow<'_, str> {
-    let (_meta, body) = strip_yaml_front_matter(raw);
-    body
 }
 
 /// FNV-1a 64-bit — stable across Rust versions for vault-derived primary keys.
@@ -114,11 +112,76 @@ fn parse_reminder_body(s: &str) -> (String, Option<NaiveDate>, Option<Recurrence
     (body, due, recurrence)
 }
 
+/// A markdown event paired with its byte range **in the raw file** — front matter included, so a
+/// range can be spliced back into the bytes on disk without any further bookkeeping.
+type Ev<'a> = (MdEvent<'a>, Range<usize>);
+
+/// An item as found in a file: the parsed row, plus what write-back needs to know about its id.
+///
+/// `item.id` comes from the line's marker when it has one. That is the whole point of the marker:
+/// an edited line keeps its identity, where the hash fallback would mint a new id and orphan the
+/// row it came from.
+#[derive(Debug, Clone)]
+pub struct FoundItem<T> {
+    pub item: T,
+    /// False when the id was derived from [`stable_vault_row_id`] because the line carried no
+    /// marker — i.e. this item is a candidate for marker back-fill.
+    pub had_marker: bool,
+    /// Byte offset in the raw file at which the marker should be spliced when it is missing.
+    pub marker_at: usize,
+    /// Written before the marker: a space for a list item, a newline for an event heading (whose
+    /// marker lives on its own line underneath).
+    pub marker_sep: &'static str,
+}
+
+impl<T> FoundItem<T> {
+    /// The text to splice at [`marker_at`](Self::marker_at), or `None` if already marked.
+    pub fn backfill(&self, id: u64) -> Option<(usize, String)> {
+        (!self.had_marker).then(|| (self.marker_at, format!("{}{}", self.marker_sep, marker::render(id))))
+    }
+}
+
+fn spanned_events(raw: &str, options: Options) -> Vec<Ev<'_>> {
+    let (_meta, body_offset) = front_matter(raw);
+    Parser::new_ext(&raw[body_offset..], options)
+        .into_offset_iter()
+        .map(|(e, r)| (e, (r.start + body_offset)..(r.end + body_offset)))
+        .collect()
+}
+
+/// End of the first line of `range`, *before* any line terminator — the point a trailing marker
+/// is spliced at. CRLF is handled explicitly: inserting between the `\r` and the `\n` would put
+/// the marker on a line of its own and leave a stray carriage return behind it.
+fn first_line_end(raw: &str, range: &Range<usize>) -> usize {
+    let end = match raw[range.start..range.end].find('\n') {
+        Some(i) => range.start + i,
+        None => range.end,
+    };
+    if raw[range.start..end].ends_with('\r') {
+        end - 1
+    } else {
+        end
+    }
+}
+
+/// The line following `line_end`, if there is one, as `(content, end)`.
+fn next_line(raw: &str, line_end: usize) -> Option<(&str, usize)> {
+    let start = match raw[line_end..].find('\n') {
+        Some(i) => line_end + i + 1,
+        None => return None,
+    };
+    if start >= raw.len() {
+        return None;
+    }
+    let end = raw[start..].find('\n').map_or(raw.len(), |i| start + i);
+    Some((raw[start..end].trim_end_matches('\r'), end))
+}
+
 /// Walk events until `end` is true; does not consume the matching event. Always advances on other events.
-fn collect_plain_until(events: &[MdEvent<'_>], i: &mut usize, mut end: impl FnMut(&MdEvent<'_>) -> bool) -> String {
+fn collect_plain_until(events: &[Ev<'_>], i: &mut usize, mut end: impl FnMut(&MdEvent<'_>) -> bool) -> String {
     let mut s = String::new();
-    while *i < events.len() && !end(&events[*i]) {
-        match &events[*i] {
+    while *i < events.len() && !end(&events[*i].0) {
+        match &events[*i].0 {
             MdEvent::Text(t) => s.push_str(t),
             MdEvent::Code(c) => s.push_str(c),
             MdEvent::SoftBreak => s.push(' '),
@@ -130,8 +193,8 @@ fn collect_plain_until(events: &[MdEvent<'_>], i: &mut usize, mut end: impl FnMu
     s
 }
 
-fn consume_if(events: &[MdEvent<'_>], i: &mut usize, pred: impl FnOnce(&MdEvent<'_>) -> bool) {
-    if *i < events.len() && pred(&events[*i]) {
+fn consume_if(events: &[Ev<'_>], i: &mut usize, pred: impl FnOnce(&MdEvent<'_>) -> bool) {
+    if *i < events.len() && pred(&events[*i].0) {
         *i += 1;
     }
 }
@@ -146,19 +209,18 @@ fn is_h2_start(ev: &MdEvent<'_>) -> bool {
     )
 }
 
-/// GitHub-style task list items → [`Reminder`].
-pub fn parse_reminders(text: &str) -> Vec<Reminder> {
-    let body = markdown_body(text);
-    let events: Vec<MdEvent<'_>> =
-        Parser::new_ext(body.as_ref(), Options::ENABLE_TASKLISTS).collect();
+/// GitHub-style task list items → [`Reminder`], with the position of each id marker.
+pub fn find_reminders(raw: &str) -> Vec<FoundItem<Reminder>> {
+    let events = spanned_events(raw, Options::ENABLE_TASKLISTS);
     let mut i = 0;
     let mut out = Vec::new();
 
     while i < events.len() {
-        if matches!(events[i], MdEvent::Start(Tag::Item)) {
+        if matches!(events[i].0, MdEvent::Start(Tag::Item)) {
+            let item_range = events[i].1.clone();
             i += 1;
             let done = if i < events.len() {
-                if let MdEvent::TaskListMarker(checked) = events[i] {
+                if let MdEvent::TaskListMarker(checked) = events[i].0 {
                     i += 1;
                     Some(checked)
                 } else {
@@ -169,24 +231,31 @@ pub fn parse_reminders(text: &str) -> Vec<Reminder> {
             };
 
             if let Some(done) = done {
-                let raw = collect_plain_until(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
+                let text = collect_plain_until(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
                 consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
-                let (body, due, recurrence) = parse_reminder_body(raw.trim());
+                let (body, due, recurrence) = parse_reminder_body(text.trim());
                 let due = match due {
                     Some(d) => date_at_noon_utc(d),
                     None => Utc::now(),
                 };
-                let norm = format!("{body}|{due}|{done}");
-                let id = stable_vault_row_id(b"rem:", &norm);
-                out.push(Reminder {
-                    id,
-                    body,
-                    due,
-                    recurrence,
-                    done,
+
+                // Only the item's own first line: a marker further down belongs to a nested item.
+                let line_end = first_line_end(raw, &item_range);
+                let found = marker::find(&raw[item_range.start..line_end]);
+                let had_marker = found.is_some();
+                let id = found.map_or_else(
+                    || stable_vault_row_id(b"rem:", &format!("{body}|{due}|{done}")),
+                    |f| f.id,
+                );
+
+                out.push(FoundItem {
+                    item: Reminder { id, body, due, recurrence, done },
+                    had_marker,
+                    marker_at: line_end,
+                    marker_sep: " ",
                 });
             } else {
-                while i < events.len() && !matches!(events[i], MdEvent::End(TagEnd::Item)) {
+                while i < events.len() && !matches!(events[i].0, MdEvent::End(TagEnd::Item)) {
                     i += 1;
                 }
                 consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
@@ -199,14 +268,20 @@ pub fn parse_reminders(text: &str) -> Vec<Reminder> {
     out
 }
 
-fn take_paragraph(events: &[MdEvent<'_>], i: &mut usize) -> Option<String> {
-    if !matches!(events.get(*i), Some(MdEvent::Start(Tag::Paragraph))) {
+/// [`find_reminders`] without the write-back bookkeeping.
+#[allow(dead_code)] // Sibling of `parse_worklog`; sync itself needs the marker positions.
+pub fn parse_reminders(text: &str) -> Vec<Reminder> {
+    find_reminders(text).into_iter().map(|f| f.item).collect()
+}
+
+fn take_paragraph(events: &[Ev<'_>], i: &mut usize) -> Option<String> {
+    if !matches!(events.get(*i).map(|e| &e.0), Some(MdEvent::Start(Tag::Paragraph))) {
         return None;
     }
     *i += 1;
     let mut s = String::new();
     while *i < events.len() {
-        match &events[*i] {
+        match &events[*i].0 {
             MdEvent::End(TagEnd::Paragraph) => {
                 *i += 1;
                 return Some(s);
@@ -250,15 +325,18 @@ fn split_item_body_and_tags(body: &str) -> (String, Option<Vec<String>>) {
     (main, Some(parsed))
 }
 
-/// `## YYYY-MM-DD — title` sections; body paragraphs + optional `Tags:` line.
-pub fn parse_events(text: &str) -> Vec<Event> {
-    let body = markdown_body(text);
-    let events: Vec<MdEvent<'_>> = Parser::new_ext(body.as_ref(), Options::empty()).collect();
+/// `## YYYY-MM-DD — title` sections, with the position of each id marker.
+///
+/// An event's marker sits on its own line directly under the heading — a heading is a leaf block,
+/// so there is nowhere inline to put it without it becoming part of the title.
+pub fn find_events(raw: &str) -> Vec<FoundItem<Event>> {
+    let events = spanned_events(raw, Options::empty());
     let mut i = 0;
     let mut out = Vec::new();
 
     while i < events.len() {
-        if is_h2_start(&events[i]) {
+        if is_h2_start(&events[i].0) {
+            let heading_range = events[i].1.clone();
             i += 1;
             let heading = collect_plain_until(&events, &mut i, |e| {
                 matches!(e, MdEvent::End(TagEnd::Heading(HeadingLevel::H2)))
@@ -277,7 +355,7 @@ pub fn parse_events(text: &str) -> Vec<Event> {
             let mut desc_lines: Vec<String> = Vec::new();
             let mut tags: Vec<String> = Vec::new();
 
-            while i < events.len() && !is_h2_start(&events[i]) {
+            while i < events.len() && !is_h2_start(&events[i].0) {
                 if let Some(para) = take_paragraph(&events, &mut i) {
                     let trimmed = para.trim_end();
                     if let Some(t) = parse_tags_line(trimmed) {
@@ -295,15 +373,30 @@ pub fn parse_events(text: &str) -> Vec<Event> {
             } else {
                 Some(desc_lines.join("\n"))
             };
-            let key = format!("{title}|{start}");
-            let id = stable_vault_row_id(b"evt:", &key);
-            out.push(Event {
-                id,
-                title: title.trim().to_string(),
-                description,
-                start,
-                end: None,
-                tags,
+
+            let heading_end = first_line_end(raw, &heading_range);
+            let found = next_line(raw, heading_end).and_then(|(line, _)| {
+                let t = line.trim();
+                marker::find(t).filter(|_| marker::strip(t).trim().is_empty())
+            });
+            let had_marker = found.is_some();
+            let id = found.map_or_else(
+                || stable_vault_row_id(b"evt:", &format!("{title}|{start}")),
+                |f| f.id,
+            );
+
+            out.push(FoundItem {
+                item: Event {
+                    id,
+                    title: title.trim().to_string(),
+                    description,
+                    start,
+                    end: None,
+                    tags,
+                },
+                had_marker,
+                marker_at: heading_end,
+                marker_sep: "\n",
             });
         } else {
             i += 1;
@@ -313,8 +406,14 @@ pub fn parse_events(text: &str) -> Vec<Event> {
     out
 }
 
-fn collect_list_item_text(events: &[MdEvent<'_>], i: &mut usize) -> String {
-    if !matches!(events.get(*i), Some(MdEvent::Start(Tag::Item))) {
+/// [`find_events`] without the write-back bookkeeping.
+#[allow(dead_code)] // Sibling of `parse_worklog`; sync itself needs the marker positions.
+pub fn parse_events(text: &str) -> Vec<Event> {
+    find_events(text).into_iter().map(|f| f.item).collect()
+}
+
+fn collect_list_item_text(events: &[Ev<'_>], i: &mut usize) -> String {
+    if !matches!(events.get(*i).map(|e| &e.0), Some(MdEvent::Start(Tag::Item))) {
         return String::new();
     }
     *i += 1;
@@ -324,14 +423,17 @@ fn collect_list_item_text(events: &[MdEvent<'_>], i: &mut usize) -> String {
 }
 
 /// `## YYYY-MM-DD` sections; list items as worklog bullets; optional `Tags:` paragraph.
+///
+/// No marker handling: the worklog is read-only for Mervyn. `worklog.md` is a symlink into the
+/// worklog clone, and writing into that working tree would break `git pull --ff-only`.
+/// See `docs/two-way-vault-sync.md`.
 pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
-    let body = markdown_body(text);
-    let events: Vec<MdEvent<'_>> = Parser::new_ext(body.as_ref(), Options::empty()).collect();
+    let events = spanned_events(text, Options::empty());
     let mut i = 0;
     let mut out = Vec::new();
 
     while i < events.len() {
-        if is_h2_start(&events[i]) {
+        if is_h2_start(&events[i].0) {
             i += 1;
             let heading = collect_plain_until(&events, &mut i, |e| {
                 matches!(e, MdEvent::End(TagEnd::Heading(HeadingLevel::H2)))
@@ -346,12 +448,12 @@ pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
             let mut bullets: Vec<String> = Vec::new();
             let mut tags: Vec<String> = Vec::new();
 
-            while i < events.len() && !is_h2_start(&events[i]) {
-                match &events[i] {
+            while i < events.len() && !is_h2_start(&events[i].0) {
+                match &events[i].0 {
                     MdEvent::Start(Tag::List(_)) => {
                         i += 1;
-                        while i < events.len() && !matches!(events[i], MdEvent::End(TagEnd::List(_))) {
-                            if matches!(events[i], MdEvent::Start(Tag::Item)) {
+                        while i < events.len() && !matches!(events[i].0, MdEvent::End(TagEnd::List(_))) {
+                            if matches!(events[i].0, MdEvent::Start(Tag::Item)) {
                                 let body = collect_list_item_text(&events, &mut i);
                                 if !body.is_empty() {
                                     let (main, tag_opt) = split_item_body_and_tags(&body);
@@ -402,6 +504,140 @@ pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::vault::write::splice;
+
+    /// Splice in every missing marker, the way the reconciler does.
+    fn backfill_reminders(raw: &str) -> String {
+        let mut edits: Vec<(usize, String)> = find_reminders(raw)
+            .iter()
+            .filter_map(|f| f.backfill(f.item.id))
+            .collect();
+        splice(raw, &mut edits)
+    }
+
+    fn backfill_events(raw: &str) -> String {
+        let mut edits: Vec<(usize, String)> = find_events(raw)
+            .iter()
+            .filter_map(|f| f.backfill(f.item.id))
+            .collect();
+        splice(raw, &mut edits)
+    }
+
+    #[test]
+    fn an_unmarked_reminder_gains_a_marker_carrying_the_id_it_synced_under() {
+        let raw = "- [ ] Pay tax — due 2026-04-10\n";
+        let id = find_reminders(raw)[0].item.id;
+
+        let marked = backfill_reminders(raw);
+        assert_eq!(
+            marked,
+            format!("- [ ] Pay tax — due 2026-04-10 {}\n", marker::render(id))
+        );
+
+        // The bootstrap is what makes the migration free: the row keeps the id it already has.
+        let reparsed = &find_reminders(&marked)[0];
+        assert_eq!(reparsed.item.id, id);
+        assert!(reparsed.had_marker);
+    }
+
+    #[test]
+    fn a_marked_reminder_keeps_its_id_when_the_line_is_edited() {
+        // The bug this phase exists to fix: ticking the box used to rehash the line into a new
+        // id, leaving the unticked row in redb to fire for ever.
+        let before = "- [ ] Pay tax — due 2026-04-10 <!--mv:2a-->\n";
+        let after = "- [x] Pay the tax bill — due 2026-04-11 <!--mv:2a-->\n";
+
+        let a = &find_reminders(before)[0].item;
+        let b = &find_reminders(after)[0].item;
+
+        assert_eq!(a.id, b.id, "id must survive an edit");
+        assert!(!a.done && b.done, "the edit itself must still be read");
+        assert_eq!(b.body, "Pay the tax bill");
+    }
+
+    #[test]
+    fn an_unmarked_edit_still_rehashes_which_is_why_the_backfill_runs_once_up_front() {
+        let a = &find_reminders("- [ ] Pay tax — due 2026-04-10\n")[0].item;
+        let b = &find_reminders("- [x] Pay tax — due 2026-04-10\n")[0].item;
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn a_marker_does_not_leak_into_the_reminder_body_or_its_fields() {
+        let r = &find_reminders("- [ ] Pay tax — due 2026-04-10 — recurs yearly <!--mv:ff-->\n")[0].item;
+        assert_eq!(r.body, "Pay tax");
+        assert_eq!(r.id, 255);
+        assert!(matches!(r.recurrence, Some(Recurrence::Custom(ref s)) if s == "yearly"));
+        assert_eq!(r.due, date_at_noon_utc(NaiveDate::from_ymd_opt(2026, 4, 10).unwrap()));
+    }
+
+    #[test]
+    fn backfill_is_idempotent() {
+        let raw = "- [ ] One — due 2026-04-10\n- [x] Two\n";
+        let once = backfill_reminders(raw);
+        let twice = backfill_reminders(&once);
+        assert_eq!(once, twice, "a second pass must not add a second marker");
+    }
+
+    #[test]
+    fn backfill_splices_before_the_carriage_return_on_crlf_files() {
+        let raw = "- [ ] Pay tax\r\n- [ ] Call bank\r\n";
+        let marked = backfill_reminders(raw);
+        for line in marked.split("\r\n").filter(|l| !l.is_empty()) {
+            assert!(line.ends_with("-->"), "marker not at end of line: {line:?}");
+            assert!(!line.contains('\r'), "stray carriage return in {line:?}");
+        }
+        assert_eq!(find_reminders(&marked).len(), 2);
+        assert!(find_reminders(&marked).iter().all(|f| f.had_marker));
+    }
+
+    #[test]
+    fn an_event_marker_sits_under_the_heading_and_stays_out_of_the_description() {
+        let raw = "## 2026-04-05 — **Gig** at Tap\nDoors 7pm\n";
+        let id = find_events(raw)[0].item.id;
+
+        let marked = backfill_events(raw);
+        assert_eq!(
+            marked,
+            format!("## 2026-04-05 — **Gig** at Tap\n{}\nDoors 7pm\n", marker::render(id))
+        );
+
+        let e = &find_events(&marked)[0];
+        assert!(e.had_marker);
+        assert_eq!(e.item.id, id);
+        assert_eq!(e.item.title, "Gig at Tap");
+        assert_eq!(e.item.description.as_deref(), Some("Doors 7pm"));
+    }
+
+    #[test]
+    fn a_marked_event_keeps_its_id_when_retitled() {
+        let before = "## 2026-04-05 — Gig\n<!--mv:7b-->\nDoors 7pm\n";
+        let after = "## 2026-04-05 — Gig at the Tap\n<!--mv:7b-->\nDoors 8pm\n";
+        assert_eq!(find_events(before)[0].item.id, find_events(after)[0].item.id);
+        assert_eq!(find_events(after)[0].item.title, "Gig at the Tap");
+    }
+
+    #[test]
+    fn a_comment_under_a_heading_that_is_not_a_marker_is_left_alone() {
+        let raw = "## 2026-04-05 — Gig\n<!-- ask about parking -->\nDoors 7pm\n";
+        let f = &find_events(raw)[0];
+        assert!(!f.had_marker, "an ordinary comment must not be read as an id");
+        assert_eq!(f.item.description.as_deref(), Some("Doors 7pm"));
+    }
+
+    #[test]
+    fn backfill_leaves_everything_the_parser_does_not_model_byte_identical() {
+        let raw = "---\ntitle: Reminders\ntags: [inbox]\n---\n\n# Reminders\n\nSome prose Mervyn knows nothing about.\n\n> [!note] a callout\n> with a second line\n\n- [ ] Pay tax — due 2026-04-10\n\n*Emphasis and a [link](https://example.com) at the end.*\n";
+        let marked = backfill_reminders(raw);
+
+        let id = find_reminders(raw)[0].item.id;
+        let expected = raw.replace(
+            "- [ ] Pay tax — due 2026-04-10",
+            &format!("- [ ] Pay tax — due 2026-04-10 {}", marker::render(id)),
+        );
+        assert_eq!(marked, expected, "only the reminder line may change");
+    }
 
     #[test]
     fn front_matter_offset_points_at_body_and_keeps_crlf() {
