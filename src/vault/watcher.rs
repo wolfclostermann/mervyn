@@ -9,7 +9,7 @@ use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer_opt, Config, DebounceEventResult};
 use redb::Database;
 
-use super::sync::{sync_vault_to_db, WriteBackPolicy};
+use super::sync::{sync_vault_to_db, SyncContext, WriteBackPolicy};
 use super::write::VaultAccess;
 
 /// Spawn a background thread that watches `vault_path` and runs sync after debounced changes.
@@ -19,10 +19,11 @@ pub fn spawn_vault_watcher(
     vault_path: PathBuf,
     vault: Arc<VaultAccess>,
     policy: WriteBackPolicy,
+    tz: chrono_tz::Tz,
 ) {
     std::thread::Builder::new()
         .name("mervyn-vault-notify".into())
-        .spawn(move || run_watcher(db, vault_path, vault, policy))
+        .spawn(move || run_watcher(db, vault_path, vault, policy, tz))
         .expect("spawn vault watcher thread");
 }
 
@@ -40,6 +41,7 @@ fn run_watcher(
     vault_path: PathBuf,
     vault: Arc<VaultAccess>,
     policy: WriteBackPolicy,
+    tz: chrono_tz::Tz,
 ) {
     let (sig_tx, sig_rx) = mpsc::channel::<Vec<PathBuf>>();
 
@@ -75,7 +77,12 @@ fn run_watcher(
                     tracing::trace!(count = paths.len(), "vault watcher: own write, not re-syncing");
                     continue;
                 }
-                match sync_vault_to_db(db.as_ref(), &vault_path, vault.as_ref(), policy) {
+                let ctx = SyncContext {
+                    access: vault.as_ref(),
+                    policy,
+                    tz,
+                };
+                match sync_vault_to_db(db.as_ref(), &vault_path, ctx) {
                     Ok(stats) => tracing::info!(?stats, "vault watcher sync"),
                     Err(e) => tracing::warn!(error = %e, "vault watcher sync failed"),
                 }

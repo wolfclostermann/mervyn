@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod error;
 mod intent;
+mod local_time;
 mod scheduler;
 mod telegram;
 mod state;
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         app_state.vault_path.clone(),
         app_state.vault.clone(),
         app_state.write_back_policy(),
+        app_state.vault_tz(),
     );
 
     if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {

@@ -7,7 +7,7 @@ use redb::Database;
 use crate::claude::client::ClaudeClient;
 use crate::config::AppConfig;
 use crate::telegram::client::TelegramClient;
-use crate::vault::sync::WriteBackPolicy;
+use crate::vault::sync::{SyncContext, WriteBackPolicy};
 use crate::vault::write::VaultAccess;
 
 #[derive(Clone)]
@@ -84,6 +84,30 @@ impl AppState {
         WriteBackPolicy {
             enabled: self.settings.vault.write_back_enabled,
             backup_before_first_write: self.settings.vault.backup_before_first_write,
+        }
+    }
+
+    /// The zone the vault's wall-clock times are written and read in. Falls back to UTC with a
+    /// warning rather than failing a sync — the same choice the intent handlers make.
+    pub fn vault_tz(&self) -> chrono_tz::Tz {
+        self.settings
+            .scheduler
+            .timezone
+            .parse()
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    tz = %self.settings.scheduler.timezone,
+                    "invalid scheduler.timezone; using UTC for vault times"
+                );
+                chrono_tz::UTC
+            })
+    }
+
+    pub fn vault_sync_context(&self) -> SyncContext<'_> {
+        SyncContext {
+            access: self.vault.as_ref(),
+            policy: self.write_back_policy(),
+            tz: self.vault_tz(),
         }
     }
 }

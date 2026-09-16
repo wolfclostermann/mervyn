@@ -20,8 +20,7 @@ fn sync_vault(state: &AppState) -> anyhow::Result<crate::vault::sync::SyncStats>
     crate::vault::sync::sync_vault_to_db(
         state.db.as_ref(),
         &state.vault_path,
-        state.vault.as_ref(),
-        state.write_back_policy(),
+        state.vault_sync_context(),
     )
 }
 

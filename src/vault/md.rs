@@ -6,12 +6,14 @@ use std::borrow::Cow;
 use std::hash::Hasher;
 use std::ops::Range;
 
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
+use chrono_tz::Tz;
 use fnv::FnvHasher;
 use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde_yaml::Value as YamlValue;
 
 use super::marker;
+use crate::local_time::{local_noon, local_to_utc};
 use crate::storage::{Event, Recurrence, Reminder, WorklogEntry};
 
 /// Obsidian/Jekyll-style YAML block at the top of a file, as `(parsed, body_offset)` where
@@ -80,30 +82,81 @@ pub(super) fn stable_vault_row_id(prefix: &[u8], key: &str) -> u64 {
     h.finish()
 }
 
-fn date_at_noon_utc(date: NaiveDate) -> chrono::DateTime<Utc> {
-    date.and_hms_opt(12, 0, 0)
-        .expect("valid noon")
-        .and_utc()
+/// `HH:MM`, 24-hour. Deliberately strict: anything else is treated as prose, not a time.
+fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
+    let (h, m) = s.split_once(':')?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 {
+        return None;
+    }
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    (h < 24 && m < 60).then_some((h, m))
 }
 
-fn parse_reminder_body(s: &str) -> (String, Option<NaiveDate>, Option<Recurrence>) {
+/// Split `09:00–10:30` into its halves. The range separator is a dash with **no** spaces, which
+/// is what keeps it distinct from the ` — ` that separates a heading's date from its title.
+fn split_time_range(s: &str) -> (&str, Option<&str>) {
+    for sep in ['\u{2013}', '\u{2014}', '-'] {
+        if let Some((a, b)) = s.split_once(sep) {
+            return (a, Some(b));
+        }
+    }
+    (s, None)
+}
+
+/// `YYYY-MM-DD`, optionally followed by `HH:MM` or `HH:MM–HH:MM` in **local** wall-clock time.
+///
+/// Tolerant: a trailing token that is not a time is ignored rather than failing the whole parse,
+/// so a line someone typed loosely still yields its date.
+fn parse_date_and_times(s: &str) -> Option<(NaiveDate, Option<(u32, u32)>, Option<(u32, u32)>)> {
+    let mut parts = s.trim().split_whitespace();
+    let date = NaiveDate::parse_from_str(parts.next()?, "%Y-%m-%d").ok()?;
+    let Some(rest) = parts.next() else {
+        return Some((date, None, None));
+    };
+    let (start_str, end_str) = split_time_range(rest);
+    let Some(start) = parse_hh_mm(start_str) else {
+        return Some((date, None, None));
+    };
+    let end = end_str.and_then(parse_hh_mm);
+    Some((date, Some(start), end))
+}
+
+/// A parsed date and optional local time as the UTC instant it denotes.
+fn at_local(date: NaiveDate, time: Option<(u32, u32)>, tz: Tz) -> chrono::DateTime<chrono::Utc> {
+    match time {
+        Some((h, m)) => local_to_utc(date, h, m, tz).unwrap_or_else(|| local_noon(date, tz)),
+        None => local_noon(date, tz),
+    }
+}
+
+/// Known cadences become their own variant so a rendered reminder parses back to what it was.
+fn parse_recurrence(s: &str) -> Recurrence {
+    match s.trim().to_lowercase().as_str() {
+        "daily" => Recurrence::Daily,
+        "weekly" => Recurrence::Weekly,
+        "monthly" => Recurrence::Monthly,
+        _ => Recurrence::Custom(s.trim().to_string()),
+    }
+}
+
+fn parse_reminder_body(
+    s: &str,
+) -> (String, Option<(NaiveDate, Option<(u32, u32)>)>, Option<Recurrence>) {
     let mut recurrence = None;
     let mut due = None;
     let mut body_part = s.to_string();
 
-    if let Some(idx) = body_part.find(" — recurs ") {
+    if let Some(idx) = body_part.rfind(" — recurs ") {
         let tail = body_part[idx + " — recurs ".len()..].trim();
-        recurrence = Some(Recurrence::Custom(tail.to_string()));
+        recurrence = Some(parse_recurrence(tail));
         body_part.truncate(idx);
     }
 
-    if let Some(idx) = body_part.find(" — due ") {
-        let date_str = body_part[idx + " — due ".len()..].trim();
-        if let Ok(d) = NaiveDate::parse_from_str(
-            date_str.split_whitespace().next().unwrap_or(date_str),
-            "%Y-%m-%d",
-        ) {
-            due = Some(d);
+    if let Some(idx) = body_part.rfind(" — due ") {
+        let when = body_part[idx + " — due ".len()..].trim().to_string();
+        if let Some((date, time, _end)) = parse_date_and_times(&when) {
+            due = Some((date, time));
         }
         body_part.truncate(idx);
     }
@@ -210,7 +263,7 @@ fn is_h2_start(ev: &MdEvent<'_>) -> bool {
 }
 
 /// GitHub-style task list items → [`Reminder`], with the position of each id marker.
-pub fn find_reminders(raw: &str) -> Vec<FoundItem<Reminder>> {
+pub fn find_reminders(raw: &str, tz: Tz) -> Vec<FoundItem<Reminder>> {
     let events = spanned_events(raw, Options::ENABLE_TASKLISTS);
     let mut i = 0;
     let mut out = Vec::new();
@@ -235,8 +288,8 @@ pub fn find_reminders(raw: &str) -> Vec<FoundItem<Reminder>> {
                 consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
                 let (body, due, recurrence) = parse_reminder_body(text.trim());
                 let due = match due {
-                    Some(d) => date_at_noon_utc(d),
-                    None => Utc::now(),
+                    Some((date, time)) => at_local(date, time, tz),
+                    None => chrono::Utc::now(),
                 };
 
                 // Only the item's own first line: a marker further down belongs to a nested item.
@@ -270,8 +323,8 @@ pub fn find_reminders(raw: &str) -> Vec<FoundItem<Reminder>> {
 
 /// [`find_reminders`] without the write-back bookkeeping.
 #[allow(dead_code)] // Sibling of `parse_worklog`; sync itself needs the marker positions.
-pub fn parse_reminders(text: &str) -> Vec<Reminder> {
-    find_reminders(text).into_iter().map(|f| f.item).collect()
+pub fn parse_reminders(text: &str, tz: Tz) -> Vec<Reminder> {
+    find_reminders(text, tz).into_iter().map(|f| f.item).collect()
 }
 
 fn take_paragraph(events: &[Ev<'_>], i: &mut usize) -> Option<String> {
@@ -329,7 +382,7 @@ fn split_item_body_and_tags(body: &str) -> (String, Option<Vec<String>>) {
 ///
 /// An event's marker sits on its own line directly under the heading — a heading is a leaf block,
 /// so there is nowhere inline to put it without it becoming part of the title.
-pub fn find_events(raw: &str) -> Vec<FoundItem<Event>> {
+pub fn find_events(raw: &str, tz: Tz) -> Vec<FoundItem<Event>> {
     let events = spanned_events(raw, Options::empty());
     let mut i = 0;
     let mut out = Vec::new();
@@ -348,10 +401,11 @@ pub fn find_events(raw: &str) -> Vec<FoundItem<Event>> {
             let Some((date_str, title)) = heading.split_once(" — ") else {
                 continue;
             };
-            let Ok(date) = NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d") else {
+            let Some((date, time, end_time)) = parse_date_and_times(date_str) else {
                 continue;
             };
-            let start = date_at_noon_utc(date);
+            let start = at_local(date, time, tz);
+            let end = end_time.map(|(h, m)| at_local(date, Some((h, m)), tz));
             let mut desc_lines: Vec<String> = Vec::new();
             let mut tags: Vec<String> = Vec::new();
 
@@ -391,7 +445,7 @@ pub fn find_events(raw: &str) -> Vec<FoundItem<Event>> {
                     title: title.trim().to_string(),
                     description,
                     start,
-                    end: None,
+                    end,
                     tags,
                 },
                 had_marker,
@@ -408,8 +462,8 @@ pub fn find_events(raw: &str) -> Vec<FoundItem<Event>> {
 
 /// [`find_events`] without the write-back bookkeeping.
 #[allow(dead_code)] // Sibling of `parse_worklog`; sync itself needs the marker positions.
-pub fn parse_events(text: &str) -> Vec<Event> {
-    find_events(text).into_iter().map(|f| f.item).collect()
+pub fn parse_events(text: &str, tz: Tz) -> Vec<Event> {
+    find_events(text, tz).into_iter().map(|f| f.item).collect()
 }
 
 fn collect_list_item_text(events: &[Ev<'_>], i: &mut usize) -> String {
@@ -427,7 +481,7 @@ fn collect_list_item_text(events: &[Ev<'_>], i: &mut usize) -> String {
 /// No marker handling: the worklog is read-only for Mervyn. `worklog.md` is a symlink into the
 /// worklog clone, and writing into that working tree would break `git pull --ff-only`.
 /// See `docs/two-way-vault-sync.md`.
-pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
+pub fn parse_worklog(text: &str, tz: Tz) -> Vec<WorklogEntry> {
     let events = spanned_events(text, Options::empty());
     let mut i = 0;
     let mut out = Vec::new();
@@ -444,7 +498,7 @@ pub fn parse_worklog(text: &str) -> Vec<WorklogEntry> {
             let Ok(day) = NaiveDate::parse_from_str(heading.trim(), "%Y-%m-%d") else {
                 continue;
             };
-            let day_start = date_at_noon_utc(day);
+            let day_start = local_noon(day, tz);
             let mut bullets: Vec<String> = Vec::new();
             let mut tags: Vec<String> = Vec::new();
 
@@ -507,9 +561,13 @@ mod tests {
 
     use crate::vault::write::splice;
 
+    fn london() -> Tz {
+        "Europe/London".parse().unwrap()
+    }
+
     /// Splice in every missing marker, the way the reconciler does.
     fn backfill_reminders(raw: &str) -> String {
-        let mut edits: Vec<(usize, String)> = find_reminders(raw)
+        let mut edits: Vec<(usize, String)> = find_reminders(raw, london())
             .iter()
             .filter_map(|f| f.backfill(f.item.id))
             .collect();
@@ -517,7 +575,7 @@ mod tests {
     }
 
     fn backfill_events(raw: &str) -> String {
-        let mut edits: Vec<(usize, String)> = find_events(raw)
+        let mut edits: Vec<(usize, String)> = find_events(raw, london())
             .iter()
             .filter_map(|f| f.backfill(f.item.id))
             .collect();
@@ -525,9 +583,65 @@ mod tests {
     }
 
     #[test]
+    fn a_reminder_time_is_local_wall_clock_on_the_date_written() {
+        // Written while it is BST, for a date that is GMT: 09:00 stays 09:00 that morning.
+        let winter = &find_reminders("- [ ] Pay tax — due 2026-11-15 09:00\n", london())[0].item;
+        assert_eq!(winter.due.to_rfc3339(), "2026-11-15T09:00:00+00:00");
+
+        let summer = &find_reminders("- [ ] Pay tax — due 2026-06-15 09:00\n", london())[0].item;
+        assert_eq!(summer.due.to_rfc3339(), "2026-06-15T08:00:00+00:00");
+    }
+
+    #[test]
+    fn a_bare_due_date_means_local_noon() {
+        let r = &find_reminders("- [ ] Pay tax — due 2026-06-15\n", london())[0].item;
+        assert_eq!(r.due.to_rfc3339(), "2026-06-15T11:00:00+00:00");
+    }
+
+    #[test]
+    fn a_trailing_token_that_is_not_a_time_is_ignored_rather_than_failing_the_date() {
+        let r = &find_reminders("- [ ] Pay tax — due 2026-06-15 sometime\n", london())[0].item;
+        assert_eq!(r.due.to_rfc3339(), "2026-06-15T11:00:00+00:00");
+        assert_eq!(r.body, "Pay tax");
+    }
+
+    #[test]
+    fn recurrence_words_map_to_their_own_variants() {
+        let cases = [
+            ("daily", Recurrence::Daily),
+            ("weekly", Recurrence::Weekly),
+            ("monthly", Recurrence::Monthly),
+            ("yearly", Recurrence::Custom("yearly".into())),
+        ];
+        for (word, expected) in cases {
+            let line = format!("- [ ] Pay tax — due 2026-06-15 — recurs {word}\n");
+            assert_eq!(find_reminders(&line, london())[0].item.recurrence, Some(expected));
+        }
+    }
+
+    #[test]
+    fn an_event_heading_carries_an_optional_time_and_range() {
+        let e = &find_events("## 2026-09-23 14:30 — Hospital\n", london())[0].item;
+        assert_eq!(e.start.to_rfc3339(), "2026-09-23T13:30:00+00:00");
+        assert!(e.end.is_none());
+
+        let ranged = &find_events("## 2026-09-23 14:30–16:00 — Hospital\n", london())[0].item;
+        assert_eq!(ranged.start.to_rfc3339(), "2026-09-23T13:30:00+00:00");
+        assert_eq!(ranged.end.unwrap().to_rfc3339(), "2026-09-23T15:00:00+00:00");
+        assert_eq!(ranged.title, "Hospital");
+    }
+
+    #[test]
+    fn an_event_heading_without_a_time_still_parses_as_before() {
+        let e = &find_events("## 2026-04-05 — **Gig** at Tap\nDoors 7pm\n", london())[0].item;
+        assert_eq!(e.title, "Gig at Tap");
+        assert_eq!(e.start.to_rfc3339(), "2026-04-05T11:00:00+00:00");
+    }
+
+    #[test]
     fn an_unmarked_reminder_gains_a_marker_carrying_the_id_it_synced_under() {
         let raw = "- [ ] Pay tax — due 2026-04-10\n";
-        let id = find_reminders(raw)[0].item.id;
+        let id = find_reminders(raw, london())[0].item.id;
 
         let marked = backfill_reminders(raw);
         assert_eq!(
@@ -536,7 +650,7 @@ mod tests {
         );
 
         // The bootstrap is what makes the migration free: the row keeps the id it already has.
-        let reparsed = &find_reminders(&marked)[0];
+        let reparsed = &find_reminders(&marked, london())[0];
         assert_eq!(reparsed.item.id, id);
         assert!(reparsed.had_marker);
     }
@@ -548,8 +662,8 @@ mod tests {
         let before = "- [ ] Pay tax — due 2026-04-10 <!--mv:2a-->\n";
         let after = "- [x] Pay the tax bill — due 2026-04-11 <!--mv:2a-->\n";
 
-        let a = &find_reminders(before)[0].item;
-        let b = &find_reminders(after)[0].item;
+        let a = &find_reminders(before, london())[0].item;
+        let b = &find_reminders(after, london())[0].item;
 
         assert_eq!(a.id, b.id, "id must survive an edit");
         assert!(!a.done && b.done, "the edit itself must still be read");
@@ -558,18 +672,18 @@ mod tests {
 
     #[test]
     fn an_unmarked_edit_still_rehashes_which_is_why_the_backfill_runs_once_up_front() {
-        let a = &find_reminders("- [ ] Pay tax — due 2026-04-10\n")[0].item;
-        let b = &find_reminders("- [x] Pay tax — due 2026-04-10\n")[0].item;
+        let a = &find_reminders("- [ ] Pay tax — due 2026-04-10\n", london())[0].item;
+        let b = &find_reminders("- [x] Pay tax — due 2026-04-10\n", london())[0].item;
         assert_ne!(a.id, b.id);
     }
 
     #[test]
     fn a_marker_does_not_leak_into_the_reminder_body_or_its_fields() {
-        let r = &find_reminders("- [ ] Pay tax — due 2026-04-10 — recurs yearly <!--mv:ff-->\n")[0].item;
+        let r = &find_reminders("- [ ] Pay tax — due 2026-04-10 — recurs yearly <!--mv:ff-->\n", london())[0].item;
         assert_eq!(r.body, "Pay tax");
         assert_eq!(r.id, 255);
         assert!(matches!(r.recurrence, Some(Recurrence::Custom(ref s)) if s == "yearly"));
-        assert_eq!(r.due, date_at_noon_utc(NaiveDate::from_ymd_opt(2026, 4, 10).unwrap()));
+        assert_eq!(r.due, local_noon(NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(), london()));
     }
 
     #[test]
@@ -588,14 +702,14 @@ mod tests {
             assert!(line.ends_with("-->"), "marker not at end of line: {line:?}");
             assert!(!line.contains('\r'), "stray carriage return in {line:?}");
         }
-        assert_eq!(find_reminders(&marked).len(), 2);
-        assert!(find_reminders(&marked).iter().all(|f| f.had_marker));
+        assert_eq!(find_reminders(&marked, london()).len(), 2);
+        assert!(find_reminders(&marked, london()).iter().all(|f| f.had_marker));
     }
 
     #[test]
     fn an_event_marker_sits_under_the_heading_and_stays_out_of_the_description() {
         let raw = "## 2026-04-05 — **Gig** at Tap\nDoors 7pm\n";
-        let id = find_events(raw)[0].item.id;
+        let id = find_events(raw, london())[0].item.id;
 
         let marked = backfill_events(raw);
         assert_eq!(
@@ -603,7 +717,7 @@ mod tests {
             format!("## 2026-04-05 — **Gig** at Tap\n{}\nDoors 7pm\n", marker::render(id))
         );
 
-        let e = &find_events(&marked)[0];
+        let e = &find_events(&marked, london())[0];
         assert!(e.had_marker);
         assert_eq!(e.item.id, id);
         assert_eq!(e.item.title, "Gig at Tap");
@@ -614,14 +728,14 @@ mod tests {
     fn a_marked_event_keeps_its_id_when_retitled() {
         let before = "## 2026-04-05 — Gig\n<!--mv:7b-->\nDoors 7pm\n";
         let after = "## 2026-04-05 — Gig at the Tap\n<!--mv:7b-->\nDoors 8pm\n";
-        assert_eq!(find_events(before)[0].item.id, find_events(after)[0].item.id);
-        assert_eq!(find_events(after)[0].item.title, "Gig at the Tap");
+        assert_eq!(find_events(before, london())[0].item.id, find_events(after, london())[0].item.id);
+        assert_eq!(find_events(after, london())[0].item.title, "Gig at the Tap");
     }
 
     #[test]
     fn a_comment_under_a_heading_that_is_not_a_marker_is_left_alone() {
         let raw = "## 2026-04-05 — Gig\n<!-- ask about parking -->\nDoors 7pm\n";
-        let f = &find_events(raw)[0];
+        let f = &find_events(raw, london())[0];
         assert!(!f.had_marker, "an ordinary comment must not be read as an id");
         assert_eq!(f.item.description.as_deref(), Some("Doors 7pm"));
     }
@@ -631,7 +745,7 @@ mod tests {
         let raw = "---\ntitle: Reminders\ntags: [inbox]\n---\n\n# Reminders\n\nSome prose Mervyn knows nothing about.\n\n> [!note] a callout\n> with a second line\n\n- [ ] Pay tax — due 2026-04-10\n\n*Emphasis and a [link](https://example.com) at the end.*\n";
         let marked = backfill_reminders(raw);
 
-        let id = find_reminders(raw)[0].item.id;
+        let id = find_reminders(raw, london())[0].item.id;
         let expected = raw.replace(
             "- [ ] Pay tax — due 2026-04-10",
             &format!("- [ ] Pay tax — due 2026-04-10 {}", marker::render(id)),
@@ -695,7 +809,7 @@ mod tests {
     #[test]
     fn reminders_skip_yaml_front_matter() {
         let md = "---\ntitle: Reminders\nfoo: bar\n---\n\n- [ ] Do thing — due 2026-06-01\n";
-        let list = parse_reminders(md);
+        let list = parse_reminders(md, london());
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].body, "Do thing");
         let (meta, _) = strip_yaml_front_matter(md);
@@ -706,7 +820,7 @@ mod tests {
     #[test]
     fn reminders_tasklist_matches_line_parser_case() {
         let md = "# Reminders\n\n- [ ] Pay tax — due 2026-04-10 — recurs yearly\n";
-        let list = parse_reminders(md);
+        let list = parse_reminders(md, london());
         assert_eq!(list.len(), 1);
         assert!(!list[0].done);
         assert_eq!(list[0].body, "Pay tax");
@@ -719,7 +833,7 @@ mod tests {
     #[test]
     fn events_heading_with_inline_formatting() {
         let md = "## 2026-04-05 — **Gig** at Tap\nDoors 7pm\n";
-        let evs = parse_events(md);
+        let evs = parse_events(md, london());
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].title, "Gig at Tap");
         assert_eq!(evs[0].description.as_deref(), Some("Doors 7pm"));
@@ -728,7 +842,7 @@ mod tests {
     #[test]
     fn worklog_list_and_tags() {
         let md = "## 2026-03-30\n- Line one\n- Line two\nTags: a, b\n";
-        let w = parse_worklog(md);
+        let w = parse_worklog(md, london());
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].tags, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(w[1].tags, vec!["a".to_string(), "b".to_string()]);

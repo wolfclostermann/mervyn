@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono_tz::Tz;
 use redb::Database;
 
 use super::md::{self, FoundItem};
@@ -34,6 +35,15 @@ pub struct SyncStats {
 pub struct WriteBackPolicy {
     pub enabled: bool,
     pub backup_before_first_write: bool,
+}
+
+/// Everything one sync cycle needs beyond the database and the vault path.
+#[derive(Clone, Copy)]
+pub struct SyncContext<'a> {
+    pub access: &'a VaultAccess,
+    pub policy: WriteBackPolicy,
+    /// Wall-clock zone the vault is written and read in — `scheduler.timezone`.
+    pub tz: Tz,
 }
 
 impl WriteBackPolicy {
@@ -69,16 +79,16 @@ fn marker_edits<T>(found: &[FoundItem<T>], id_of: impl Fn(&T) -> u64) -> Vec<(us
 pub fn sync_vault_to_db(
     db: &Database,
     vault_path: &Path,
-    access: &VaultAccess,
-    policy: WriteBackPolicy,
+    ctx: SyncContext<'_>,
 ) -> anyhow::Result<SyncStats> {
+    let SyncContext { access, policy, tz } = ctx;
     let _guard = access.lock();
     let mut stats = SyncStats::default();
     let mut pending: Vec<PendingWrite> = Vec::new();
 
     let reminders_path = vault_path.join("reminders.md");
     if let Some(raw) = read_if_present(&reminders_path)? {
-        let found = md::find_reminders(&raw);
+        let found = md::find_reminders(&raw, tz);
         for f in &found {
             reminders::put(db, &f.item).map_err(|e| anyhow::anyhow!(e))?;
             stats.reminders += 1;
@@ -91,7 +101,7 @@ pub fn sync_vault_to_db(
 
     let events_path = vault_path.join("events.md");
     if let Some(raw) = read_if_present(&events_path)? {
-        let found = md::find_events(&raw);
+        let found = md::find_events(&raw, tz);
         for f in &found {
             events::put(db, &f.item).map_err(|e| anyhow::anyhow!(e))?;
             stats.events += 1;
@@ -104,7 +114,7 @@ pub fn sync_vault_to_db(
 
     let worklog_path = vault_path.join("worklog.md");
     if let Some(raw) = read_if_present(&worklog_path)? {
-        for w in md::parse_worklog(&raw) {
+        for w in md::parse_worklog(&raw, tz) {
             worklog::put(db, &w).map_err(|e| anyhow::anyhow!(e))?;
             stats.worklog_entries += 1;
         }
@@ -154,17 +164,25 @@ mod tests {
     use crate::vault::marker;
     use tempfile::tempdir;
 
-    fn write_back() -> WriteBackPolicy {
-        WriteBackPolicy {
-            enabled: true,
-            backup_before_first_write: false,
+    fn london() -> Tz {
+        "Europe/London".parse().unwrap()
+    }
+
+    fn ctx(access: &VaultAccess, enabled: bool) -> SyncContext<'_> {
+        SyncContext {
+            access,
+            policy: WriteBackPolicy {
+                enabled,
+                backup_before_first_write: false,
+            },
+            tz: london(),
         }
     }
 
     #[test]
     fn parse_reminder_due_and_recurrence() {
         let md = "# Reminders\n\n- [ ] Pay tax — due 2026-04-10 — recurs yearly\n";
-        let list = md::parse_reminders(md);
+        let list = md::parse_reminders(md, london());
         assert_eq!(list.len(), 1);
         assert!(!list[0].done);
         assert_eq!(list[0].body, "Pay tax");
@@ -186,7 +204,7 @@ mod tests {
         .unwrap();
 
         let access = VaultAccess::new();
-        let s = sync_vault_to_db(&db, vault.path(), &access, WriteBackPolicy::READ_ONLY).unwrap();
+        let s = sync_vault_to_db(&db, vault.path(), ctx(&access, false)).unwrap();
         assert_eq!(s.reminders, 1);
         let all = reminders::list_all(&db).unwrap();
         assert_eq!(all.len(), 1);
@@ -203,7 +221,7 @@ mod tests {
         std::fs::write(&path, before).unwrap();
 
         let access = VaultAccess::new();
-        let s = sync_vault_to_db(&db, vault.path(), &access, WriteBackPolicy::READ_ONLY).unwrap();
+        let s = sync_vault_to_db(&db, vault.path(), ctx(&access, false)).unwrap();
 
         assert_eq!(s.markers_added, 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -226,10 +244,10 @@ mod tests {
         .unwrap();
 
         let access = VaultAccess::new();
-        let first = sync_vault_to_db(&db, vault.path(), &access, write_back()).unwrap();
+        let first = sync_vault_to_db(&db, vault.path(), ctx(&access, true)).unwrap();
         assert_eq!(first.markers_added, 3, "two reminders and one event");
 
-        let second = sync_vault_to_db(&db, vault.path(), &access, write_back()).unwrap();
+        let second = sync_vault_to_db(&db, vault.path(), ctx(&access, true)).unwrap();
         assert_eq!(second.markers_added, 0, "second pass has nothing to add");
 
         let reminders_md = std::fs::read_to_string(vault.path().join("reminders.md")).unwrap();
@@ -251,13 +269,13 @@ mod tests {
         std::fs::write(&path, "- [ ] Pay tax — due 2026-04-10\n").unwrap();
 
         let access = VaultAccess::new();
-        sync_vault_to_db(&db, vault.path(), &access, write_back()).unwrap();
+        sync_vault_to_db(&db, vault.path(), ctx(&access, true)).unwrap();
         let id = reminders::list_all(&db).unwrap()[0].id;
 
         // Tick the box in Obsidian, keeping the marker as the editor would.
         let marked = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, marked.replace("- [ ]", "- [x]")).unwrap();
-        sync_vault_to_db(&db, vault.path(), &access, write_back()).unwrap();
+        sync_vault_to_db(&db, vault.path(), ctx(&access, true)).unwrap();
 
         let rows = reminders::list_all(&db).unwrap();
         assert_eq!(rows.len(), 1, "the edit must not create a second row: {rows:?}");
@@ -275,7 +293,7 @@ mod tests {
         std::fs::write(&path, before).unwrap();
 
         let access = VaultAccess::new();
-        let s = sync_vault_to_db(&db, vault.path(), &access, write_back()).unwrap();
+        let s = sync_vault_to_db(&db, vault.path(), ctx(&access, true)).unwrap();
 
         assert_eq!(s.worklog_entries, 1, "still imported");
         assert_eq!(
@@ -296,7 +314,7 @@ mod tests {
         // Stand in for Obsidian flushing between the parse and the write.
         let access = VaultAccess::new();
         let raw = std::fs::read_to_string(&path).unwrap();
-        let found = md::find_reminders(&raw);
+        let found = md::find_reminders(&raw, london());
         let mut edits = marker_edits(&found, |r| r.id);
         std::fs::write(&path, "- [ ] One\n- [ ] Two typed while syncing\n").unwrap();
 
@@ -304,7 +322,7 @@ mod tests {
         assert!(!stale.contains("Two typed"), "the stale render drops the new line");
 
         // The real path re-reads before writing, so the typed line survives.
-        let s = sync_vault_to_db(&db, vault.path(), &access, write_back()).unwrap();
+        let s = sync_vault_to_db(&db, vault.path(), ctx(&access, true)).unwrap();
         assert_eq!(s.markers_added, 2);
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("Two typed while syncing"));
