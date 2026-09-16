@@ -1,7 +1,3 @@
-# Stack composition follows patterns from the GFS Terraform framework example:
-# https://github.com/gfs-sre/terraform-framework-example-stack
-# (Enterprise SSO repo — mirror internally or align module boundaries with that layout.)
-
 module "oci_stack" {
   source = "./modules/mervyn-oci"
 
