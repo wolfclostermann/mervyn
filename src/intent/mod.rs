@@ -119,6 +119,13 @@ pub async fn dispatch(
         .telegram
         .send_message(&chat_id.to_string(), &reply)
         .await?;
+    // The only confirmation that a reply actually left the process; without it a silent
+    // send failure and a successful one look identical in the logs.
+    tracing::info!(
+        ?label,
+        reply_chars = reply.chars().count(),
+        "reply sent"
+    );
     Ok(())
 }
 
