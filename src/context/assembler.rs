@@ -231,7 +231,7 @@ impl ContextAssembler {
             "{situation_block}\
              ## Upcoming events (database, next {} days)\n{}\n\n\
              ## Pending reminders\n{}\n\n\
-             ## Open todos (database; numeric ids for reference)\n{}\n\n\
+             ## Open todos (database; numbered as Wolf sees them, so he can say: todo 2)\n{}\n\n\
              ## Recent worklog (database, last 7 days)\n{}\n\n\
              ## Vault worklog.md (file on disk; may include git-backed lines not yet in DB)\n{}",
             QUERY_EVENT_HORIZON_DAYS,
@@ -346,14 +346,20 @@ fn format_reminders(list: &[crate::storage::Reminder]) -> String {
     s
 }
 
-fn format_todos(items: &[crate::storage::TodoItem], include_ids: bool) -> String {
+/// `numbered` shows each item's **position in the list**, not its database key.
+///
+/// The key used to be printed here, and it is unusable as a label: a todo typed straight into
+/// `todos.md` is keyed by content hash, so "what's on my list" came back reading
+/// `14362973...4977 Test syncing todos`. Positions are what `complete_todo` already accepts
+/// ("todo 2"), and both sides read `todos::list_open(db, 80)`, so the numbering agrees.
+fn format_todos(items: &[crate::storage::TodoItem], numbered: bool) -> String {
     if items.is_empty() {
         return "(none)\n".into();
     }
     let mut s = String::new();
-    for t in items {
-        if include_ids {
-            s.push_str(&format!("- [{}] {}\n", t.id, t.body));
+    for (i, t) in items.iter().enumerate() {
+        if numbered {
+            s.push_str(&format!("{}. {}\n", i + 1, t.body));
         } else {
             s.push_str(&format!("- {}\n", t.body));
         }
@@ -481,6 +487,33 @@ mod tests {
         let ctx = asm.build_query_context(now, None).await.unwrap();
         assert!(ctx.contains("Vault worklog.md"));
         assert!(ctx.contains("shipped feature"));
+    }
+
+    #[test]
+    fn todos_are_listed_by_position_never_by_database_key() {
+        let hashed = crate::storage::TodoItem {
+            // What a line typed straight into todos.md gets: a content hash, 20 digits decimal.
+            id: 0xc75b_a919_4ac1_a291,
+            body: "Test syncing todos from desktop".into(),
+            created_at: Utc::now(),
+            done: false,
+        };
+        let other = crate::storage::TodoItem {
+            id: 2,
+            body: "Call the plumber".into(),
+            ..hashed.clone()
+        };
+        let listed = format_todos(&[hashed.clone(), other], true);
+
+        assert_eq!(
+            listed,
+            "1. Test syncing todos from desktop\n2. Call the plumber\n"
+        );
+        assert!(
+            !listed.contains("14362"),
+            "a database key must never reach the prompt: {listed}"
+        );
+        assert_eq!(format_todos(&[hashed], false), "- Test syncing todos from desktop\n");
     }
 
     #[tokio::test]
