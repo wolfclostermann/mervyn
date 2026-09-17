@@ -1,6 +1,6 @@
 # Mervyn
 
-Personal AI assistant: Telegram bot (long polling), Obsidian vault sync into `redb`, scheduled jobs, and Claude. Runs headlessly in Docker (deployment is often an **Oracle Cloud Ampere** ARM64 VPS—see the spec).
+Personal AI assistant: Telegram bot (long polling), two-way Obsidian vault sync with `redb`, scheduled jobs, and Claude. Runs headlessly in Docker (deployment is often an **Oracle Cloud Ampere** ARM64 VPS—see the spec).
 
 See [mervyn_project_spec.md](mervyn_project_spec.md) for architecture, the message ingest/dedupe pipeline, and implementation notes.
 
@@ -91,15 +91,39 @@ Roughly what each intent does (you do **not** type these labels yourself—descr
 | Intent (internal) | What it does |
 | ----------------- | ------------ |
 | **Reminder** | Stores a reminder in `redb`. If the message contains an ISO date `YYYY-MM-DD`, that day is used (default time 09:00 UTC); otherwise due time defaults to about **tomorrow** at 09:00 UTC. Due reminders are **posted to `TELEGRAM_CHAT_ID`** on a schedule (see below). |
-| **Event** | Saves a calendar-style **event** in `redb` with a default start around **24 hours** ahead; refine times and detail in Obsidian (`events.md`) if needed. |
+| **Event** | Saves a calendar-style **event** in `redb`, and (with write-back on) writes it into `events.md`; refine times and detail in Obsidian either way. |
 | **Work log** | Appends a **worklog** entry with the current UTC timestamp. |
-| **Note** | Parses one or more **todo** lines and stores them in **`redb`** (open until marked done). They appear in **morning briefing** context and **ask** context. For long-form writing you can still use **`data/vault/notes/`** in Obsidian. |
-| **Complete todo** | Loads **open** todos, uses Claude to match your wording (or numeric id) to rows, then sets **`done`** in **`redb`**. |
+| **Note** | Parses one or more **todo** lines and stores them in **`redb`** (open until marked done), and with write-back on mirrors them to `todos.md` as checkboxes. They appear in **morning briefing** context and **ask** context. For long-form writing you can still use **`data/vault/notes/`** in Obsidian. |
+| **Complete todo** | Loads **open** todos, uses Claude to match your wording (or numeric id) to rows, then sets **`done`** in **`redb`** — which ticks the box in `todos.md`. Ticking it in Obsidian works too. |
 | **Ask** | Builds **context** from `redb` plus vault Markdown and asks Claude for an answer, then returns that text in Telegram (split into 4096-character messages if it is long). |
 
 ### Obsidian vault (`data/vault`)
 
-Treat **`data/vault`** as the human-readable layer (e.g. synced Obsidian folder). Expected top-level files include **`worklog.md`**, **`reminders.md`**, and **`events.md`**, plus a **`notes/`** tree—see [mervyn_project_spec.md](mervyn_project_spec.md) for Markdown/front-matter behaviour. **Edits on disk** are picked up by a **debounced file watcher** and by a periodic **vault sync** job so the database stays aligned with what you typed in the editor.
+Treat **`data/vault`** as the human-readable layer (e.g. a synced Obsidian folder). Top-level files
+are **`reminders.md`**, **`events.md`**, **`todos.md`** and **`worklog.md`**, plus a **`notes/`**
+tree — see [mervyn_project_spec.md](mervyn_project_spec.md) for Markdown/front-matter behaviour.
+**Edits on disk** are picked up by a **debounced file watcher** and by a periodic **vault sync**
+job.
+
+Sync is **two-way** for reminders, events and todos: rows added from chat are written into the
+vault, and edits made in Obsidian reach the database. Each item carries its row id in an HTML
+comment — `- [ ] Pay tax — due 2026-11-15 09:00 <!--mv:1a2b-->` — which Obsidian hides in reading
+view and which is what lets an edited line keep its identity. Leave it in place; a line without one
+is treated as new and given one on the next sync.
+
+Times are **local wall-clock** in `scheduler.timezone`, written without an offset, and resolved for
+the date in question — writing `2026-11-15 09:00` in August still means 09:00 GMT that morning. A
+bare date means local noon. Event headings take `## YYYY-MM-DD [HH:MM[–HH:MM]] — Title`.
+
+**Write-back is off by default.** Set `MERVYN__VAULT__WRITE_BACK_ENABLED=true` (or `[vault]` in
+[`config/default.toml`](config/default.toml)) to let Mervyn modify the files; until then it only
+reads them. The first write of each run copies the managed files to a timestamped sibling of the
+vault. **`worklog.md` is never written** — it is a symlink into the worklog clone, and touching
+that working tree would break the scheduled `git pull --ff-only`.
+
+Deletions work in both directions: removing a line deletes the row, and deleting an event from chat
+removes its section. If the whole file goes missing — a moved vault, an unmounted volume — nothing
+is deleted. See [docs/two-way-vault-sync.md](docs/two-way-vault-sync.md) for the merge rules.
 
 ### Background jobs (defaults)
 
@@ -107,7 +131,7 @@ Schedules and timezone come from [`config/default.toml`](config/default.toml) (`
 
 - **Morning briefing** — generated from vault + `redb` and **posted to `TELEGRAM_CHAT_ID`** (default cron **07:30** in **`Europe/London`**).
 - **Reminder check** — runs **every minute**; posts due reminders to **`TELEGRAM_CHAT_ID`** and advances or completes them.
-- **Vault sync** — periodic import from Markdown into `redb` (default **every five minutes**), in addition to the live watcher.
+- **Vault sync** — periodic reconcile between Markdown and `redb` (default **every five minutes**), in addition to the live watcher.
 - **Message ingest maintenance** — prunes old `message_ingest` rows and sweeps stuck “pending” deliveries (housekeeping, not user-facing).
 
 ### HTTP endpoints

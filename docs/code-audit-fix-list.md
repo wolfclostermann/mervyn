@@ -15,8 +15,10 @@ Structured backlog from a full pass over the Rust codebase (storage, schedulers,
 3. **`complete_todo` silently treats bad model JSON as “complete nothing”** (`src/intent/complete_todo.rs`)  
    When `parse_complete_reply` fails, the code logs a warning and uses an empty `Vec`, which surfaces as the generic “No todos were marked done” reply. Users cannot distinguish parse failure from the model returning no ids. Consider a distinct user-visible message when JSON parsing fails vs an empty id list.
 
-4. **Vault sync overwrites DB rows by shared ids** (`src/vault/sync.rs` + `vault/md` parsing)  
-   Obsidian-derived rows and Slack/app-created rows share the same tables; sync can overwrite app-created records if ids collide (vault hashing vs `next_id`). Document the contract clearly or separate namespaces/tables if this causes real incidents.
+4. ~~**Vault sync overwrites DB rows by shared ids**~~ — **fixed 2026-09-17.** Items carry their id
+   in the Markdown as an HTML comment, so identity no longer depends on hashing content and an
+   edited line keeps its row. Hashing survives only to bootstrap a line that has no marker yet.
+   See `docs/two-way-vault-sync.md`.
 
 ---
 
@@ -91,7 +93,7 @@ Structured backlog from a full pass over the Rust codebase (storage, schedulers,
 | Priority | Items |
 |----------|--------|
 | **P0** | 1 (reminder consistency), 2 (appointment full scan) |
-| **P1** | 5 (timezone split), 3 (complete_todo parse vs empty), 4 (vault/id collisions) |
+| **P1** | 5 (timezone split — partly addressed: vault times are now local wall-clock via `local_time.rs`), 3 (complete_todo parse vs empty) |
 | **P2** | 6, 7, 8 (DRY + errors), 12 (cron validation), 14 (serialization/version story) |
 | **P3** | 9, 16 (perf polish), 10, 11 (observability/UX), 13, 15, 17–19 |
 

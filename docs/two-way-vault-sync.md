@@ -1,7 +1,7 @@
 # Two-way vault sync
 
 *Design and staging plan for making the Obsidian vault a **view** as well as an input.
-Written 2026-09-16. Decisions at the bottom are settled; the phases are not yet built.*
+Written 2026-09-16, built 2026-09-17. All four phases have landed; write-back ships disabled.*
 
 ---
 
@@ -120,15 +120,27 @@ into it puts unstaged changes in that working tree, and `git pull --ff-only` in
 separate project. The pull is disabled at the moment, so the breakage is latent rather than
 visible — which is exactly why it is written down here. Chat `log_work` entries stay database-only.
 
-### 6. Rendering waits for the timezone question
+### 6. Times are local wall-clock
 
-Canonical renderers (`Reminder` → `- [ ] … — due …`) were planned for phase 1 and deferred to
-phase 2, because the grammar cannot yet express what a chat-created row holds. `— due 2026-04-10`
-parses to **noon UTC**; a reminder added from chat is due at, say, 09:00 local. Rendering it
-date-only and re-reading it would silently move it. So phase 2 has to settle two things together:
-an optional `HH:MM` in the grammar, and whether vault times are written in UTC or in
-`scheduler.timezone` — which is audit item 5, the timezone split, arriving from the other
-direction. Phase 1 therefore writes markers and nothing else.
+The grammar takes an optional `HH:MM` on a reminder's due date and `HH:MM[–HH:MM]` on an event
+heading, written in `scheduler.timezone` with **no offset suffix**. A bare date means local noon,
+so noon renders back as a bare date and still round-trips exactly.
+
+Local won over UTC and over a written offset for one reason: both alternatives put arithmetic
+between the user and their own notes, and the arithmetic changes with the date. To schedule 09:00
+in November you would write `09:00Z`, but 09:00 tomorrow is `08:00Z` — same number on the clock,
+different number in the file. A written offset is worse still, because hand-typing the offset you
+are *currently* living in for a date on the other side of a changeover is a well-formed way to be
+an hour early.
+
+The offset is resolved for the date being converted, never for today, so `2026-11-15 09:00` written
+in August is 09:00 GMT that morning. That rule lives in `local_time.rs`, shared with the chat path
+so the two cannot drift, with the DST edges under test: the repeated hour resolves to the later
+instant, the missing hour is pushed forward.
+
+The residue: the file is not self-describing, so changing `scheduler.timezone` would silently
+re-mean every stored line. Acceptable for a single-user vault pinned to `Europe/London`, and
+recorded here rather than discovered later.
 
 ### 7. `todos.md` is the easy win
 
@@ -149,11 +161,11 @@ from the query context. This is part of the work, not a follow-up.
 
 | Phase | Content | Risk |
 |---|---|---|
-| **0** ✅ | Span-preserving front-matter strip; vault lock; atomic-write helper; self-write suppression; `[vault] write_back_enabled = false`; one-shot backup | None — no writes yet |
-| **1** ✅ | Marker grammar, `into_offset_iter` parsing, marker back-fill write. **Fixes the orphan-on-edit bug on its own.** | First writes to the vault; deploy dark, verify in logs, then enable |
-| **2** | Canonical renderers; db → md: chat-created events / reminders / todos appear; `remove_event` strips lines; reminder firing ticks boxes; `todos.md` introduced | Medium |
-| **3** | md → db deletes with tombstones; `vault_sync_state` three-way merge | Medium |
-| **4** | Assembler dedupe; README "Obsidian vault", spec, and the handoff's "Obsidian is an input, never a view" paragraph; close audit item 4 | Low |
+| **0** ✅ | Span-preserving front-matter strip; vault lock; atomic-write helper; self-write suppression; `[vault] write_back_enabled = false`; one-shot backup | None — no writes |
+| **1** ✅ | Marker grammar, `into_offset_iter` parsing, marker back-fill write. **Fixed the orphan-on-edit bug on its own.** | First writes to the vault |
+| **2** ✅ | Local wall-clock grammar; canonical renderers with round-trip tests | None on its own |
+| **3** ✅ | `vault_state` snapshots; three-way merge; db → md materialisation; deletes in both directions; `todos.md` | The substantive one |
+| **4** ✅ | Assembler dedupe; README, handoff and audit item 4 | Low |
 
 Module layout: `src/vault/{md.rs, render.rs, marker.rs, reconcile.rs, write.rs, watcher.rs}`, with
 `sync.rs` becoming a thin `reconcile()` wrapper so callers do not all change at once.
@@ -167,6 +179,30 @@ Module layout: `src/vault/{md.rs, render.rs, marker.rs, reconcile.rs, write.rs, 
 - A tombstoned marker does not resurrect.
 - CRLF files and front-matter files survive a write unchanged.
 - A file with prose, bold and callouts between items is byte-identical outside the edited line.
+
+## What shipped, and what to know about it
+
+**Rewrites are as small as the change allows.** A fired reminder differs from its line only in the
+checkbox, so that single character is replaced in place and `- [ ] Pay the **tax** bill` keeps its
+bold. An event is never re-rendered wholesale — only its heading line — because the description is
+free Markdown the parser flattens, and rewriting the section would strip a link out of the note.
+
+**The re-firing bug is fixed.** It predated this work: a vault-sourced reminder that fired was set
+`done` in redb, then reset to unticked by the next import, and fired again five minutes later, for
+ever. It went unnoticed only because the deployed vault has no `reminders.md`. The snapshot is what
+resolves it — without one, that state is genuinely ambiguous.
+
+**Deleting the whole file deletes nothing.** A line that had a snapshot and is now gone deletes its
+row, but only when the file is still there. A missing file is a moved vault or an unmounted volume.
+The gap that remains: a file *truncated to empty* still reads as "everything was deleted". The
+first-write backup is the safety net.
+
+**`next_id` is max-key-plus-one**, and vault rows are keyed by FNV hash, so once a hand-written
+event exists the next chat-created event gets a 19-digit id too. Harmless — ids stay unique — but
+it makes numeric references in chat unwieldy for events and reminders. Todos keep small ids while
+`todos.md` has no hand-written entries. Pre-existing; worth fixing separately.
+
+**Still one-way:** the worklog, and `notes/`.
 
 ## Decisions
 

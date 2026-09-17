@@ -14,7 +14,6 @@ const NOTES_CHAR_BUDGET: usize = 24_000;
 /// Events horizon for freeform Q&A (`ask`) — covers “next month” style questions.
 const QUERY_EVENT_HORIZON_DAYS: i64 = 40;
 /// Cap for `events.md` mirror in query context (keeps token use bounded).
-const QUERY_EVENTS_MD_MAX_CHARS: usize = 12_000;
 /// Cap for `worklog.md` mirror in query context (git-synced file may be ahead of redb briefly).
 const QUERY_WORKLOG_MD_MAX_CHARS: usize = 16_000;
 
@@ -199,7 +198,12 @@ impl ContextAssembler {
         ))
     }
 
-    /// Context for freeform Q&A: upcoming events (DB + `events.md`), reminders, recent worklog (no `notes/`).
+    /// Context for freeform Q&A: upcoming events, reminders, todos, recent worklog (no `notes/`).
+    ///
+    /// `events.md` is not included. Vault sync imports every event in it, so the database block
+    /// below is a superset — pasting the file in as well cost tokens and invited Claude to
+    /// report the same appointment twice. `worklog.md` is still included, because the worklog is
+    /// one-way and the file can hold git-backed lines the database has not seen.
     pub async fn build_query_context(
         &self,
         now: DateTime<Utc>,
@@ -209,18 +213,6 @@ impl ContextAssembler {
         let evs = events::upcoming_within(self.db.as_ref(), now, event_until, 120)
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let events_md_raw = read_file_or_empty(self.vault_path.join("events.md")).await?;
-        let md_len = events_md_raw.chars().count();
-        let events_md: String = events_md_raw.chars().take(QUERY_EVENTS_MD_MAX_CHARS).collect();
-        let events_md_block = if events_md.trim().is_empty() {
-            "(empty or missing)\n".to_string()
-        } else {
-            let mut s = events_md;
-            if md_len > QUERY_EVENTS_MD_MAX_CHARS {
-                s.push_str("\n… (events.md truncated)\n");
-            }
-            s
-        };
 
         let reminder_horizon = now + Duration::days(7);
         let pending = reminders::pending_due_within(self.db.as_ref(), reminder_horizon, 40)
@@ -257,14 +249,12 @@ impl ContextAssembler {
         Ok(format!(
             "{situation_block}\
              ## Upcoming events (database, next {} days)\n{}\n\n\
-             ## Vault events.md\n{}\n\n\
              ## Pending reminders\n{}\n\n\
              ## Open todos (database; numeric ids for reference)\n{}\n\n\
              ## Recent worklog (database, last 7 days)\n{}\n\n\
              ## Vault worklog.md (file on disk; may include git-backed lines not yet in DB)\n{}",
             QUERY_EVENT_HORIZON_DAYS,
             format_events(&evs),
-            events_md_block,
             format_reminders(&pending),
             format_todos(&open_todos, true),
             format_worklog(&work),
