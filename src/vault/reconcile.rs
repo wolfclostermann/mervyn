@@ -241,6 +241,8 @@ pub struct Reconciled {
     pub changes: FileChanges,
     /// Snapshots to record once the write has actually landed.
     pub snapshots: Vec<(u64, String)>,
+    /// Tombstones to consume once the line has actually gone from the file.
+    pub tombstones_cleared: Vec<u64>,
 }
 
 /// Rewrite an item's text from `row`, as cheaply as the change allows.
@@ -283,6 +285,7 @@ pub fn reconcile_file<T: VaultRow>(
         edits: Vec::new(),
         changes: FileChanges::default(),
         snapshots: Vec::new(),
+        tombstones_cleared: Vec::new(),
     };
 
     let found = raw.map(|r| T::find(r, tz, now)).unwrap_or_default();
@@ -297,11 +300,13 @@ pub fn reconcile_file<T: VaultRow>(
         seen.insert(id);
         out.changes.imported += 1;
 
-        // Deleted from the database by chat: take the line out and stop tracking the row.
-        if vault_state::take_tombstone(db, id, T::FILE)? {
+        // Deleted from the database by chat: take the line out and stop tracking the row. The
+        // tombstone is consumed by the caller, once the bytes are actually gone from disk.
+        if vault_state::has_tombstone(db, id, T::FILE)? {
             out.edits.push(Edit::remove(f.span.clone()));
             vault_state::forget(db, id, T::FILE)?;
             out.changes.lines_removed += 1;
+            out.tombstones_cleared.push(id);
             continue;
         }
 

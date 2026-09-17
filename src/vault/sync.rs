@@ -140,6 +140,9 @@ fn sync_one<T: VaultRow>(
     for (id, rendered) in outcome.snapshots {
         vault_state::put(db, id, T::FILE, &rendered).map_err(|e| anyhow::anyhow!(e))?;
     }
+    for id in outcome.tombstones_cleared {
+        vault_state::take_tombstone(db, id, T::FILE).map_err(|e| anyhow::anyhow!(e))?;
+    }
 
     Ok(())
 }
@@ -525,6 +528,24 @@ mod tests {
         assert_eq!(s.lines_removed, 1);
         assert_eq!(f.read("events.md"), "## 2026-04-06 — Dentist\n<!--mv:2-->\n");
         assert_eq!(f.sync().lines_removed, 0, "the tombstone is consumed");
+    }
+
+    #[test]
+    fn a_tombstone_survives_a_cycle_that_did_not_write() {
+        let f = Fixture::new();
+        f.write("events.md", "## 2026-04-05 — Gig\n<!--mv:1-->\nDoors 7pm\n");
+        f.sync();
+        events::delete(&f.db, 1).unwrap();
+        vault_state::tombstone(&f.db, 1, "events.md").unwrap();
+
+        // Write-back off: nothing is removed, and the instruction must not be thrown away.
+        f.import_only();
+        assert!(f.read("events.md").contains("Gig"));
+        assert!(vault_state::has_tombstone(&f.db, 1, "events.md").unwrap());
+
+        let s = f.sync();
+        assert_eq!(s.lines_removed, 1, "the deferred removal still happens");
+        assert!(!vault_state::has_tombstone(&f.db, 1, "events.md").unwrap());
     }
 
     // ---- stability ----------------------------------------------------------------------------

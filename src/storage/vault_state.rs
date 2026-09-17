@@ -110,8 +110,17 @@ pub fn tombstone(db: &Database, id: u64, file: &str) -> Result<()> {
     )
 }
 
-/// Consume the tombstone for `id`, returning whether there was one. Consuming rather than reading
-/// means a line removed once is not hunted for ever after.
+/// Whether a line for `id` is still waiting to be removed from `file`.
+pub fn has_tombstone(db: &Database, id: u64, file: &str) -> Result<bool> {
+    Ok(get_str::<Tombstone>(db, VAULT_TOMBSTONES_TABLE, &key(file, id))?.is_some())
+}
+
+/// Consume the tombstone for `id`, returning whether there was one.
+///
+/// Called only once the line has actually gone from the file on disk. Consuming it during the
+/// merge would mean a write that then failed — or a commit later discarded — left no record that
+/// the section still needs removing, and the next sync would read the surviving line as a row to
+/// re-import.
 pub fn take_tombstone(db: &Database, id: u64, file: &str) -> Result<bool> {
     delete_str(db, VAULT_TOMBSTONES_TABLE, &key(file, id))
 }
@@ -158,6 +167,8 @@ mod tests {
     fn a_tombstone_is_consumed_by_the_first_taker() {
         let db = open_db();
         tombstone(&db, 7, "events.md").unwrap();
+        assert!(has_tombstone(&db, 7, "events.md").unwrap());
+        assert!(!has_tombstone(&db, 7, "todos.md").unwrap());
         assert!(!take_tombstone(&db, 7, "todos.md").unwrap(), "another file's id 7 is not this one");
         assert!(take_tombstone(&db, 7, "events.md").unwrap());
         assert!(
