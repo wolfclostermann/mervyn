@@ -14,7 +14,7 @@ use serde_yaml::Value as YamlValue;
 
 use super::marker;
 use crate::local_time::{local_noon, local_to_utc};
-use crate::storage::{Event, Recurrence, Reminder, WorklogEntry};
+use crate::storage::{Event, Recurrence, Reminder, TodoItem, WorklogEntry};
 
 /// Obsidian/Jekyll-style YAML block at the top of a file, as `(parsed, body_offset)` where
 /// `body_offset` is a **byte offset into `raw`** — `&raw[body_offset..]` is the Markdown body.
@@ -82,8 +82,11 @@ pub(super) fn stable_vault_row_id(prefix: &[u8], key: &str) -> u64 {
     h.finish()
 }
 
+/// A wall-clock hour and minute.
+type HourMin = (u32, u32);
+
 /// `HH:MM`, 24-hour. Deliberately strict: anything else is treated as prose, not a time.
-fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
+fn parse_hh_mm(s: &str) -> Option<HourMin> {
     let (h, m) = s.split_once(':')?;
     if h.is_empty() || h.len() > 2 || m.len() != 2 {
         return None;
@@ -108,8 +111,8 @@ fn split_time_range(s: &str) -> (&str, Option<&str>) {
 ///
 /// Tolerant: a trailing token that is not a time is ignored rather than failing the whole parse,
 /// so a line someone typed loosely still yields its date.
-fn parse_date_and_times(s: &str) -> Option<(NaiveDate, Option<(u32, u32)>, Option<(u32, u32)>)> {
-    let mut parts = s.trim().split_whitespace();
+fn parse_date_and_times(s: &str) -> Option<(NaiveDate, Option<HourMin>, Option<HourMin>)> {
+    let mut parts = s.split_whitespace();
     let date = NaiveDate::parse_from_str(parts.next()?, "%Y-%m-%d").ok()?;
     let Some(rest) = parts.next() else {
         return Some((date, None, None));
@@ -123,7 +126,7 @@ fn parse_date_and_times(s: &str) -> Option<(NaiveDate, Option<(u32, u32)>, Optio
 }
 
 /// A parsed date and optional local time as the UTC instant it denotes.
-fn at_local(date: NaiveDate, time: Option<(u32, u32)>, tz: Tz) -> chrono::DateTime<chrono::Utc> {
+fn at_local(date: NaiveDate, time: Option<HourMin>, tz: Tz) -> chrono::DateTime<chrono::Utc> {
     match time {
         Some((h, m)) => local_to_utc(date, h, m, tz).unwrap_or_else(|| local_noon(date, tz)),
         None => local_noon(date, tz),
@@ -140,9 +143,10 @@ fn parse_recurrence(s: &str) -> Recurrence {
     }
 }
 
-fn parse_reminder_body(
-    s: &str,
-) -> (String, Option<(NaiveDate, Option<(u32, u32)>)>, Option<Recurrence>) {
+/// A due date with an optional wall-clock time.
+type DueWhen = (NaiveDate, Option<HourMin>);
+
+fn parse_reminder_body(s: &str) -> (String, Option<DueWhen>, Option<Recurrence>) {
     let mut recurrence = None;
     let mut due = None;
     let mut body_part = s.to_string();
@@ -185,6 +189,15 @@ pub struct FoundItem<T> {
     /// Written before the marker: a space for a list item, a newline for an event heading (whose
     /// marker lives on its own line underneath).
     pub marker_sep: &'static str,
+    /// Everything belonging to this item — the bytes removed when the row is deleted. A list
+    /// item's own line; an event's whole `## …` section up to the next heading.
+    pub span: Range<usize>,
+    /// The bytes replaced when the database side changed: the anchor line only, so an event's
+    /// description keeps whatever formatting the parser cannot represent.
+    pub anchor: Range<usize>,
+    /// Offset of the character inside `[ ]`, when the item is a task. Flipping it in place is
+    /// how a fired reminder ticks its box without re-rendering — and losing — the line.
+    pub checkbox_at: Option<usize>,
 }
 
 impl<T> FoundItem<T> {
@@ -262,63 +275,118 @@ fn is_h2_start(ev: &MdEvent<'_>) -> bool {
     )
 }
 
-/// GitHub-style task list items → [`Reminder`], with the position of each id marker.
-pub fn find_reminders(raw: &str, tz: Tz) -> Vec<FoundItem<Reminder>> {
+/// A task-list item as it appears in the file, before it means anything in particular.
+struct RawTask {
+    done: bool,
+    text: String,
+    marker: Option<u64>,
+    span: Range<usize>,
+    line_end: usize,
+    checkbox_at: usize,
+}
+
+/// Every `- [ ]` / `- [x]` item in `raw`. Reminders and todos are the same shape on disk; only
+/// what the text after the box means differs.
+fn find_task_items(raw: &str) -> Vec<RawTask> {
     let events = spanned_events(raw, Options::ENABLE_TASKLISTS);
     let mut i = 0;
     let mut out = Vec::new();
 
     while i < events.len() {
-        if matches!(events[i].0, MdEvent::Start(Tag::Item)) {
-            let item_range = events[i].1.clone();
+        if !matches!(events[i].0, MdEvent::Start(Tag::Item)) {
             i += 1;
-            let done = if i < events.len() {
-                if let MdEvent::TaskListMarker(checked) = events[i].0 {
-                    i += 1;
-                    Some(checked)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(done) = done {
-                let text = collect_plain_until(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
-                consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
-                let (body, due, recurrence) = parse_reminder_body(text.trim());
-                let due = match due {
-                    Some((date, time)) => at_local(date, time, tz),
-                    None => chrono::Utc::now(),
-                };
-
-                // Only the item's own first line: a marker further down belongs to a nested item.
-                let line_end = first_line_end(raw, &item_range);
-                let found = marker::find(&raw[item_range.start..line_end]);
-                let had_marker = found.is_some();
-                let id = found.map_or_else(
-                    || stable_vault_row_id(b"rem:", &format!("{body}|{due}|{done}")),
-                    |f| f.id,
-                );
-
-                out.push(FoundItem {
-                    item: Reminder { id, body, due, recurrence, done },
-                    had_marker,
-                    marker_at: line_end,
-                    marker_sep: " ",
-                });
-            } else {
-                while i < events.len() && !matches!(events[i].0, MdEvent::End(TagEnd::Item)) {
-                    i += 1;
-                }
-                consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
-            }
-        } else {
-            i += 1;
+            continue;
         }
+        let span = events[i].1.clone();
+        i += 1;
+
+        let marked = match events.get(i) {
+            Some((MdEvent::TaskListMarker(checked), r)) => Some((*checked, r.clone())),
+            _ => None,
+        };
+        let Some((done, box_range)) = marked else {
+            // A plain bullet: skip to the end of the item and carry on.
+            while i < events.len() && !matches!(events[i].0, MdEvent::End(TagEnd::Item)) {
+                i += 1;
+            }
+            consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
+            continue;
+        };
+        i += 1;
+
+        let text = collect_plain_until(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
+        consume_if(&events, &mut i, |e| matches!(e, MdEvent::End(TagEnd::Item)));
+
+        // Only the item's own first line: a marker further down belongs to a nested item.
+        let line_end = first_line_end(raw, &span);
+        out.push(RawTask {
+            done,
+            text: text.trim().to_string(),
+            marker: marker::find(&raw[span.start..line_end]).map(|f| f.id),
+            span,
+            line_end,
+            // `[ ]` — the state is the middle character.
+            checkbox_at: box_range.start + 1,
+        });
     }
 
     out
+}
+
+fn task_found_item<T>(task: &RawTask, item: T) -> FoundItem<T> {
+    FoundItem {
+        item,
+        had_marker: task.marker.is_some(),
+        marker_at: task.line_end,
+        marker_sep: " ",
+        span: task.span.clone(),
+        anchor: task.span.start..task.line_end,
+        checkbox_at: Some(task.checkbox_at),
+    }
+}
+
+/// Open and completed todos — task items with nothing but a body.
+pub fn find_todos(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Vec<FoundItem<TodoItem>> {
+    find_task_items(raw)
+        .into_iter()
+        .map(|t| {
+            let id = t
+                .marker
+                .unwrap_or_else(|| stable_vault_row_id(b"todo:", &t.text));
+            let item = TodoItem {
+                id,
+                body: marker::strip(&t.text).trim().to_string(),
+                created_at: now,
+                done: t.done,
+            };
+            task_found_item(&t, item)
+        })
+        .collect()
+}
+
+/// GitHub-style task list items → [`Reminder`], with the position of each id marker.
+pub fn find_reminders(raw: &str, tz: Tz) -> Vec<FoundItem<Reminder>> {
+    find_task_items(raw)
+        .into_iter()
+        .map(|t| {
+            let (body, due, recurrence) = parse_reminder_body(marker::strip(&t.text).trim());
+            let due = match due {
+                Some((date, time)) => at_local(date, time, tz),
+                None => chrono::Utc::now(),
+            };
+            let id = t.marker.unwrap_or_else(|| {
+                stable_vault_row_id(b"rem:", &format!("{body}|{due}|{}", t.done))
+            });
+            let item = Reminder {
+                id,
+                body,
+                due,
+                recurrence,
+                done: t.done,
+            };
+            task_found_item(&t, item)
+        })
+        .collect()
 }
 
 /// [`find_reminders`] without the write-back bookkeeping.
@@ -428,6 +496,8 @@ pub fn find_events(raw: &str, tz: Tz) -> Vec<FoundItem<Event>> {
                 Some(desc_lines.join("\n"))
             };
 
+            // The section runs to the next `##`, or to the end of the file.
+            let section_end = events.get(i).map_or(raw.len(), |e| e.1.start);
             let heading_end = first_line_end(raw, &heading_range);
             let found = next_line(raw, heading_end).and_then(|(line, _)| {
                 let t = line.trim();
@@ -451,6 +521,9 @@ pub fn find_events(raw: &str, tz: Tz) -> Vec<FoundItem<Event>> {
                 had_marker,
                 marker_at: heading_end,
                 marker_sep: "\n",
+                span: heading_range.start..section_end,
+                anchor: heading_range.start..heading_end,
+                checkbox_at: None,
             });
         } else {
             i += 1;

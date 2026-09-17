@@ -19,18 +19,30 @@ pub fn put(db: &Database, item: &TodoItem) -> Result<()> {
     table::put_u64(db, TODOS_TABLE, item.id, item)
 }
 
-#[allow(dead_code)] // For future “remove todo” / admin tooling
 pub fn get(db: &Database, id: u64) -> Result<Option<TodoItem>> {
     table::get_u64(db, TODOS_TABLE, id)
 }
 
-#[allow(dead_code)]
 pub fn delete(db: &Database, id: u64) -> Result<bool> {
     table::delete_u64(db, TODOS_TABLE, id)
 }
 
 pub fn next_id(db: &Database) -> Result<u64> {
     table::next_id_u64(db, TODOS_TABLE)
+}
+
+/// Every todo, open or done, oldest first. Vault reconcile needs the completed ones too — a
+/// ticked box in the file has to stay ticked rather than look like a row that vanished.
+pub fn list_all(db: &Database) -> Result<Vec<TodoItem>> {
+    let r = db.begin_read()?;
+    let t = r.open_table(TODOS_TABLE)?;
+    let mut out = Vec::new();
+    for row in t.iter()? {
+        let (_, v) = row?;
+        out.push(codec::decode::<TodoItem>(v.value())?);
+    }
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    Ok(out)
 }
 
 /// Open items (`done == false`), oldest first, at most `max` rows.

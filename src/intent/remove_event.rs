@@ -10,6 +10,7 @@ use crate::intent::normalize_claude_json_block;
 use crate::state::AppState;
 use crate::storage::event_notices;
 use crate::storage::events;
+use crate::storage::vault_state;
 use crate::user_situation;
 
 fn parse_remove_reply(raw: &str) -> anyhow::Result<Vec<u64>> {
@@ -79,6 +80,12 @@ pub async fn run(state: &AppState, text: &str) -> anyhow::Result<String> {
             if events::delete(state.db.as_ref(), id).map_err(|e| anyhow::anyhow!(e))? {
                 if let Err(e) = event_notices::delete(state.db.as_ref(), id) {
                     tracing::warn!(id, error = %e, "remove_event: event_notices delete failed");
+                }
+                // The row may also have a section in the vault. Absence is not evidence of a
+                // deletion — restoring a database backup would read as one — so say so explicitly
+                // and let the next sync take the section out.
+                if let Err(e) = vault_state::tombstone(state.db.as_ref(), id, "events.md") {
+                    tracing::warn!(id, error = %e, "remove_event: vault tombstone failed");
                 }
                 removed_titles.push(title);
             }

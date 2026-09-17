@@ -178,18 +178,48 @@ impl VaultAccess {
     }
 }
 
-/// Apply insertions to `raw`, returning the new text. Each edit is `(byte offset, text)`.
+/// One change to a file's bytes. Insert is an empty span, removal is empty text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edit {
+    pub span: std::ops::Range<usize>,
+    pub text: String,
+}
+
+impl Edit {
+    pub fn insert(at: usize, text: impl Into<String>) -> Self {
+        Self { span: at..at, text: text.into() }
+    }
+
+    pub fn replace(span: std::ops::Range<usize>, text: impl Into<String>) -> Self {
+        Self { span, text: text.into() }
+    }
+
+    pub fn remove(span: std::ops::Range<usize>) -> Self {
+        Self { span, text: String::new() }
+    }
+}
+
+/// Apply `edits` to `raw`, returning the new text.
 ///
-/// Applied back to front so that earlier offsets stay valid — the whole reason write-back splices
-/// into the original bytes instead of re-rendering the file is that everything the parser does not
+/// Applied back to front so that earlier offsets stay valid — the whole reason write-back edits
+/// the original bytes instead of re-rendering the file is that everything the parser does not
 /// model (prose, bold, callouts, blank-line layout, front matter) has to survive untouched.
-pub fn splice(raw: &str, edits: &mut [(usize, String)]) -> String {
-    edits.sort_by(|a, b| b.0.cmp(&a.0));
+pub fn apply_edits(raw: &str, edits: &mut [Edit]) -> String {
+    edits.sort_by(|a, b| b.span.start.cmp(&a.span.start));
     let mut out = raw.to_string();
-    for (at, text) in edits.iter() {
-        out.insert_str(*at, text);
+    for e in edits.iter() {
+        out.replace_range(e.span.clone(), &e.text);
     }
     out
+}
+
+/// [`apply_edits`] for insertions given as `(offset, text)`.
+pub fn splice(raw: &str, edits: &mut [(usize, String)]) -> String {
+    let mut edits: Vec<Edit> = edits
+        .iter()
+        .map(|(at, t)| Edit::insert(*at, t.clone()))
+        .collect();
+    apply_edits(raw, &mut edits)
 }
 
 /// The path a write should actually land on: the symlink's target if `path` is a link.
@@ -218,6 +248,26 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::tempdir;
+
+    #[test]
+    fn edits_replace_and_remove_spans() {
+        let raw = "- [ ] one\n- [ ] two\n- [ ] three\n";
+        let mut edits = vec![
+            Edit::replace(0..9, "- [x] ONE"),
+            Edit::remove(10..20),
+        ];
+        assert_eq!(apply_edits(raw, &mut edits), "- [x] ONE\n- [ ] three\n");
+    }
+
+    #[test]
+    fn a_one_character_replacement_leaves_the_rest_of_the_line_alone() {
+        let raw = "- [ ] **Pay** the bill <!--mv:1-->\n";
+        let mut edits = vec![Edit::replace(3..4, "x")];
+        assert_eq!(
+            apply_edits(raw, &mut edits),
+            "- [x] **Pay** the bill <!--mv:1-->\n"
+        );
+    }
 
     #[test]
     fn splice_applies_every_edit_at_the_offset_it_was_measured_at() {
