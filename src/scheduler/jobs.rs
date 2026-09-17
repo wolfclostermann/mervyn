@@ -1,9 +1,7 @@
-//! Cron jobs: morning briefing, reminder check, vault sync, optional worklog `git pull`.
+//! Cron jobs: morning briefing, reminder check, vault sync, optional vault git sync.
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
 
-use anyhow::Context;
 
 use crate::claude::prompts;
 use crate::context::ContextAssembler;
@@ -12,7 +10,6 @@ use crate::storage::reminders;
 use crate::user_situation;
 use crate::storage::message_ingest;
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tokio::process::Command;
 
 /// One vault cycle. Synchronous on purpose: it takes the vault lock internally, so it must not
 /// be held across an await — calling it as a plain expression keeps that impossible.
@@ -33,7 +30,6 @@ async fn run_morning_briefing(state: &AppState) -> anyhow::Result<()> {
     let asm = ContextAssembler::new(
         state.db.clone(),
         state.vault_path.clone(),
-        state.settings.worklog_md_git_mirror_path(),
     );
     let (ev, rem, wl) = asm
         .briefing_prompt_sections(now, situation.as_deref())
@@ -78,60 +74,52 @@ async fn run_vault_sync(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `git pull` worklog repo + vault sync. Used on a cron when enabled and once at process startup.
+/// Pull the vault clone, reconcile it with the database, then commit and push what changed.
 ///
-/// When **`MERVYN_WORKLOG_GITHUB_PAT`** is set (e.g. from `.env` / Compose), sends GitHub HTTPS
-/// **Basic** auth (`x-access-token:<secret>`) via `http.https://github.com/.extraheader`, so
-/// private clones work in Docker without an interactive credential prompt. Value can be a
-/// classic/fine-grained PAT or a `gh auth token` OAuth token (`gho_…`).
-pub async fn run_worklog_git_pull(state: &AppState) -> anyhow::Result<()> {
-    let cfg = &state.settings.worklog_git;
-    if !cfg.enabled {
-        return Ok(());
-    }
-    let repo = cfg.repo_path.trim();
-    if repo.is_empty() {
-        tracing::warn!("worklog_git.enabled is true but worklog_git.repo_path is empty");
+/// This is the whole cycle, and it is deliberately one blocking unit run off the async runtime:
+/// it holds the vault lock from the pull through to the push, so that a file cannot move under a
+/// merge that has already measured its byte offsets.
+///
+/// With `MERVYN_VAULT_GITHUB_PAT` set, HTTPS pushes to a private GitHub repo work without a
+/// prompt. Pushing needs a token with **write** access, where the old worklog pull only needed
+/// read.
+pub async fn run_vault_git_sync(state: &AppState) -> anyhow::Result<()> {
+    if !state.settings.vault_git.enabled {
         return Ok(());
     }
 
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg("-c")
-        .arg("credential.helper=");
-    if let Ok(pat) = std::env::var("MERVYN_WORKLOG_GITHUB_PAT") {
-        let pat = pat.trim();
-        if !pat.is_empty() {
-            // GitHub Git-over-HTTPS expects `x-access-token` + PAT/OAuth token as Basic, not Bearer.
-            let basic = B64.encode(format!("x-access-token:{pat}"));
-            let header = format!("AUTHORIZATION: basic {basic}");
-            cmd.arg("-c")
-                .arg(format!("http.https://github.com/.extraheader={header}"));
+    let db = state.db.clone();
+    let vault_path = state.vault_path.clone();
+    let vault = state.vault.clone();
+    let policy = state.write_back_policy();
+    let tz = state.vault_tz();
+    let git_cfg = state.settings.vault_git.clone();
+
+    let stats = tokio::task::spawn_blocking(move || {
+        let ctx = crate::vault::sync::SyncContext {
+            access: vault.as_ref(),
+            policy,
+            tz,
+        };
+        crate::vault::sync::sync_vault_with_git(db.as_ref(), &vault_path, ctx, &git_cfg)
+    })
+    .await??;
+
+    if stats.git_conflict {
+        // A paused vault is otherwise invisible: the phone just quietly stops updating.
+        let msg = "Heads up: the vault has diverged from its git remote and I could not rebase it. \
+I have stopped writing to it until that is sorted — your notes are safe, but anything I add will \
+not reach your other devices. Resolve the conflict in the vault clone and I will pick up again.";
+        if let Err(e) = state
+            .telegram
+            .send_message(&state.secrets.telegram_chat_id.to_string(), msg)
+            .await
+        {
+            tracing::warn!(error = %e, "could not report vault git conflict to chat");
         }
     }
-    cmd.args([
-        "pull",
-        "--ff-only",
-        cfg.remote.trim(),
-        cfg.branch.trim(),
-    ]);
 
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("spawn git pull in {repo}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!("git pull in {repo} failed: {stderr} {stdout}");
-    }
-
-    tracing::info!(repo, remote = %cfg.remote, branch = %cfg.branch, "worklog git pull ok");
-
-    let s = sync_vault(state)?;
-    tracing::debug!(?s, "vault synced after worklog git pull");
+    tracing::debug!(?stats, "vault git sync");
     Ok(())
 }
 
@@ -229,25 +217,19 @@ pub async fn spawn_scheduler(state: AppState) -> anyhow::Result<()> {
         })?)
         .await?;
 
-    if state.settings.worklog_git.enabled {
-        if state.settings.worklog_git.repo_path.trim().is_empty() {
-            tracing::warn!(
-                "worklog_git.enabled is true but repo_path is empty; worklog git pull job not scheduled"
-            );
-        } else {
-            let st = state.clone();
-            let c = st.settings.worklog_git.pull_cron.clone();
-            sched
-                .add(Job::new_async_tz(c.as_str(), tz, move |_uuid, _lock| {
-                    let st = st.clone();
-                    Box::pin(async move {
-                        if let Err(e) = run_worklog_git_pull(&st).await {
-                            tracing::error!(error = %e, "worklog_git_pull job");
-                        }
-                    })
-                })?)
-                .await?;
-        }
+    if state.settings.vault_git.enabled {
+        let st = state.clone();
+        let c = st.settings.vault_git.sync_cron.clone();
+        sched
+            .add(Job::new_async_tz(c.as_str(), tz, move |_uuid, _lock| {
+                let st = st.clone();
+                Box::pin(async move {
+                    if let Err(e) = run_vault_git_sync(&st).await {
+                        tracing::error!(error = %e, "vault_git_sync job");
+                    }
+                })
+            })?)
+            .await?;
     }
 
     tokio::spawn(async move {

@@ -125,6 +125,27 @@ Deletions work in both directions: removing a line deletes the row, and deleting
 removes its section. If the whole file goes missing — a moved vault, an unmounted volume — nothing
 is deleted. See [docs/two-way-vault-sync.md](docs/two-way-vault-sync.md) for the merge rules.
 
+### Getting the vault onto a laptop and a phone
+
+The vault directory is the working tree of a private git repo. With `[vault_git]` enabled, each
+cycle pulls, reconciles, then commits and pushes what changed; Obsidian Git does the same at the
+other end, on desktop and mobile. Obsidian Sync cannot do this job — it runs inside the Obsidian
+app, and there is no headless client to run on the server.
+
+```sh
+# once, on the box that holds the vault
+MERVYN_VAULT_GITHUB_PAT=… ./scripts/vault-git-init.sh ~/mervyn/data/vault \
+    https://github.com/you/mervyn-vault.git main
+```
+
+Then set `MERVYN__VAULT_GIT__ENABLED=true` and `MERVYN_VAULT_GITHUB_PAT` (a token with **write**
+access). The **worklog lives in this repo too** — `worklog.md` is an ordinary file in the vault,
+not a symlink into a separate clone, and the old `[worklog_git]` section is gone.
+
+If an edit on your phone and an edit by Mervyn land on nearby lines between two syncs, the rebase
+will conflict. Mervyn aborts it, stops writing, and tells you in chat; resolve it in the clone and
+it picks up again.
+
 ### Background jobs (defaults)
 
 Schedules and timezone come from [`config/default.toml`](config/default.toml) (`[scheduler]`); override with `MERVYN__SCHEDULER__…` if needed.
@@ -132,6 +153,7 @@ Schedules and timezone come from [`config/default.toml`](config/default.toml) (`
 - **Morning briefing** — generated from vault + `redb` and **posted to `TELEGRAM_CHAT_ID`** (default cron **07:30** in **`Europe/London`**).
 - **Reminder check** — runs **every minute**; posts due reminders to **`TELEGRAM_CHAT_ID`** and advances or completes them.
 - **Vault sync** — periodic reconcile between Markdown and `redb` (default **every five minutes**), in addition to the live watcher.
+- **Vault git sync** — when `[vault_git]` is on, pull → reconcile → commit → push on the same cadence, carrying the vault to your other devices.
 - **Message ingest maintenance** — prunes old `message_ingest` rows and sweeps stuck “pending” deliveries (housekeeping, not user-facing).
 
 ### HTTP endpoints

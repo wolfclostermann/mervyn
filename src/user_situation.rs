@@ -34,7 +34,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AppConfig, ClaudeSection, SchedulerSection, ServerSection, StorageSection,
-        UserContextSection, VaultSection, WorklogGitSection,
+        UserContextSection, VaultGitSection, VaultSection,
     };
 
     fn cfg_with_vault(dir: &std::path::Path, file_body: &str) -> AppConfig {
@@ -68,8 +68,8 @@ mod tests {
                 situation_file: "mervyn-situation.md".into(),
                 situation_max_chars: 5000,
             },
-            worklog_git: WorklogGitSection::default(),
             vault: VaultSection::default(),
+            vault_git: VaultGitSection::default(),
         }
     }
 

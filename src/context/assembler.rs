@@ -23,8 +23,6 @@ const BRIEFING_QUEUE_MAX_AGE: Duration = Duration::hours(48);
 pub struct ContextAssembler {
     db: Arc<Database>,
     vault_path: PathBuf,
-    /// `worklog.md` inside `[worklog_git].repo_path` when set (see [`crate::config::AppConfig::worklog_md_git_mirror_path`]).
-    worklog_md_fallback: Option<PathBuf>,
 }
 
 struct VaultMirror {
@@ -45,45 +43,28 @@ impl ContextAssembler {
     pub fn new(
         db: Arc<Database>,
         vault_path: PathBuf,
-        worklog_md_fallback: Option<PathBuf>,
     ) -> Self {
         Self {
             db,
             vault_path,
-            worklog_md_fallback,
         }
     }
 
-    /// Prefer vault `worklog.md`; if missing, unreadable, or whitespace-only, try `worklog_md_fallback`.
-    async fn read_worklog_md_with_fallback(&self) -> anyhow::Result<String> {
-        let primary_path = self.vault_path.join("worklog.md");
-        let primary = match tokio::fs::read_to_string(&primary_path).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+    /// `worklog.md` from the vault, empty when it is missing.
+    ///
+    /// There used to be a fallback to a separate `worklog_git` clone, because the vault's
+    /// `worklog.md` was a symlink into it that did not resolve outside the container. The worklog
+    /// is an ordinary file in the vault repo now, so there is nothing to fall back to.
+    async fn read_worklog_md(&self) -> anyhow::Result<String> {
+        let path = self.vault_path.join("worklog.md");
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
             Err(e) => {
-                tracing::warn!(
-                    path = %primary_path.display(),
-                    error = %e,
-                    "vault worklog.md read failed; will try worklog_git mirror if configured"
-                );
-                String::new()
-            }
-        };
-        if !primary.trim().is_empty() {
-            return Ok(primary);
-        }
-        if let Some(ref fb) = self.worklog_md_fallback {
-            match tokio::fs::read_to_string(fb).await {
-                Ok(s) if !s.trim().is_empty() => {
-                    tracing::debug!(path = %fb.display(), "using worklog.md from worklog_git mirror path");
-                    return Ok(s);
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %fb.display(), error = %e, "worklog git mirror read failed"),
+                tracing::warn!(path = %path.display(), error = %e, "vault worklog.md read failed");
+                Ok(String::new())
             }
         }
-        Ok(primary)
     }
 
     async fn load_briefing_data(
@@ -222,7 +203,7 @@ impl ContextAssembler {
             .map_err(|e| anyhow::anyhow!(e))?;
         let open_todos = todos::list_open(self.db.as_ref(), 80).map_err(|e| anyhow::anyhow!(e))?;
 
-        let worklog_md_raw = self.read_worklog_md_with_fallback().await?;
+        let worklog_md_raw = self.read_worklog_md().await?;
         let wl_len = worklog_md_raw.chars().count();
         let worklog_md: String = worklog_md_raw
             .chars()
@@ -265,7 +246,7 @@ impl ContextAssembler {
     async fn read_vault_mirror(&self) -> anyhow::Result<VaultMirror> {
         let events_md = read_file_or_empty(self.vault_path.join("events.md")).await?;
         let reminders_md = read_file_or_empty(self.vault_path.join("reminders.md")).await?;
-        let worklog_md = self.read_worklog_md_with_fallback().await?;
+        let worklog_md = self.read_worklog_md().await?;
 
         let mut notes_section = String::from("## Vault notes (*.md under notes/)\n");
         let notes_dir = self.vault_path.join("notes");
@@ -430,7 +411,7 @@ mod tests {
         )
         .unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -447,7 +428,7 @@ mod tests {
         std::fs::create_dir_all(vault.path().join("notes")).unwrap();
         std::fs::write(vault.path().join("notes/leak.md"), "SECRET").unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = Utc::now();
         let ctx = asm.build_query_context(now, None).await.unwrap();
         assert!(!ctx.contains("SECRET"));
@@ -474,7 +455,7 @@ mod tests {
         )
         .unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = DateTime::parse_from_rfc3339("2026-04-05T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -493,7 +474,7 @@ mod tests {
         )
         .unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = DateTime::parse_from_rfc3339("2026-04-07T18:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -503,26 +484,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_context_reads_worklog_from_fallback_when_vault_missing() {
+    async fn query_context_copes_with_no_worklog_at_all() {
+        // There used to be a fallback to a separate worklog_git clone here, because the vault's
+        // worklog.md was a symlink that did not resolve outside the container. It is a real file
+        // in the vault repo now, so a missing one simply means an empty section.
         let tmp = NamedTempFile::new().unwrap();
         let db = Arc::new(db::open(tmp.path().to_str().unwrap()).unwrap());
         let vault = tempfile::tempdir().unwrap();
-        let mirror = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            mirror.path(),
-            "## 2026-04-07\n- from git mirror only\n",
-        )
-        .unwrap();
 
-        let asm = ContextAssembler::new(
-            db,
-            vault.path().to_path_buf(),
-            Some(mirror.path().to_path_buf()),
-        );
-        let now = DateTime::parse_from_rfc3339("2026-04-07T18:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let ctx = asm.build_query_context(now, None).await.unwrap();
-        assert!(ctx.contains("from git mirror only"));
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
+        let ctx = asm.build_query_context(Utc::now(), None).await.unwrap();
+
+        assert!(ctx.contains("Vault worklog.md"), "the section is still there");
+        assert!(ctx.contains("(empty or missing)"));
     }
 }

@@ -10,9 +10,11 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use redb::Database;
 
+use super::git::{self, PullOutcome};
 use super::md;
 use super::reconcile::{self, VaultRow};
 use super::write::{apply_edits, VaultAccess};
+use crate::config::VaultGitSection;
 use crate::storage::{vault_state, worklog, Event, Reminder, TodoItem};
 
 /// Files Mervyn may write to. `worklog.md` is deliberately absent: it is a symlink into the
@@ -35,6 +37,9 @@ pub struct SyncStats {
     pub lines_removed: usize,
     /// Rows deleted because their line was removed from the file.
     pub rows_deleted: usize,
+    /// The vault has diverged from its remote and a rebase could not resolve it. Write-back is
+    /// paused until a person settles it, and this cycle wrote nothing.
+    pub git_conflict: bool,
 }
 
 /// Whether this sync may modify the vault, and what to do before its first write.
@@ -147,6 +152,52 @@ fn sync_one<T: VaultRow>(
     Ok(())
 }
 
+/// One git-backed cycle: bring in what other devices wrote, reconcile, then send ours out.
+///
+/// Holds the vault lock from the pull through to the push. Anything less and a `git pull` could
+/// land new bytes between a merge measuring a file's offsets and the write that uses them.
+///
+/// A rebase conflict stops the cycle before it writes. Mervyn's own commits are mostly
+/// reproducible from the database, but not all of them are — a removal consumes a tombstone —
+/// and piling more automated commits on top of a divergence only makes it harder to unpick.
+pub fn sync_vault_with_git(
+    db: &Database,
+    vault_path: &Path,
+    ctx: SyncContext<'_>,
+    git_cfg: &VaultGitSection,
+) -> anyhow::Result<SyncStats> {
+    if !git::is_repo(vault_path) {
+        anyhow::bail!(
+            "[vault_git] is enabled but {} is not a git repository; clone the vault there first              (see docs/two-way-vault-sync.md)",
+            vault_path.display()
+        );
+    }
+
+    let _guard = ctx.access.lock();
+
+    // Anything left uncommitted by a previous cycle has to be committed before a rebase will run.
+    if git::commit_all(vault_path, git_cfg, "mervyn: vault write-back (recovered)")? {
+        tracing::warn!("committed vault changes left behind by an earlier cycle");
+    }
+
+    if git::pull_rebase(vault_path, git_cfg)? == PullOutcome::Conflicted {
+        // pull_rebase has already logged what happened and why writes are paused.
+        return Ok(SyncStats {
+            git_conflict: true,
+            ..SyncStats::default()
+        });
+    }
+
+    let stats = reconcile_all(db, vault_path, ctx)?;
+
+    if git::commit_all(vault_path, git_cfg, "mervyn: vault write-back")? {
+        git::push(vault_path, git_cfg)?;
+        tracing::info!(?stats, "vault changes pushed");
+    }
+
+    Ok(stats)
+}
+
 /// Reconcile the managed files with the database, then import the worklog.
 ///
 /// Takes the vault lock for the whole cycle: read, merge and write have to be one operation, or a
@@ -157,6 +208,15 @@ pub fn sync_vault_to_db(
     ctx: SyncContext<'_>,
 ) -> anyhow::Result<SyncStats> {
     let _guard = ctx.access.lock();
+    reconcile_all(db, vault_path, ctx)
+}
+
+/// The cycle itself. The caller must already hold the vault lock.
+fn reconcile_all(
+    db: &Database,
+    vault_path: &Path,
+    ctx: SyncContext<'_>,
+) -> anyhow::Result<SyncStats> {
     let now = Utc::now();
     let mut stats = SyncStats::default();
     let mut backed_up = false;
@@ -546,6 +606,115 @@ mod tests {
         let s = f.sync();
         assert_eq!(s.lines_removed, 1, "the deferred removal still happens");
         assert!(!vault_state::has_tombstone(&f.db, 1, "events.md").unwrap());
+    }
+
+    // ---- git-backed cycle ---------------------------------------------------------------------
+
+    /// A bare repo standing in for GitHub, and a second clone standing in for the phone.
+    fn git_backed(f: &Fixture) -> (TempDir, TempDir, VaultGitSection) {
+        let cfg = VaultGitSection {
+            enabled: true,
+            remote: "origin".into(),
+            branch: "main".into(),
+            sync_cron: "0 */5 * * * *".into(),
+            author_name: "Mervyn".into(),
+            author_email: "mervyn@localhost".into(),
+        };
+        let remote = tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(f.vault.path())
+                .output()
+                .unwrap()
+        };
+        g(&["init", "--initial-branch=main"]);
+        g(&["remote", "add", "origin", remote.path().to_str().unwrap()]);
+        f.write("README.md", "# Vault\n");
+        crate::vault::git::commit_all(f.vault.path(), &cfg, "seed").unwrap();
+        crate::vault::git::push(f.vault.path(), &cfg).unwrap();
+
+        let phone = tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["clone", remote.path().to_str().unwrap(), "."])
+            .current_dir(phone.path())
+            .output()
+            .unwrap();
+        (remote, phone, cfg)
+    }
+
+    #[test]
+    fn a_git_cycle_carries_the_database_out_and_an_edit_back_in() {
+        let f = Fixture::new();
+        let (_remote, phone, git_cfg) = git_backed(&f);
+
+        todos::put(
+            &f.db,
+            &TodoItem {
+                id: 1,
+                body: "Call the plumber".into(),
+                created_at: utc("2026-09-16T10:00:00Z"),
+                done: false,
+            },
+        )
+        .unwrap();
+
+        sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
+
+        // The phone sees the todo Mervyn materialised.
+        std::process::Command::new("git")
+            .args(["pull", "--rebase", "origin", "main"])
+            .current_dir(phone.path())
+            .output()
+            .unwrap();
+        let on_phone = std::fs::read_to_string(phone.path().join("todos.md")).unwrap();
+        assert!(on_phone.contains("Call the plumber"), "not on the phone: {on_phone}");
+
+        // Tick it there and push.
+        std::fs::write(phone.path().join("todos.md"), on_phone.replace("- [ ]", "- [x]")).unwrap();
+        crate::vault::git::commit_all(phone.path(), &git_cfg, "tick on the phone").unwrap();
+        crate::vault::git::push(phone.path(), &git_cfg).unwrap();
+
+        sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
+
+        assert!(
+            todos::get(&f.db, 1).unwrap().unwrap().done,
+            "the phone's tick reached the database"
+        );
+    }
+
+    #[test]
+    fn a_diverged_vault_pauses_instead_of_writing() {
+        let f = Fixture::new();
+        let (_remote, phone, git_cfg) = git_backed(&f);
+        f.write("todos.md", "- [ ] one <!--mv:1-->\n- [ ] two <!--mv:2-->\n");
+        sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
+
+        // The phone rewords one line; Mervyn is about to change the one next to it.
+        std::process::Command::new("git")
+            .args(["pull", "--rebase", "origin", "main"])
+            .current_dir(phone.path())
+            .output()
+            .unwrap();
+        std::fs::write(
+            phone.path().join("todos.md"),
+            "- [ ] one, reworded <!--mv:1-->\n- [ ] two <!--mv:2-->\n",
+        )
+        .unwrap();
+        crate::vault::git::commit_all(phone.path(), &git_cfg, "reword").unwrap();
+        crate::vault::git::push(phone.path(), &git_cfg).unwrap();
+
+        todos::mark_done(&f.db, 2).unwrap();
+        let stats = sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
+
+        assert!(stats.git_conflict, "a divergence it cannot rebase must be reported");
+        assert_eq!(stats.rows_written_to_file, 0, "and nothing written on top of it");
     }
 
     // ---- stability ----------------------------------------------------------------------------

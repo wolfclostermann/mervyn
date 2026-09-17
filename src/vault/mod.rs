@@ -1,3 +1,4 @@
+pub mod git;
 pub mod marker;
 pub mod md;
 pub mod reconcile;

@@ -112,7 +112,17 @@ back and resurrects the row on the next tick. A tombstoned id must be dropped on
   immediately before writing; if it moved (Obsidian flushed a buffer), redo the merge. Write via a
   temp file and `rename` within the same directory.
 
-### 5. Worklog stays one-way
+### 5b. …and then the worklog moved into the vault repo
+
+*Added 2026-09-17.* The section below is why the worklog was excluded from write-back, and it held
+for as long as `worklog.md` was a symlink into a separate clone that Mervyn only pulled. Once the
+vault itself had to become a git repo — to reach a laptop and a phone — keeping a second repo for
+one file stopped making sense. The worklog is now an ordinary file in the vault repo, `[vault_git]`
+replaces `[worklog_git]`, and the sync runs in both directions, so `git pull --ff-only` is no
+longer the constraint it was. Mervyn still never *writes* `worklog.md`: it is appended by the
+commit hook in `contrib/mervyn-worklog-sync`, and read by the assembler.
+
+### 5. Worklog stays one-way (historical)
 
 `data/vault/worklog.md` is a symlink into a git clone (`/worklog/worklog.md` in-container). Writing
 into it puts unstaged changes in that working tree, and `git pull --ff-only` in
@@ -210,7 +220,21 @@ existed, it would have been deleted from the database instead. The "file missing
 guard is what stopped that, which is a reason to keep such guards even when the logic above them
 looks sound. Caught on the first production deploy; regression test in `vault::sync`.
 
-**Still one-way:** the worklog, and `notes/`.
+**Still one-way:** the worklog and `notes/` — Mervyn reads both and writes neither.
+
+**Git carries the vault to other devices.** The vault directory is the working tree of a private
+repo; each cycle is pull → reconcile → commit → push, under the vault lock for the whole of it, so
+a file cannot move between a merge measuring its offsets and the write that uses them. Obsidian Git
+does the same on a laptop and a phone. Obsidian Sync cannot: it runs inside the Obsidian app and
+has no headless client.
+
+**Conflicts pause rather than resolve.** Git merges edits a few lines apart, but in a short file
+two *adjacent* lines will not merge — an edit on the phone and a checkbox Mervyn ticked next to it
+conflict, and that is the realistic case, not the exotic one. The rebase is aborted, write-back
+stops, and Mervyn says so in chat, because a vault that has quietly stopped reaching your phone is
+otherwise invisible. Picking a side automatically would mean silently discarding either the phone's
+edit or the scheduler's, and Mervyn's commits are not quite reproducible enough to throw away — a
+removal consumes a tombstone.
 
 ## Decisions
 

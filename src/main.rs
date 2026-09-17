@@ -75,8 +75,8 @@ async fn main() -> anyhow::Result<()> {
         app_state.vault_tz(),
     );
 
-    if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {
-        tracing::error!(error = %e, "worklog git pull on startup");
+    if let Err(e) = scheduler::run_vault_git_sync(&app_state).await {
+        tracing::error!(error = %e, "vault git sync on startup");
     }
 
     match app_state.telegram.get_me().await {
