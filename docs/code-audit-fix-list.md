@@ -6,8 +6,29 @@ Structured backlog from a full pass over the Rust codebase (storage, schedulers,
 
 ## Critical / correctness risks
 
-1. **Reminder firing loop is not transactional** (`src/scheduler/jobs.rs`)  
-   For each due reminder the code posts to Slack, then updates the row. If Slack succeeds but `reminders::put` fails (or the process dies between steps), you can double-notify or leave inconsistent state. Consider: persist state first (queued/sent), update DB before Slack with idempotent semantics, or document + monitor.
+1. **Reminder firing loop is not transactional** (`src/scheduler/jobs.rs`) — **addressed
+   2026-09-17, but read the caveat.**
+
+   It cannot be made transactional. `sendMessage` has no idempotency key, so send-and-persist
+   cannot be one atomic step, and a failure between them loses something whichever order they run
+   in: persist-first risks a reminder that never arrives, send-first risks announcing it twice.
+   The suggestion to persist before sending trades a duplicate for a miss, and a miss defeats the
+   purpose of a reminder — so the order stands, deliberately, and is now documented at the
+   function.
+
+   What *was* wrong and is fixed:
+   - **One failure aborted the whole tick.** `send_message(...).await?` meant a single Telegram
+     hiccup skipped every later reminder *and* the appointment sweep, which had nothing to do with
+     it. Each reminder is now isolated, and appointments run regardless.
+   - **Duplicates were unbounded.** A row that kept failing to write re-announced every minute for
+     ever. `storage/reminder_notices` counts announcements per occurrence and stops after three,
+     logging loudly; the stuck row is visible in `/admin/reminders`.
+   - The same abort-the-batch flaw in `appointment_reminders` is fixed the same way, per event and
+     per message, so a failed advance notice no longer marks itself sent.
+
+   Still true: a crash in the window between a successful send and the row write re-announces once
+   on the next tick. That is the chosen trade, not an oversight. A wholly unwritable database is
+   beyond the bound, since the counter cannot be written either.
 
 2. **Appointment reminders scan the entire events table every tick** (`src/scheduler/appointment_reminders.rs` uses `events::list_all`)  
    As events accumulate this becomes O(n) per cron tick with full decode. Prefer a bounded query such as `upcoming_within(now, now + horizon, max)` so past events are not scanned forever.
@@ -92,7 +113,7 @@ Structured backlog from a full pass over the Rust codebase (storage, schedulers,
 
 | Priority | Items |
 |----------|--------|
-| **P0** | 1 (reminder consistency), 2 (appointment full scan) |
+| **P0** | ~~1 (reminder consistency)~~ addressed, 2 (appointment full scan) |
 | **P1** | 5 (timezone split — partly addressed: vault times are now local wall-clock via `local_time.rs`), 3 (complete_todo parse vs empty) |
 | **P2** | 6, 7, 8 (DRY + errors), 12 (cron validation), 14 (serialization/version story) |
 | **P3** | 9, 16 (perf polish), 10, 11 (observability/UX), 13, 15, 17–19 |

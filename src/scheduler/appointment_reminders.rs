@@ -70,6 +70,8 @@ pub async fn run(state: &AppState) -> anyhow::Result<()> {
 
     let list = events::list_all(state.db.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
 
+    let mut failures = 0usize;
+
     for event in list {
         let mut st = match event_notices::get(state.db.as_ref(), event.id)
             .map_err(|e| anyhow::anyhow!(e))?
@@ -86,56 +88,93 @@ pub async fn run(state: &AppState) -> anyhow::Result<()> {
         let (send_advance, send_start) =
             tick_notice_state(&mut st, event.start, now, advance, grace);
 
+        // Each send is isolated and each flag is only kept if its own message went out. A `?`
+        // here used to abandon every later appointment as well — and `tick_notice_state` has
+        // already set the flags, so an aborted tick could also have marked something sent that
+        // never was.
         if send_advance {
-            let when = format_event_time(state, event.start)?;
-            let until = event.start.signed_duration_since(now);
-            let secs = until.num_seconds().max(0);
-            let mut msg = if secs < 60 {
-                format!(
-                    "Appointment in less than a minute: “{}” — {}",
-                    event.title, when
-                )
-            } else {
-                let mins = until.num_minutes().max(0).min(10_000) as u32;
-                format!(
-                    "Appointment in about {} min: “{}” — {}",
-                    mins, event.title, when
-                )
-            };
-            if let Some(desc) = event.description.as_deref() {
-                let d = desc.trim();
-                if !d.is_empty() {
-                    msg.push_str("\n");
-                    msg.push_str(d);
+            match format_event_time(state, event.start) {
+                Ok(when) => {
+                    let until = event.start.signed_duration_since(now);
+                    let secs = until.num_seconds().max(0);
+                    let mut msg = if secs < 60 {
+                        format!(
+                            "Appointment in less than a minute: “{}” — {}",
+                            event.title, when
+                        )
+                    } else {
+                        let mins = until.num_minutes().clamp(0, 10_000) as u32;
+                        format!(
+                            "Appointment in about {} min: “{}” — {}",
+                            mins, event.title, when
+                        )
+                    };
+                    if let Some(desc) = event.description.as_deref() {
+                        let d = desc.trim();
+                        if !d.is_empty() {
+                            msg.push('\n');
+                            msg.push_str(d);
+                        }
+                    }
+                    if let Err(e) = state
+                        .telegram
+                        .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
+                        .await
+                    {
+                        tracing::warn!(id = event.id, error = %e, "appointment advance notice failed; will retry");
+                        st.advance_sent = before_tick.advance_sent;
+                        failures += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(id = event.id, error = %e, "appointment time formatting failed");
+                    st.advance_sent = before_tick.advance_sent;
+                    failures += 1;
                 }
             }
-            state
-                .telegram
-                .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
-                .await?;
         }
 
         if send_start {
-            let when = format_event_time(state, event.start)?;
-            let mut msg = format!("Appointment starting now: “{}” — {}", event.title, when);
-            if let Some(desc) = event.description.as_deref() {
-                let d = desc.trim();
-                if !d.is_empty() {
-                    msg.push_str("\n");
-                    msg.push_str(d);
+            match format_event_time(state, event.start) {
+                Ok(when) => {
+                    let mut msg =
+                        format!("Appointment starting now: “{}” — {}", event.title, when);
+                    if let Some(desc) = event.description.as_deref() {
+                        let d = desc.trim();
+                        if !d.is_empty() {
+                            msg.push('\n');
+                            msg.push_str(d);
+                        }
+                    }
+                    if let Err(e) = state
+                        .telegram
+                        .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
+                        .await
+                    {
+                        tracing::warn!(id = event.id, error = %e, "appointment start notice failed; will retry");
+                        st.start_sent = before_tick.start_sent;
+                        failures += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(id = event.id, error = %e, "appointment time formatting failed");
+                    st.start_sent = before_tick.start_sent;
+                    failures += 1;
                 }
             }
-            state
-                .telegram
-                .send_message(&state.secrets.telegram_chat_id.to_string(), &msg)
-                .await?;
         }
 
         if st != before_tick {
-            event_notices::put(state.db.as_ref(), event.id, &st).map_err(|e| anyhow::anyhow!(e))?;
+            if let Err(e) = event_notices::put(state.db.as_ref(), event.id, &st) {
+                tracing::error!(id = event.id, error = %e, "appointment notice state write failed");
+                failures += 1;
+            }
         }
     }
 
+    if failures > 0 {
+        anyhow::bail!("{failures} appointment notice(s) did not complete this tick");
+    }
     Ok(())
 }
 
