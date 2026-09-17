@@ -15,6 +15,11 @@ pub const TODOS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("todos
 /// Tracks chat pings for calendar events (advance + start), keyed by `event.id`.
 pub const EVENT_NOTICES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_notices");
 
+/// Occurrences already announced whose reminder row has not advanced yet, keyed by `reminder.id`.
+/// Bounds re-announcement when the row write is what keeps failing — see `reminder_notices`.
+pub const REMINDER_NOTICES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("reminder_notices");
+
 /// What the vault file and the database last agreed on. The evidence that lets a sync tell a
 /// human's edit from the scheduler's own change — see `docs/two-way-vault-sync.md`.
 ///
@@ -39,6 +44,7 @@ pub fn open(path: &str) -> anyhow::Result<Database> {
         let _ = write_txn.open_table(MESSAGE_INGEST_TABLE)?;
         let _ = write_txn.open_table(TODOS_TABLE)?;
         let _ = write_txn.open_table(EVENT_NOTICES_TABLE)?;
+        let _ = write_txn.open_table(REMINDER_NOTICES_TABLE)?;
         let _ = write_txn.open_table(VAULT_STATE_TABLE)?;
         let _ = write_txn.open_table(VAULT_TOMBSTONES_TABLE)?;
     }
