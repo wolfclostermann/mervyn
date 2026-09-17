@@ -10,6 +10,7 @@ pub mod meta;
 pub mod reminders;
 pub mod message_ingest;
 pub mod todos;
+pub mod vault_state;
 pub mod worklog;
 
 pub use error::{Result, StorageError};

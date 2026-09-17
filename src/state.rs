@@ -7,6 +7,8 @@ use redb::Database;
 use crate::claude::client::ClaudeClient;
 use crate::config::AppConfig;
 use crate::telegram::client::TelegramClient;
+use crate::vault::sync::{SyncContext, WriteBackPolicy};
+use crate::vault::write::VaultAccess;
 
 #[derive(Clone)]
 pub struct Secrets {
@@ -71,6 +73,43 @@ pub struct AppState {
     pub claude: Arc<ClaudeClient>,
     pub telegram: Arc<TelegramClient>,
     pub vault_path: PathBuf,
+    /// Serialises vault reconcile cycles and suppresses the watcher's echo of Mervyn's own
+    /// writes. Shared, not cloned: every task must contend for the same lock.
+    pub vault: Arc<VaultAccess>,
+}
+
+impl AppState {
+    /// Whether this process may write to the vault, from `[vault]` in the config.
+    pub fn write_back_policy(&self) -> WriteBackPolicy {
+        WriteBackPolicy {
+            enabled: self.settings.vault.write_back_enabled,
+            backup_before_first_write: self.settings.vault.backup_before_first_write,
+        }
+    }
+
+    /// The zone the vault's wall-clock times are written and read in. Falls back to UTC with a
+    /// warning rather than failing a sync — the same choice the intent handlers make.
+    pub fn vault_tz(&self) -> chrono_tz::Tz {
+        self.settings
+            .scheduler
+            .timezone
+            .parse()
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    tz = %self.settings.scheduler.timezone,
+                    "invalid scheduler.timezone; using UTC for vault times"
+                );
+                chrono_tz::UTC
+            })
+    }
+
+    pub fn vault_sync_context(&self) -> SyncContext<'_> {
+        SyncContext {
+            access: self.vault.as_ref(),
+            policy: self.write_back_policy(),
+            tz: self.vault_tz(),
+        }
+    }
 }
 
 #[cfg(test)]

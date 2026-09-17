@@ -7,10 +7,15 @@ services:
     volumes:
       # :z — SELinux (Podman on Oracle/RHEL): allow container write to host bind mounts under $HOME.
       - ./data:/app/data:z
-      # Sibling git worklog repo (host path). Uncomment so vault symlinks / pull target exist in-container.
-      - ../mervyn-worklog:/worklog:z
     env_file:
       - .env
     environment:
       RUST_LOG: mervyn=debug,tower_http=info
-      MERVYN__WORKLOG_GIT__REPO_PATH: /worklog
+      # Two-way vault sync (docs/two-way-vault-sync.md). Not a secret, so it lives here rather
+      # than in .env: this block survives every deploy path, whereas .env arrives either from
+      # --use-local-env or from decrypting .env.enc, and the blob goes stale silently.
+      # config/default.toml still ships it disabled; this turns it on for this deployment.
+      MERVYN__VAULT__WRITE_BACK_ENABLED: "true"
+      # Carry the vault to and from its git remote, so the laptop and phone see it. The vault
+      # directory is the clone; MERVYN_VAULT_GITHUB_PAT (in .env) authenticates the push.
+      MERVYN__VAULT_GIT__ENABLED: "true"
