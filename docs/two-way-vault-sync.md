@@ -57,10 +57,16 @@ Obsidian block ids (`^mv-8fa1c3d2`) were the alternative — more native, but aw
 heading-delimited event sections, and they lose the "old parser ignores them" property.
 
 **Migration is free.** On the first back-fill, parse exactly as today (hash ids), then write each
-row's *existing* hash id into the file as its marker. The database does not move. After that ids
-come only from `next_id`; the hash survives as a bootstrap only. Run the back-fill once immediately
-after deploy — a hand edit made between the last sync and the back-fill still duplicates, exactly
-as it does today.
+row's *existing* hash id into the file as its marker. The database does not move.
+
+**The hash is not only a bootstrap** — an earlier draft of this document said it was, and that
+undersold it. Inserting a row and writing its marker back are two steps, and the second can fail:
+a write error, or the file moving under the cycle, which is routine once a phone and a laptop push
+to it. Deriving the id from the content makes that failure self-healing — the next cycle reads the
+same unmarked line, derives the same id, and upserts the same row. A counter would allocate a new
+id instead, insert a second row, and then append the first one back into the file as a row with no
+line. The ugly 20-digit ids are the price of that idempotency, and after
+`format_todos` stopped printing database keys they are no longer visible anywhere but the markers.
 
 ### 2. Surgical edits, not regeneration
 
