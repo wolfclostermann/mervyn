@@ -1,6 +1,6 @@
 //! Best-effort dates/times from natural language for intents (no extra model call).
 
-use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 
 /// Scan for `YYYY-MM-DD` anywhere in `text`.
@@ -246,21 +246,9 @@ fn has_whole_word(text: &str, word: &str) -> bool {
         .any(|part| part == w)
 }
 
-/// Local wall time on `date` in `tz` → UTC (handles DST gaps/ambiguous with sensible picks).
+/// Local wall time on `date` in `tz` → UTC. See [`crate::local_time`] for the DST rules.
 fn naive_local_to_utc(date: NaiveDate, hour: u32, min: u32, tz: Tz) -> Option<DateTime<Utc>> {
-    let naive = date.and_hms_opt(hour, min, 0)?;
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
-        LocalResult::Ambiguous(_, late) => Some(late.with_timezone(&Utc)),
-        LocalResult::None => {
-            let naive2 = date.and_hms_opt(hour.saturating_add(1), min, 0)?;
-            match tz.from_local_datetime(&naive2) {
-                LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
-                LocalResult::Ambiguous(_, late) => Some(late.with_timezone(&Utc)),
-                LocalResult::None => None,
-            }
-        }
-    }
+    crate::local_time::local_to_utc(date, hour, min, tz)
 }
 
 /// `H:MM` or `H:MM am/pm` after ` at ` if possible, else first `H:MM` in `text`.

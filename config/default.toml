@@ -32,16 +32,24 @@ enabled = true
 situation_file = "mervyn-situation.md"
 situation_max_chars = 12000
 
-# While Mervyn is running: `git pull --ff-only` in repo_path, then vault → redb sync (picks up symlinked worklog.md).
-# Default layout: sibling clone at ../mervyn-worklog (see mervyn-worklog README).
-# Docker: mount that repo (e.g. to /worklog) and set MERVYN__WORKLOG_GIT__REPO_PATH=/worklog — vault symlinks
-# to the host clone do not resolve inside the container otherwise. When set, Ask/briefing also read
-# repo_path/worklog.md if vault worklog.md is missing or empty.
-[worklog_git]
-# Disabled 2026-09-15 pending a worklog rework. Re-enable with MERVYN__WORKLOG_GIT__ENABLED=true
-# once the worklog source is sorted; the vault symlink expects /worklog/worklog.md in-container.
+# While Mervyn is running: pull the vault clone, reconcile it with the database, then commit and
+# push what changed — which is how the vault reaches a laptop and a phone (Obsidian Git at the
+# other end). The vault directory itself is the working tree, so there is no separate repo_path.
+# Needs MERVYN_VAULT_GITHUB_PAT with *write* access for a private GitHub remote.
+# Replaces the old [worklog_git] section: the worklog is a file in the vault repo now, not a
+# separate clone the vault symlinked into.
+[vault_git]
 enabled = false
-repo_path = "../mervyn-worklog"
 remote = "origin"
 branch = "main"
-pull_cron = "0 */5 * * * *"
+sync_cron = "0 */5 * * * *"
+author_name = "Mervyn"
+author_email = "mervyn@localhost"
+
+# db → Markdown write-back (see docs/two-way-vault-sync.md). Off by default: each phase of the
+# two-way work ships dark and is verified from the logs before it is allowed to touch the vault.
+# Markdown → db sync is unaffected and always runs. Enable with MERVYN__VAULT__WRITE_BACK_ENABLED=true.
+[vault]
+write_back_enabled = false
+# Copy the managed files to a timestamped sibling of the vault before the first write of a run.
+backup_before_first_write = true

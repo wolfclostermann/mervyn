@@ -14,7 +14,6 @@ const NOTES_CHAR_BUDGET: usize = 24_000;
 /// Events horizon for freeform Q&A (`ask`) — covers “next month” style questions.
 const QUERY_EVENT_HORIZON_DAYS: i64 = 40;
 /// Cap for `events.md` mirror in query context (keeps token use bounded).
-const QUERY_EVENTS_MD_MAX_CHARS: usize = 12_000;
 /// Cap for `worklog.md` mirror in query context (git-synced file may be ahead of redb briefly).
 const QUERY_WORKLOG_MD_MAX_CHARS: usize = 16_000;
 
@@ -24,8 +23,6 @@ const BRIEFING_QUEUE_MAX_AGE: Duration = Duration::hours(48);
 pub struct ContextAssembler {
     db: Arc<Database>,
     vault_path: PathBuf,
-    /// `worklog.md` inside `[worklog_git].repo_path` when set (see [`crate::config::AppConfig::worklog_md_git_mirror_path`]).
-    worklog_md_fallback: Option<PathBuf>,
 }
 
 struct VaultMirror {
@@ -46,45 +43,28 @@ impl ContextAssembler {
     pub fn new(
         db: Arc<Database>,
         vault_path: PathBuf,
-        worklog_md_fallback: Option<PathBuf>,
     ) -> Self {
         Self {
             db,
             vault_path,
-            worklog_md_fallback,
         }
     }
 
-    /// Prefer vault `worklog.md`; if missing, unreadable, or whitespace-only, try `worklog_md_fallback`.
-    async fn read_worklog_md_with_fallback(&self) -> anyhow::Result<String> {
-        let primary_path = self.vault_path.join("worklog.md");
-        let primary = match tokio::fs::read_to_string(&primary_path).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+    /// `worklog.md` from the vault, empty when it is missing.
+    ///
+    /// There used to be a fallback to a separate `worklog_git` clone, because the vault's
+    /// `worklog.md` was a symlink into it that did not resolve outside the container. The worklog
+    /// is an ordinary file in the vault repo now, so there is nothing to fall back to.
+    async fn read_worklog_md(&self) -> anyhow::Result<String> {
+        let path = self.vault_path.join("worklog.md");
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
             Err(e) => {
-                tracing::warn!(
-                    path = %primary_path.display(),
-                    error = %e,
-                    "vault worklog.md read failed; will try worklog_git mirror if configured"
-                );
-                String::new()
-            }
-        };
-        if !primary.trim().is_empty() {
-            return Ok(primary);
-        }
-        if let Some(ref fb) = self.worklog_md_fallback {
-            match tokio::fs::read_to_string(fb).await {
-                Ok(s) if !s.trim().is_empty() => {
-                    tracing::debug!(path = %fb.display(), "using worklog.md from worklog_git mirror path");
-                    return Ok(s);
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %fb.display(), error = %e, "worklog git mirror read failed"),
+                tracing::warn!(path = %path.display(), error = %e, "vault worklog.md read failed");
+                Ok(String::new())
             }
         }
-        Ok(primary)
     }
 
     async fn load_briefing_data(
@@ -199,7 +179,12 @@ impl ContextAssembler {
         ))
     }
 
-    /// Context for freeform Q&A: upcoming events (DB + `events.md`), reminders, recent worklog (no `notes/`).
+    /// Context for freeform Q&A: upcoming events, reminders, todos, recent worklog (no `notes/`).
+    ///
+    /// `events.md` is not included. Vault sync imports every event in it, so the database block
+    /// below is a superset — pasting the file in as well cost tokens and invited Claude to
+    /// report the same appointment twice. `worklog.md` is still included, because the worklog is
+    /// one-way and the file can hold git-backed lines the database has not seen.
     pub async fn build_query_context(
         &self,
         now: DateTime<Utc>,
@@ -209,18 +194,6 @@ impl ContextAssembler {
         let evs = events::upcoming_within(self.db.as_ref(), now, event_until, 120)
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let events_md_raw = read_file_or_empty(self.vault_path.join("events.md")).await?;
-        let md_len = events_md_raw.chars().count();
-        let events_md: String = events_md_raw.chars().take(QUERY_EVENTS_MD_MAX_CHARS).collect();
-        let events_md_block = if events_md.trim().is_empty() {
-            "(empty or missing)\n".to_string()
-        } else {
-            let mut s = events_md;
-            if md_len > QUERY_EVENTS_MD_MAX_CHARS {
-                s.push_str("\n… (events.md truncated)\n");
-            }
-            s
-        };
 
         let reminder_horizon = now + Duration::days(7);
         let pending = reminders::pending_due_within(self.db.as_ref(), reminder_horizon, 40)
@@ -230,7 +203,7 @@ impl ContextAssembler {
             .map_err(|e| anyhow::anyhow!(e))?;
         let open_todos = todos::list_open(self.db.as_ref(), 80).map_err(|e| anyhow::anyhow!(e))?;
 
-        let worklog_md_raw = self.read_worklog_md_with_fallback().await?;
+        let worklog_md_raw = self.read_worklog_md().await?;
         let wl_len = worklog_md_raw.chars().count();
         let worklog_md: String = worklog_md_raw
             .chars()
@@ -257,14 +230,12 @@ impl ContextAssembler {
         Ok(format!(
             "{situation_block}\
              ## Upcoming events (database, next {} days)\n{}\n\n\
-             ## Vault events.md\n{}\n\n\
              ## Pending reminders\n{}\n\n\
-             ## Open todos (database; numeric ids for reference)\n{}\n\n\
+             ## Open todos (database; numbered as Wolf sees them, so he can say: todo 2)\n{}\n\n\
              ## Recent worklog (database, last 7 days)\n{}\n\n\
              ## Vault worklog.md (file on disk; may include git-backed lines not yet in DB)\n{}",
             QUERY_EVENT_HORIZON_DAYS,
             format_events(&evs),
-            events_md_block,
             format_reminders(&pending),
             format_todos(&open_todos, true),
             format_worklog(&work),
@@ -275,7 +246,7 @@ impl ContextAssembler {
     async fn read_vault_mirror(&self) -> anyhow::Result<VaultMirror> {
         let events_md = read_file_or_empty(self.vault_path.join("events.md")).await?;
         let reminders_md = read_file_or_empty(self.vault_path.join("reminders.md")).await?;
-        let worklog_md = self.read_worklog_md_with_fallback().await?;
+        let worklog_md = self.read_worklog_md().await?;
 
         let mut notes_section = String::from("## Vault notes (*.md under notes/)\n");
         let notes_dir = self.vault_path.join("notes");
@@ -375,14 +346,20 @@ fn format_reminders(list: &[crate::storage::Reminder]) -> String {
     s
 }
 
-fn format_todos(items: &[crate::storage::TodoItem], include_ids: bool) -> String {
+/// `numbered` shows each item's **position in the list**, not its database key.
+///
+/// The key used to be printed here, and it is unusable as a label: a todo typed straight into
+/// `todos.md` is keyed by content hash, so "what's on my list" came back reading
+/// `14362973...4977 Test syncing todos`. Positions are what `complete_todo` already accepts
+/// ("todo 2"), and both sides read `todos::list_open(db, 80)`, so the numbering agrees.
+fn format_todos(items: &[crate::storage::TodoItem], numbered: bool) -> String {
     if items.is_empty() {
         return "(none)\n".into();
     }
     let mut s = String::new();
-    for t in items {
-        if include_ids {
-            s.push_str(&format!("- [{}] {}\n", t.id, t.body));
+    for (i, t) in items.iter().enumerate() {
+        if numbered {
+            s.push_str(&format!("{}. {}\n", i + 1, t.body));
         } else {
             s.push_str(&format!("- {}\n", t.body));
         }
@@ -440,7 +417,7 @@ mod tests {
         )
         .unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -457,7 +434,7 @@ mod tests {
         std::fs::create_dir_all(vault.path().join("notes")).unwrap();
         std::fs::write(vault.path().join("notes/leak.md"), "SECRET").unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = Utc::now();
         let ctx = asm.build_query_context(now, None).await.unwrap();
         assert!(!ctx.contains("SECRET"));
@@ -484,7 +461,7 @@ mod tests {
         )
         .unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = DateTime::parse_from_rfc3339("2026-04-05T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -503,7 +480,7 @@ mod tests {
         )
         .unwrap();
 
-        let asm = ContextAssembler::new(db, vault.path().to_path_buf(), None);
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
         let now = DateTime::parse_from_rfc3339("2026-04-07T18:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -512,27 +489,46 @@ mod tests {
         assert!(ctx.contains("shipped feature"));
     }
 
+    #[test]
+    fn todos_are_listed_by_position_never_by_database_key() {
+        let hashed = crate::storage::TodoItem {
+            // What a line typed straight into todos.md gets: a content hash, 20 digits decimal.
+            id: 0xc75b_a919_4ac1_a291,
+            body: "Test syncing todos from desktop".into(),
+            created_at: Utc::now(),
+            done: false,
+        };
+        let other = crate::storage::TodoItem {
+            id: 2,
+            body: "Call the plumber".into(),
+            ..hashed.clone()
+        };
+        let listed = format_todos(&[hashed.clone(), other], true);
+
+        assert_eq!(
+            listed,
+            "1. Test syncing todos from desktop\n2. Call the plumber\n"
+        );
+        assert!(
+            !listed.contains("14362"),
+            "a database key must never reach the prompt: {listed}"
+        );
+        assert_eq!(format_todos(&[hashed], false), "- Test syncing todos from desktop\n");
+    }
+
     #[tokio::test]
-    async fn query_context_reads_worklog_from_fallback_when_vault_missing() {
+    async fn query_context_copes_with_no_worklog_at_all() {
+        // There used to be a fallback to a separate worklog_git clone here, because the vault's
+        // worklog.md was a symlink that did not resolve outside the container. It is a real file
+        // in the vault repo now, so a missing one simply means an empty section.
         let tmp = NamedTempFile::new().unwrap();
         let db = Arc::new(db::open(tmp.path().to_str().unwrap()).unwrap());
         let vault = tempfile::tempdir().unwrap();
-        let mirror = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            mirror.path(),
-            "## 2026-04-07\n- from git mirror only\n",
-        )
-        .unwrap();
 
-        let asm = ContextAssembler::new(
-            db,
-            vault.path().to_path_buf(),
-            Some(mirror.path().to_path_buf()),
-        );
-        let now = DateTime::parse_from_rfc3339("2026-04-07T18:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let ctx = asm.build_query_context(now, None).await.unwrap();
-        assert!(ctx.contains("from git mirror only"));
+        let asm = ContextAssembler::new(db, vault.path().to_path_buf());
+        let ctx = asm.build_query_context(Utc::now(), None).await.unwrap();
+
+        assert!(ctx.contains("Vault worklog.md"), "the section is still there");
+        assert!(ctx.contains("(empty or missing)"));
     }
 }

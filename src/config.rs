@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -14,9 +13,11 @@ pub struct AppConfig {
     pub server: ServerSection,
     #[serde(default)]
     pub user_context: UserContextSection,
-    /// Optional scheduled `git pull` for a worklog (or vault) repo while Mervyn is running.
     #[serde(default)]
-    pub worklog_git: WorklogGitSection,
+    pub vault: VaultSection,
+    /// Optional scheduled git sync of the vault clone while Mervyn is running.
+    #[serde(default)]
+    pub vault_git: VaultGitSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +77,34 @@ fn default_message_ingest_stale_pending_minutes() -> u32 {
     30
 }
 
+fn default_backup_before_first_write() -> bool {
+    true
+}
+
+/// Vault write-back: the db → Markdown direction of sync. See `docs/two-way-vault-sync.md`.
+///
+/// Off by default, and deliberately so — every phase of the work ships dark, is verified from
+/// the logs against the real vault, and is only then enabled. Nothing here affects the
+/// long-standing Markdown → db direction, which always runs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultSection {
+    /// Allow Mervyn to modify files under `storage.vault_path`. `false` = read-only, as today.
+    #[serde(default)]
+    pub write_back_enabled: bool,
+    /// Copy the managed files to a timestamped sibling directory before the first write of a run.
+    #[serde(default = "default_backup_before_first_write")]
+    pub backup_before_first_write: bool,
+}
+
+impl Default for VaultSection {
+    fn default() -> Self {
+        Self {
+            write_back_enabled: false,
+            backup_before_first_write: default_backup_before_first_write(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerSection {
     pub port: u16,
@@ -122,50 +151,50 @@ fn default_git_branch() -> String {
     "main".to_string()
 }
 
-fn default_worklog_git_pull_cron() -> String {
+fn default_vault_git_sync_cron() -> String {
     "0 */5 * * * *".to_string()
 }
 
-/// Run `git pull --ff-only` on a schedule (same Tokio scheduler as vault sync). Off by default.
+fn default_git_author_name() -> String {
+    "Mervyn".to_string()
+}
+
+fn default_git_author_email() -> String {
+    "mervyn@localhost".to_string()
+}
+
+/// Carry the vault to and from a private git remote, so a laptop and a phone can hold it too.
+///
+/// This replaces the old `[worklog_git]` section. That one only pulled, into a separate clone the
+/// vault symlinked into; the worklog now lives in the vault repo like everything else, and the
+/// sync runs in both directions. Off by default.
 #[derive(Debug, Clone, Deserialize)]
-pub struct WorklogGitSection {
+pub struct VaultGitSection {
     #[serde(default)]
     pub enabled: bool,
-    /// Repository working tree (path passed to `git -C`). Relative paths use the process cwd.
-    #[serde(default)]
-    pub repo_path: String,
     #[serde(default = "default_git_remote")]
     pub remote: String,
     #[serde(default = "default_git_branch")]
     pub branch: String,
-    #[serde(default = "default_worklog_git_pull_cron")]
-    pub pull_cron: String,
+    #[serde(default = "default_vault_git_sync_cron")]
+    pub sync_cron: String,
+    /// Identity on Mervyn's own commits, so they are told apart from yours at a glance.
+    #[serde(default = "default_git_author_name")]
+    pub author_name: String,
+    #[serde(default = "default_git_author_email")]
+    pub author_email: String,
 }
 
-impl Default for WorklogGitSection {
+impl Default for VaultGitSection {
     fn default() -> Self {
         Self {
             enabled: false,
-            repo_path: String::new(),
             remote: default_git_remote(),
             branch: default_git_branch(),
-            pull_cron: default_worklog_git_pull_cron(),
+            sync_cron: default_vault_git_sync_cron(),
+            author_name: default_git_author_name(),
+            author_email: default_git_author_email(),
         }
-    }
-}
-
-impl AppConfig {
-    /// When `[worklog_git]` is on, path to `worklog.md` inside that clone — used if vault `worklog.md`
-    /// is missing or empty (e.g. broken symlink into an unmounted path in Docker).
-    pub fn worklog_md_git_mirror_path(&self) -> Option<PathBuf> {
-        if !self.worklog_git.enabled {
-            return None;
-        }
-        let r = self.worklog_git.repo_path.trim();
-        if r.is_empty() {
-            return None;
-        }
-        Some(Path::new(r).join("worklog.md"))
     }
 }
 

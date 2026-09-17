@@ -1,14 +1,18 @@
 # Mervyn worklog sync (no Mervyn code changes)
 
-Global **git `post-commit`** hook: after you commit in a project repo, append one bullet to a shared **`worklog.md`** (Mervyn’s vault format: `## YYYY-MM-DD` sections and `-` list items), then **commit and push** from the worklog git repo.
+Global **git `post-commit`** hook: after you commit in a project repo, append one bullet to **`worklog.md`** (Mervyn’s vault format: `## YYYY-MM-DD` sections and `-` list items), then **commit and push** from that repo.
 
-On the machine where **Mervyn** runs, **pull** that repo on a timer so `vault/worklog.md` stays current.
+**As of 2026-09-17 the target is the vault repo itself.** `worklog.md` is an ordinary file in the Mervyn vault, alongside `events.md` and `todos.md`, and the whole vault is synced by `[vault_git]` — there is no separate worklog clone and no symlink any more. Point `MERVYN_WORKLOG_REPO` at your vault clone; the server pulls it on the same timer as everything else. See `docs/two-way-vault-sync.md`.
+
+> If your hook has stopped producing entries, check that `MERVYN_WORKLOG_REPO` and
+> `MERVYN_WORKLOG_PROJECT_PREFIXES` still point at paths that exist — the hook exits quietly when
+> they do not, so a moved checkout looks exactly like "no commits worth logging".
 
 ---
 
-## 1. Create the worklog repository
+## 1. Use the vault repository
 
-On GitHub (or elsewhere), create a repo that contains `worklog.md`. Minimal starter:
+The vault repo holds `worklog.md`. If you are starting from nothing, a minimal file:
 
 ```markdown
 # Worklog
@@ -17,7 +21,7 @@ On GitHub (or elsewhere), create a repo that contains `worklog.md`. Minimal star
 - **example** `0000000` seed entry (replace or delete)
 ```
 
-Clone it somewhere stable, e.g. `~/Code/Play/mervyn-worklog`.
+Clone the vault somewhere stable — the same clone Obsidian opens.
 
 ---
 

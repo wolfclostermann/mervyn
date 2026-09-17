@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod error;
 mod intent;
+mod local_time;
 mod scheduler;
 mod telegram;
 mod state;
@@ -59,16 +60,23 @@ async fn main() -> anyhow::Result<()> {
         claude,
         telegram,
         vault_path: vault_path.to_path_buf(),
+        vault: Arc::new(vault::write::VaultAccess::new()),
     };
 
     scheduler::spawn_scheduler(app_state.clone())
         .await
         .context("start scheduler")?;
 
-    vault::watcher::spawn_vault_watcher(app_state.db.clone(), app_state.vault_path.clone());
+    vault::watcher::spawn_vault_watcher(
+        app_state.db.clone(),
+        app_state.vault_path.clone(),
+        app_state.vault.clone(),
+        app_state.write_back_policy(),
+        app_state.vault_tz(),
+    );
 
-    if let Err(e) = scheduler::run_worklog_git_pull(&app_state).await {
-        tracing::error!(error = %e, "worklog git pull on startup");
+    if let Err(e) = scheduler::run_vault_git_sync(&app_state).await {
+        tracing::error!(error = %e, "vault git sync on startup");
     }
 
     match app_state.telegram.get_me().await {
