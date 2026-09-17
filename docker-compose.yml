@@ -14,3 +14,8 @@ services:
     environment:
       RUST_LOG: mervyn=debug,tower_http=info
       MERVYN__WORKLOG_GIT__REPO_PATH: /worklog
+      # Two-way vault sync (docs/two-way-vault-sync.md). Not a secret, so it lives here rather
+      # than in .env: this block survives every deploy path, whereas .env arrives either from
+      # --use-local-env or from decrypting .env.enc, and the blob goes stale silently.
+      # config/default.toml still ships it disabled; this turns it on for this deployment.
+      MERVYN__VAULT__WRITE_BACK_ENABLED: "true"
