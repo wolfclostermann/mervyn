@@ -163,7 +163,29 @@ The server binds locally so the process has a liveness probe and a clean shutdow
 | Method / path | Purpose |
 | ------------- | ------- |
 | `GET /health` | Liveness; responds with `ok`. |
-| `GET /admin/message-ingest` | Optional: JSON view of the ingest log when `MERVYN_ADMIN_TOKEN` is set (Bearer auth). Not registered at all when the token is unset. |
+| `GET /admin/message-ingest` | JSON view of the inbound delivery log. |
+| `GET /admin/events` | Every stored event, earliest first. |
+| `GET /admin/reminders` | Stored reminders (`?include_done=true` for closed ones). |
+| `GET /admin/todos` | Stored todos, each with the `list_number` chat shows, so "todo 2" maps to a row. |
+| `GET /admin/vault` | Where the vault and the database disagree, and why — see below. |
+
+The `/admin/*` routes exist only when **`MERVYN_ADMIN_TOKEN`** is set, take `Authorization: Bearer
+<token>`, and are read-only. They report what is in the tables and nothing more — unlike asking
+Mervyn, which answers through Claude and is the thing you are usually trying to check. Row keys
+travel as lower-case hex, matching the vault markers, because a `u64` key does not survive a JSON
+number intact.
+
+There is no public URL, so reach them over SSH:
+
+```sh
+ssh opc@<host> 'curl -s -H "Authorization: Bearer $TOKEN" localhost:3000/admin/vault' | jq
+```
+
+`/admin/vault` answers the question neither side can answer alone: for each managed file it lists
+rows that exist only in the database, lines that exist only in the file, and — by comparing both
+against the snapshot they last agreed on — **which side moved**. It also shows unmarked lines,
+pending tombstones (one that never clears means a write is failing), and whether the git working
+tree has uncommitted changes.
 
 ## GitHub account
 

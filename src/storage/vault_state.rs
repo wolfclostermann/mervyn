@@ -6,7 +6,7 @@
 //! canonical rendering both sides last held — says which one moved.
 
 use chrono::Utc;
-use redb::Database;
+use redb::{Database, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::codec;
@@ -113,6 +113,26 @@ pub fn tombstone(db: &Database, id: u64, file: &str) -> Result<()> {
 /// Whether a line for `id` is still waiting to be removed from `file`.
 pub fn has_tombstone(db: &Database, id: u64, file: &str) -> Result<bool> {
     Ok(get_str::<Tombstone>(db, VAULT_TOMBSTONES_TABLE, &key(file, id))?.is_some())
+}
+
+/// Every line still waiting to be removed, as `(file, id)`. For the operator view: a tombstone
+/// that never clears means a write has been failing quietly.
+pub fn pending_tombstones(db: &Database) -> Result<Vec<(String, u64)>> {
+    let r = db.begin_read()?;
+    let t = r.open_table(VAULT_TOMBSTONES_TABLE)?;
+    let mut out = Vec::new();
+    for row in t.iter()? {
+        let (k, v) = row?;
+        let stone: Tombstone = codec::decode(v.value())?;
+        // Key is `file#hexid`; the id is easier to recover from the key than to store twice.
+        let id = k
+            .value()
+            .rsplit_once('#')
+            .and_then(|(_, hex)| u64::from_str_radix(hex, 16).ok())
+            .unwrap_or(0);
+        out.push((stone.file, id));
+    }
+    Ok(out)
 }
 
 /// Consume the tombstone for `id`, returning whether there was one.

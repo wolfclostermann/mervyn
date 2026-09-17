@@ -4,6 +4,11 @@ services:
     # Stabilises tags for pre-built images (see scripts/deploy-gcp.sh --local-build).
     image: mervyn:deploy
     restart: unless-stopped
+    # Bound to loopback on the host, not 0.0.0.0: the admin routes are reachable over SSH
+    # (`curl localhost:3000/...` on the box) and from nowhere else. Without this the port is
+    # published nowhere at all and even /health cannot be checked from the host.
+    ports:
+      - "127.0.0.1:3000:3000"
     volumes:
       # :z — SELinux (Podman on Oracle/RHEL): allow container write to host bind mounts under $HOME.
       - ./data:/app/data:z
