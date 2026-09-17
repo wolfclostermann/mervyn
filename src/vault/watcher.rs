@@ -1,6 +1,6 @@
 //! Debounced vault directory watcher → `sync_vault_to_db` (Obsidian edits land in redb without waiting for cron).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +25,18 @@ pub fn spawn_vault_watcher(
         .name("mervyn-vault-notify".into())
         .spawn(move || run_watcher(db, vault_path, vault, policy, tz))
         .expect("spawn vault watcher thread");
+}
+
+/// Git's own bookkeeping, which changes constantly and means nothing to the vault.
+///
+/// The vault is a git working tree, so every fetch, commit and push rewrites files under `.git`.
+/// Without this, each git cycle wakes the watcher several times for a sync that can only conclude
+/// nothing has changed — noise that would drown out a real edit.
+fn is_git_internal(vault_path: &Path, path: &Path) -> bool {
+    path.strip_prefix(vault_path)
+        .unwrap_or(path)
+        .components()
+        .any(|c| c.as_os_str() == ".git")
 }
 
 /// True when every path in the batch still holds exactly the bytes Mervyn last wrote there, i.e.
@@ -73,6 +85,13 @@ fn run_watcher(
     loop {
         match sig_rx.recv() {
             Ok(paths) => {
+                let paths: Vec<PathBuf> = paths
+                    .into_iter()
+                    .filter(|p| !is_git_internal(&vault_path, p))
+                    .collect();
+                if paths.is_empty() {
+                    continue;
+                }
                 if is_self_write_echo(vault.as_ref(), &paths) {
                     tracing::trace!(count = paths.len(), "vault watcher: own write, not re-syncing");
                     continue;
@@ -121,6 +140,15 @@ mod tests {
         std::fs::write(&theirs, "- [ ] typed by hand\n").unwrap();
 
         assert!(!is_self_write_echo(&vault, &[ours, theirs]));
+    }
+
+    #[test]
+    fn git_bookkeeping_is_ignored_but_the_files_beside_it_are_not() {
+        let vault = std::path::Path::new("/vault");
+        assert!(is_git_internal(vault, std::path::Path::new("/vault/.git/index")));
+        assert!(is_git_internal(vault, std::path::Path::new("/vault/.git/refs/heads/main")));
+        assert!(!is_git_internal(vault, std::path::Path::new("/vault/events.md")));
+        assert!(!is_git_internal(vault, std::path::Path::new("/vault/notes/.gitkeep")));
     }
 
     #[test]
