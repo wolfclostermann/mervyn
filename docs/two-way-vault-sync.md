@@ -202,6 +202,14 @@ event exists the next chat-created event gets a 19-digit id too. Harmless — id
 it makes numeric references in chat unwieldy for events and reminders. Todos keep small ids while
 `todos.md` has no hand-written entries. Pre-existing; worth fixing separately.
 
+**Snapshots and tombstones are keyed by `file#id`, not by id.** Primary keys are unique within
+their own table, so an event and a todo are both routinely id 1 — on the deployed database they
+were. Keying the snapshot by id alone let one row shadow another's: the todo found the event's
+snapshot, concluded its line had been deleted, and was never written to the vault. Had `todos.md`
+existed, it would have been deleted from the database instead. The "file missing deletes nothing"
+guard is what stopped that, which is a reason to keep such guards even when the logic above them
+looks sound. Caught on the first production deploy; regression test in `vault::sync`.
+
 **Still one-way:** the worklog, and `notes/`.
 
 ## Decisions

@@ -593,4 +593,40 @@ mod tests {
         assert!(after.contains("Typed by hand"), "the hand-typed line survives: {after}");
         assert!(after.contains("From chat"), "and the chat row lands: {after}");
     }
+
+    #[test]
+    fn rows_of_different_kinds_sharing_an_id_do_not_collide() {
+        // Ids are unique per table, not across them: an event and a todo are both id 1 on the
+        // deployed database. Keying the snapshot by id alone made the todo find the event's
+        // snapshot, conclude its line had been deleted, and never materialise.
+        let f = Fixture::new();
+        events::put(
+            &f.db,
+            &Event {
+                id: 1,
+                title: "Dentist".into(),
+                description: None,
+                start: utc("2026-10-12T10:05:00Z"),
+                end: None,
+                tags: vec![],
+            },
+        )
+        .unwrap();
+        todos::put(
+            &f.db,
+            &TodoItem {
+                id: 1,
+                body: "Call the plumber".into(),
+                created_at: utc("2026-09-16T10:00:00Z"),
+                done: false,
+            },
+        )
+        .unwrap();
+
+        f.sync();
+
+        assert!(f.exists("events.md"), "the event should be written");
+        assert!(f.exists("todos.md"), "and so should the todo");
+        assert_eq!(todos::list_all(&f.db).unwrap().len(), 1, "and not be deleted");
+    }
 }

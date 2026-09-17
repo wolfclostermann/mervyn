@@ -298,9 +298,9 @@ pub fn reconcile_file<T: VaultRow>(
         out.changes.imported += 1;
 
         // Deleted from the database by chat: take the line out and stop tracking the row.
-        if vault_state::take_tombstone(db, id)? {
+        if vault_state::take_tombstone(db, id, T::FILE)? {
             out.edits.push(Edit::remove(f.span.clone()));
-            vault_state::forget(db, id)?;
+            vault_state::forget(db, id, T::FILE)?;
             out.changes.lines_removed += 1;
             continue;
         }
@@ -315,7 +315,7 @@ pub fn reconcile_file<T: VaultRow>(
             continue;
         }
 
-        let snapshot = vault_state::get(db, id)?.map(|s| s.rendered);
+        let snapshot = vault_state::get(db, id, T::FILE)?.map(|s| s.rendered);
         let Some((row, snapshot)) = db_rows.get(&id).zip(snapshot) else {
             // Either the database has never seen this row or it no longer has it, and no
             // tombstone says that was deliberate. The file is the record; take it at its word.
@@ -354,7 +354,7 @@ pub fn reconcile_file<T: VaultRow>(
     let mut unseen: Vec<(&u64, &T)> = db_rows.iter().filter(|(id, _)| !seen.contains(id)).collect();
     unseen.sort_by_key(|(id, _)| **id);
     for (id, row) in unseen {
-        if vault_state::get(db, *id)?.is_some() {
+        if vault_state::get(db, *id, T::FILE)?.is_some() {
             deletions.push(*id);
         } else {
             appends.push(row);
@@ -374,7 +374,7 @@ pub fn reconcile_file<T: VaultRow>(
 
     for id in deletions {
         T::delete(db, id)?;
-        vault_state::forget(db, id)?;
+        vault_state::forget(db, id, T::FILE)?;
         out.changes.rows_deleted += 1;
     }
 
