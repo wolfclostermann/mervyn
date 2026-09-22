@@ -1,6 +1,6 @@
 //! Best-effort dates/times from natural language for intents (no extra model call).
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use chrono_tz::Tz;
 
 /// Scan for `YYYY-MM-DD` anywhere in `text`.
@@ -272,6 +272,80 @@ fn meridiem_at_start(rest: &str) -> Option<bool> {
 /// The meridiem is required. A lone number is far too ambiguous to read as a time — "leave for 5"
 /// might be five o'clock, five minutes or five of something — whereas "5pm" says exactly one
 /// thing, and it is how most people write it.
+/// Weekday names and the abbreviations people actually type.
+fn weekday_from_word(word: &str) -> Option<Weekday> {
+    Some(match word {
+        "monday" | "mon" | "mons" => Weekday::Mon,
+        "tuesday" | "tue" | "tues" => Weekday::Tue,
+        "wednesday" | "wed" | "weds" | "wednes" => Weekday::Wed,
+        "thursday" | "thu" | "thur" | "thurs" => Weekday::Thu,
+        "friday" | "fri" => Weekday::Fri,
+        "saturday" | "sat" | "sats" => Weekday::Sat,
+        "sunday" | "sun" | "suns" => Weekday::Sun,
+        _ => return None,
+    })
+}
+
+/// Abbreviations that are also ordinary English words. "I sat in the garden" and "we wed in May"
+/// must not become appointments, so these only count when something in front of them says a day
+/// is coming: "on sat", "next wed", "by sun".
+fn abbreviation_needs_a_cue(word: &str) -> bool {
+    matches!(word, "sat" | "sun" | "wed" | "mon" | "tue" | "thu" | "fri")
+}
+
+const DAY_CUES: [&str; 7] = ["on", "next", "this", "by", "from", "for", "until"];
+
+/// The weekday a message is talking about, if any.
+///
+/// Full names stand on their own. Short forms need a cue word immediately before them, which is
+/// how people write them anyway — "on Weds", "next Sat" — and which keeps the ambiguous ones from
+/// firing on ordinary prose.
+fn find_weekday(text: &str) -> Option<Weekday> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    for (i, word) in words.iter().enumerate() {
+        let Some(day) = weekday_from_word(word) else {
+            continue;
+        };
+        if !abbreviation_needs_a_cue(word) {
+            return Some(day);
+        }
+        let cued = i > 0 && DAY_CUES.contains(&words[i - 1]);
+        if cued {
+            return Some(day);
+        }
+    }
+    None
+}
+
+/// Whether a clock reading, placed on `date`, is still in the future.
+fn time_is_still_ahead_today(
+    clock: Option<(u32, u32, Option<bool>)>,
+    date: NaiveDate,
+    local_now: DateTime<Tz>,
+    tz: Tz,
+) -> bool {
+    let Some((h, m, ampm)) = clock else {
+        return false;
+    };
+    let Some((h24, min)) = to_24h_clock(h, m, ampm, date, local_now, tz) else {
+        return false;
+    };
+    naive_local_to_utc(date, h24, min, tz).is_some_and(|t| t > local_now.with_timezone(&Utc))
+}
+
+/// The next date on or after `from` falling on `target`.
+fn on_or_after(from: NaiveDate, target: Weekday) -> NaiveDate {
+    let ahead = (7 + target.num_days_from_monday() as i64
+        - from.weekday().num_days_from_monday() as i64)
+        % 7;
+    from + Duration::days(ahead)
+}
+
 fn scan_bare_hour_meridiem(s: &str) -> Option<(u32, u32, Option<bool>)> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -490,6 +564,10 @@ fn try_parse_event_timing_internals(
     let local_now = now.with_timezone(&tz);
     let today_utc = now.date_naive();
 
+    // Parsed before the anchor: a weekday that lands on today is only today if the time given is
+    // still ahead, so the date cannot be settled without knowing the clock.
+    let clock = parse_clock_in_text(text);
+
     let iso = find_iso_date(text);
     let month_day = naive_date_from_text(text, today_utc);
     let has_tomorrow = has_whole_word(text, "tomorrow");
@@ -516,9 +594,16 @@ fn try_parse_event_timing_internals(
     } else if has_today {
         anchor = Some(local_now.date_naive());
         nine_is_local = true;
+    } else if let Some(day) = find_weekday(text) {
+        let today_local = local_now.date_naive();
+        let mut date = on_or_after(today_local, day);
+        if date == today_local && !time_is_still_ahead_today(clock, today_local, local_now, tz) {
+            // Saying "on Weds" *on* a Wednesday means the next one; today would have been "today".
+            date += Duration::days(7);
+        }
+        anchor = Some(date);
+        nine_is_local = true;
     }
-
-    let clock = parse_clock_in_text(text);
 
     if anchor.is_none() {
         if clock.is_some() {
@@ -760,11 +845,12 @@ mod meridiem_tests {
 
     #[test]
     fn the_message_that_prompted_this() {
-        // Neither "Weds" nor "5pm" parsed, so this fell back to tomorrow at 09:00 UTC and fired
-        // at 10:00 the next morning. The time is understood now; the weekday still is not.
+        // Neither "Weds" nor "5pm" parsed, so this fell back to tomorrow at 09:00 UTC and would
+        // have fired at 10:00 the following morning. Sent on Tuesday the 22nd, it now lands on
+        // Wednesday evening, which is what it says.
         assert_eq!(
             due_local("I have a gig at the Royal Albert on Weds, leave for 5pm"),
-            "2026-09-22 17:00"
+            "2026-09-23 17:00"
         );
     }
 
@@ -811,6 +897,63 @@ mod meridiem_tests {
         // this change and is pinned here rather than quietly altered.
         assert_eq!(due_local("pay the bill on 2026-10-12"), "2026-10-12 10:00");
         assert_eq!(due_local("pay the bill on 2026-10-12 at 4pm"), "2026-10-12 16:00");
+    }
+
+    #[test]
+    fn weekday_names_and_the_short_forms_people_type() {
+        // now() is Tuesday 2026-09-22, midday London.
+        assert_eq!(due_local("gig on Weds, leave for 5pm"), "2026-09-23 17:00");
+        assert_eq!(due_local("dentist on Wednesday at 9am"), "2026-09-23 09:00");
+        assert_eq!(due_local("call mum on Sunday"), "2026-09-27 09:00");
+        assert_eq!(due_local("football saturday at 3pm"), "2026-09-26 15:00");
+        assert_eq!(due_local("standup on thurs at 9:30am"), "2026-09-24 09:30");
+    }
+
+    #[test]
+    fn a_weekday_with_no_time_defaults_to_nine_local() {
+        // Consistent with "tomorrow", which also gives 09:00 local rather than 09:00 UTC.
+        assert_eq!(due_local("review on Friday"), "2026-09-25 09:00");
+    }
+
+    #[test]
+    fn naming_todays_weekday_means_the_next_one_unless_a_time_is_still_ahead() {
+        // Tuesday, midday. "on Tuesday" would have been said as "today" if it meant today.
+        assert_eq!(due_local("pay rent on Tuesday"), "2026-09-29 09:00");
+        // …but an hour still to come today is taken at face value.
+        assert_eq!(due_local("leave on Tuesday at 5pm"), "2026-09-22 17:00");
+        // An hour already gone rolls to next week.
+        assert_eq!(due_local("leave on Tuesday at 9am"), "2026-09-29 09:00");
+    }
+
+    #[test]
+    fn short_forms_that_are_also_words_need_something_in_front_of_them() {
+        // "sat", "wed" and "sun" are ordinary English; without a cue they are left alone.
+        assert_eq!(due_local("I sat in the garden"), "2026-09-23 10:00");
+        assert_eq!(due_local("we wed in May"), "2026-09-23 10:00");
+        assert_eq!(due_local("enjoy the sun"), "2026-09-23 10:00");
+        // With a cue they are days again.
+        assert_eq!(due_local("drinks on sat at 7pm"), "2026-09-26 19:00");
+        assert_eq!(due_local("call on wed"), "2026-09-23 09:00");
+        assert_eq!(due_local("roast next sun at 1pm"), "2026-09-27 13:00");
+    }
+
+    #[test]
+    fn an_explicit_date_still_beats_a_weekday() {
+        assert_eq!(
+            due_local("gig on Weds 2026-10-14 at 8pm"),
+            "2026-10-14 20:00"
+        );
+        assert_eq!(due_local("meet tomorrow, not Friday"), "2026-09-23 09:00");
+    }
+
+    #[test]
+    fn find_weekday_is_strict_about_cues() {
+        assert_eq!(find_weekday("on weds"), Some(Weekday::Wed));
+        assert_eq!(find_weekday("wednesday"), Some(Weekday::Wed));
+        assert_eq!(find_weekday("thurs"), Some(Weekday::Thu));
+        assert_eq!(find_weekday("I sat down"), None);
+        assert_eq!(find_weekday("sunny"), None, "must be a whole word");
+        assert_eq!(find_weekday("next sat"), Some(Weekday::Sat));
     }
 
     #[test]
