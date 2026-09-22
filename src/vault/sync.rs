@@ -175,9 +175,11 @@ pub fn sync_vault_with_git(
 
     let _guard = ctx.access.lock();
 
-    // Anything left uncommitted by a previous cycle has to be committed before a rebase will run.
-    if git::commit_all(vault_path, git_cfg, "mervyn: vault write-back (recovered)")? {
-        tracing::warn!("committed vault changes left behind by an earlier cycle");
+    // Commit whatever is already on disk before rebasing, which needs a clean tree. This is the
+    // ordinary case, not a recovery: the file watcher reacts to a write within milliseconds and
+    // syncs it to the database long before this five-minute cycle comes round.
+    if git::commit_all(vault_path, git_cfg, "mervyn: vault write-back")? {
+        tracing::debug!("committed vault changes written between cycles");
     }
 
     if git::pull_rebase(vault_path, git_cfg)? == PullOutcome::Conflicted {
@@ -190,7 +192,12 @@ pub fn sync_vault_with_git(
 
     let stats = reconcile_all(db, vault_path, ctx)?;
 
-    if git::commit_all(vault_path, git_cfg, "mervyn: vault write-back")? {
+    git::commit_all(vault_path, git_cfg, "mervyn: vault write-back")?;
+
+    // Push on *anything* unpushed, not just on what this cycle happened to commit. Gating the
+    // push on the commit above meant that work committed before the rebase — which is most of it,
+    // since the watcher writes first — was committed locally and never sent, silently, for days.
+    if git::has_unpushed(vault_path, git_cfg) {
         git::push(vault_path, git_cfg)?;
         tracing::info!(?stats, "vault changes pushed");
     }
@@ -690,13 +697,40 @@ mod tests {
     }
 
     #[test]
+    fn work_written_between_cycles_still_reaches_the_remote() {
+        // The regression that let the vault stop publishing for five days while looking healthy.
+        // The watcher writes a file within milliseconds of a change, so by the time the git cycle
+        // runs the work is already on disk. Gating the push on what *this* cycle committed meant
+        // it was committed locally and never sent — and nothing said so.
+        let f = Fixture::new();
+        let (_remote, phone, git_cfg) = git_backed(&f);
+
+        // Stand in for the watcher having already written and committed a change.
+        f.write("todos.md", "- [ ] written by the watcher <!--mv:1-->\n");
+        crate::vault::git::commit_all(f.vault.path(), &git_cfg, "mervyn: vault write-back").unwrap();
+        assert!(crate::vault::git::has_unpushed(f.vault.path(), &git_cfg));
+
+        // This cycle finds nothing of its own to write, and must still push.
+        sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
+
+        assert!(!crate::vault::git::has_unpushed(f.vault.path(), &git_cfg), "nothing left behind");
+        std::process::Command::new("git")
+            .args(["pull", "--rebase", "origin", "main"])
+            .current_dir(phone.path())
+            .output()
+            .unwrap();
+        let on_phone = std::fs::read_to_string(phone.path().join("todos.md")).unwrap();
+        assert!(on_phone.contains("written by the watcher"), "reached the remote: {on_phone}");
+    }
+
+    #[test]
     fn a_diverged_vault_pauses_instead_of_writing() {
         let f = Fixture::new();
         let (_remote, phone, git_cfg) = git_backed(&f);
         f.write("todos.md", "- [ ] one <!--mv:1-->\n- [ ] two <!--mv:2-->\n");
         sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
 
-        // The phone rewords one line; Mervyn is about to change the one next to it.
+        // The phone rewords one line and publishes it.
         std::process::Command::new("git")
             .args(["pull", "--rebase", "origin", "main"])
             .current_dir(phone.path())
@@ -710,11 +744,19 @@ mod tests {
         crate::vault::git::commit_all(phone.path(), &git_cfg, "reword").unwrap();
         crate::vault::git::push(phone.path(), &git_cfg).unwrap();
 
-        todos::mark_done(&f.db, 2).unwrap();
+        // Meanwhile Mervyn writes and commits the line next to it without having seen that —
+        // a cycle whose push failed, or a watcher write between cycles.
+        f.write("todos.md", "- [ ] one <!--mv:1-->\n- [x] two <!--mv:2-->\n");
+        crate::vault::git::commit_all(f.vault.path(), &git_cfg, "mervyn: vault write-back").unwrap();
+
         let stats = sync_vault_with_git(&f.db, f.vault.path(), f.ctx(true), &git_cfg).unwrap();
 
         assert!(stats.git_conflict, "a divergence it cannot rebase must be reported");
         assert_eq!(stats.rows_written_to_file, 0, "and nothing written on top of it");
+        assert!(
+            crate::vault::git::has_unpushed(f.vault.path(), &git_cfg),
+            "its own commit is kept, not discarded"
+        );
     }
 
     // ---- stability ----------------------------------------------------------------------------
