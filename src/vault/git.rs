@@ -118,6 +118,21 @@ pub fn pull_rebase(path: &Path, cfg: &VaultGitSection) -> anyhow::Result<PullOut
     Ok(PullOutcome::Conflicted)
 }
 
+/// Whether the local branch holds commits the remote does not.
+///
+/// Errs toward `true`: if the count cannot be read, pushing anyway costs a round trip, whereas
+/// not pushing leaves work stranded on the server with nothing to say so.
+pub fn has_unpushed(path: &Path, cfg: &VaultGitSection) -> bool {
+    let range = format!("{}/{}..HEAD", cfg.remote.trim(), cfg.branch.trim());
+    match run(path, cfg, &["rev-list", "--count", &range]) {
+        Ok(out) => out.trim().parse::<usize>().map_or(true, |n| n > 0),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not count unpushed commits; assuming there are some");
+            true
+        }
+    }
+}
+
 /// `git push`, retrying once behind a rebase if the remote moved in between.
 pub fn push(path: &Path, cfg: &VaultGitSection) -> anyhow::Result<()> {
     let remote = cfg.remote.trim();
