@@ -252,6 +252,62 @@ fn naive_local_to_utc(date: NaiveDate, hour: u32, min: u32, tz: Tz) -> Option<Da
 }
 
 /// `H:MM` or `H:MM am/pm` after ` at ` if possible, else first `H:MM` in `text`.
+/// `am` / `pm` / `a.m.` / `p.m.` at the start of `rest`, whatever punctuation follows it.
+///
+/// Matching the whole token matters: "5 ampersands" must not read as five in the morning.
+fn meridiem_at_start(rest: &str) -> Option<bool> {
+    let lower = rest.trim_start().to_lowercase();
+    for (needle, pm) in [("a.m.", false), ("p.m.", true), ("am", false), ("pm", true)] {
+        if let Some(tail) = lower.strip_prefix(needle) {
+            if tail.chars().next().is_none_or(|c| !c.is_alphanumeric()) {
+                return Some(pm);
+            }
+        }
+    }
+    None
+}
+
+/// A bare hour carrying a meridiem: `5pm`, `6 am`, `7p.m.`.
+///
+/// The meridiem is required. A lone number is far too ambiguous to read as a time — "leave for 5"
+/// might be five o'clock, five minutes or five of something — whereas "5pm" says exactly one
+/// thing, and it is how most people write it.
+fn scan_bare_hour_meridiem(s: &str) -> Option<(u32, u32, Option<bool>)> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        // Digits glued to the end of a word are part of that word, not a time.
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        let mut j = start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        // `H:MM` is the other scanner's job, and a run longer than two digits is not an hour.
+        let is_hour_shaped = (1..=2).contains(&(j - start)) && bytes.get(j) != Some(&b':');
+        if is_hour_shaped {
+            if let Ok(h) = s[start..j].parse::<u32>() {
+                if (1..=12).contains(&h) {
+                    if let Some(pm) = meridiem_at_start(&s[j..]) {
+                        return Some((h, 0, Some(pm)));
+                    }
+                }
+            }
+        }
+        i = j;
+    }
+    None
+}
+
 fn scan_h_colon_m_fragment(s: &str) -> Option<(u32, u32, Option<bool>)> {
     let bytes = s.as_bytes();
     for i in 1..bytes.len() {
@@ -287,28 +343,25 @@ fn scan_h_colon_m_fragment(s: &str) -> Option<(u32, u32, Option<bool>)> {
         if min > 59 {
             continue;
         }
-        let rest = s.get(k..).unwrap_or("").trim_start();
-        let lower = rest.to_lowercase();
-        let ampm = if lower == "am" || lower.starts_with("am ") || lower.starts_with("a.m.") {
-            Some(false)
-        } else if lower == "pm" || lower.starts_with("pm ") || lower.starts_with("p.m.") {
-            Some(true)
-        } else {
-            None
-        };
+        let ampm = meridiem_at_start(s.get(k..).unwrap_or(""));
         return Some((left, min, ampm));
     }
     None
 }
 
+/// `H:MM` first, then a bare hour with a meridiem — the explicit form wins where both appear.
+fn scan_clock(s: &str) -> Option<(u32, u32, Option<bool>)> {
+    scan_h_colon_m_fragment(s).or_else(|| scan_bare_hour_meridiem(s))
+}
+
 fn parse_clock_in_text(text: &str) -> Option<(u32, u32, Option<bool>)> {
     let lower = text.to_lowercase();
     if let Some(pos) = lower.find(" at ") {
-        if let Some(v) = scan_h_colon_m_fragment(text[pos + 4..].trim_start()) {
+        if let Some(v) = scan_clock(text[pos + 4..].trim_start()) {
             return Some(v);
         }
     }
-    scan_h_colon_m_fragment(text)
+    scan_clock(text)
 }
 
 fn to_24h_clock(
@@ -680,5 +733,93 @@ mod tests {
             .unwrap()
             .and_utc();
         assert_eq!(due, want);
+    }
+
+}
+#[cfg(test)]
+mod meridiem_tests {
+    use super::*;
+
+    fn london() -> Tz {
+        "Europe/London".parse().unwrap()
+    }
+
+    /// Midday on a Tuesday, so "5pm" has somewhere to land later the same day.
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-22T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn due_local(text: &str) -> String {
+        due_datetime_from_reminder_text(text, now(), london())
+            .with_timezone(&london())
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    }
+
+    #[test]
+    fn the_message_that_prompted_this() {
+        // Neither "Weds" nor "5pm" parsed, so this fell back to tomorrow at 09:00 UTC and fired
+        // at 10:00 the next morning. The time is understood now; the weekday still is not.
+        assert_eq!(
+            due_local("I have a gig at the Royal Albert on Weds, leave for 5pm"),
+            "2026-09-22 17:00"
+        );
+    }
+
+    #[test]
+    fn bare_hours_with_a_meridiem() {
+        assert_eq!(due_local("leave for 5pm"), "2026-09-22 17:00");
+        assert_eq!(due_local("gym at 6am tomorrow"), "2026-09-23 06:00");
+        assert_eq!(due_local("standup at 9 am tomorrow"), "2026-09-23 09:00");
+        assert_eq!(due_local("call them at 7p.m."), "2026-09-22 19:00");
+    }
+
+    #[test]
+    fn minutes_with_a_meridiem() {
+        assert_eq!(due_local("leave at 5:30pm"), "2026-09-22 17:30");
+        assert_eq!(due_local("alarm for 5:30am tomorrow"), "2026-09-23 05:30");
+        // Punctuation straight after the meridiem used to defeat the match.
+        assert_eq!(due_local("be there for 5:30pm, sharp"), "2026-09-22 17:30");
+    }
+
+    #[test]
+    fn noon_and_midnight_read_the_conventional_way() {
+        assert_eq!(due_local("lunch at 12pm"), "2026-09-22 12:00");
+        assert_eq!(due_local("deadline 12am tomorrow"), "2026-09-23 00:00");
+    }
+
+    #[test]
+    fn an_explicit_time_still_wins_over_a_bare_hour() {
+        assert_eq!(due_local("moved from 5pm to 17:45"), "2026-09-22 17:45");
+    }
+
+    #[test]
+    fn numbers_that_are_not_times_are_left_alone() {
+        // No clock found, so these fall back to tomorrow at 09:00 UTC — 10:00 London.
+        assert_eq!(due_local("buy 5 apples"), "2026-09-23 10:00");
+        assert_eq!(due_local("read 5 pages of the manual"), "2026-09-23 10:00");
+        assert_eq!(due_local("reply to 5 ampersand queries"), "2026-09-23 10:00");
+        assert_eq!(due_local("check invoice A4pm-22"), "2026-09-23 10:00");
+    }
+
+    #[test]
+    fn an_iso_date_is_not_mistaken_for_a_time() {
+        // 10:00 London, because a bare ISO date defaults to 09:00 **UTC** while "tomorrow"
+        // defaults to 09:00 **local**. Same intent, two answers — that inconsistency predates
+        // this change and is pinned here rather than quietly altered.
+        assert_eq!(due_local("pay the bill on 2026-10-12"), "2026-10-12 10:00");
+        assert_eq!(due_local("pay the bill on 2026-10-12 at 4pm"), "2026-10-12 16:00");
+    }
+
+    #[test]
+    fn the_scanner_itself_is_strict_about_what_counts() {
+        assert_eq!(scan_bare_hour_meridiem("5pm"), Some((5, 0, Some(true))));
+        assert_eq!(scan_bare_hour_meridiem("at 11 AM"), Some((11, 0, Some(false))));
+        assert_eq!(scan_bare_hour_meridiem("13pm"), None, "not an hour on a 12-hour clock");
+        assert_eq!(scan_bare_hour_meridiem("5"), None, "a meridiem is required");
+        assert_eq!(scan_bare_hour_meridiem("5:30pm"), None, "H:MM is the other scanner's job");
+        assert_eq!(scan_bare_hour_meridiem("room4pm"), None, "glued to a word");
     }
 }
