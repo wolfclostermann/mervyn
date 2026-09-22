@@ -90,7 +90,7 @@ Roughly what each intent does (you do **not** type these labels yourself—descr
 
 | Intent (internal) | What it does |
 | ----------------- | ------------ |
-| **Reminder** | Stores a reminder in `redb`. If the message contains an ISO date `YYYY-MM-DD`, that day is used (default time 09:00 UTC); otherwise due time defaults to about **tomorrow** at 09:00 UTC. Due reminders are **posted to `TELEGRAM_CHAT_ID`** on a schedule (see below). |
+| **Reminder** | Stores a reminder in `redb`. Understands a time written as `5pm`, `6 am`, `7p.m.`, `17:00` or `5:30am`, and an ISO date `YYYY-MM-DD`, `today` or `tomorrow`. With no time it defaults to 09:00; with nothing recognised at all, about **tomorrow** at 09:00 UTC. Weekday names (`on Weds`) are **not** understood yet. Due reminders are **posted to `TELEGRAM_CHAT_ID`** on a schedule (see below). |
 | **Event** | Saves a calendar-style **event** in `redb`, and (with write-back on) writes it into `events.md`; refine times and detail in Obsidian either way. |
 | **Work log** | Appends a **worklog** entry with the current UTC timestamp. |
 | **Note** | Parses one or more **todo** lines and stores them in **`redb`** (open until marked done), and with write-back on mirrors them to `todos.md` as checkboxes. They appear in **morning briefing** context and **ask** context. For long-form writing you can still use **`data/vault/notes/`** in Obsidian. |
