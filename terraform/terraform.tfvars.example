@@ -3,10 +3,10 @@
 #
 # Copy to terraform.tfvars (gitignored), fill in secrets, then encrypt like .env.enc:
 #   cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-#   ENV_FILE=terraform/terraform.tfvars ./scripts/env-crypto.sh encrypt
+#   ENV_FILE=terraform/terraform.tfvars ~/Tools/env-crypto.sh encrypt
 # Commit terraform/terraform.tfvars.enc only.
 # Decrypt before plan/apply:
-#   ENV_FILE=terraform/terraform.tfvars ./scripts/env-crypto.sh decrypt
+#   ENV_FILE=terraform/terraform.tfvars ~/Tools/env-crypto.sh decrypt
 
 # --- Identity (replace with your values) ---
 tenancy_ocid     = "ocid1.tenancy.oc1..aaaaaaaa..."

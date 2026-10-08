@@ -4,7 +4,7 @@
 #
 # Target host should match oci-bootstrap.sh / Terraform: default user `opc` on Oracle Linux, `ubuntu` on Ubuntu — Podman + podman-compose from cloud-init or deploy-remote-setup.sh.
 #
-# Reads ciphertext .env.enc from the repo (same format as scripts/env-crypto.sh), decrypts locally,
+# Reads ciphertext .env.enc from the repo (same format as ~/Tools/env-crypto.sh), decrypts locally,
 # uploads with the app bundle, then runs compose on the VM.
 #
 # With --local-build, build the image locally (podman preferred, else docker), save, copy, load on the VM.
